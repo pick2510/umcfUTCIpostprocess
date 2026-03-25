@@ -23,7 +23,6 @@ Usage
 
 import argparse
 import glob
-import math
 import os
 import shutil
 import subprocess
@@ -160,30 +159,6 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
         )
         return positions
 
-
-def _read_vtk_points(vtk_path):
-    """Read point coordinates from a VTK legacy file (ASCII or pyvista)."""
-    try:
-        import pyvista as pv
-        pts = pv.read(vtk_path).points
-        return [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
-    except Exception:
-        pass
-    # Manual ASCII VTK parser fallback
-    with open(vtk_path) as f:
-        lines = f.readlines()
-    for i, line in enumerate(lines):
-        if line.strip().startswith('POINTS'):
-            n = int(line.split()[1])
-            data = []
-            j = i + 1
-            while len(data) < n * 3 and j < len(lines):
-                data.extend(map(float, lines[j].split()))
-                j += 1
-            import numpy as np
-            pts = np.array(data).reshape(-1, 3)
-            return [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
-    raise RuntimeError(f'Could not parse POINTS from {vtk_path}')
 
 
 
