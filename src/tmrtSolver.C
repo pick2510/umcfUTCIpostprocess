@@ -60,23 +60,16 @@ Eigen::VectorXd TmrtSolver::compute(
             qin_sw += surfaces[m].qsOut * fij_val;
         }
 
-        if (useSkyViewFactors && vf.FijsumSky.size() == nBody) {
-            double totalF = vf.Fijsum[n] + vf.FijsumSky[n];
-            if (totalF > 1e-12) {
-                double skyF = vf.FijsumSky[n] / totalF;
-                qin_lw /= totalF;
-                qin_lw += sigmaTsky4  * skyF;   // sky LW
-                qin_sw /= totalF;               // normalize wall SW
-                qin_sw += meteo.Idif  * skyF;   // add sky SW diffuse
-            }
-        } else {
-            // Fallback: sky fraction = 1 - Fijsum
-            if (vf.Fijsum[n] > 1.0) qin_lw /= vf.Fijsum[n];
-            double Fsky = std::max(0.0, 1.0 - vf.Fijsum[n]);
-            qin_lw += sigmaTsky4 * Fsky;
-            qin_sw /= std::max(1.0, vf.Fijsum[n]);
-            qin_sw += meteo.Idif * Fsky;
-        }
+        // Sky fraction = complement of wall/veg VF sum (clamped to [0,1]).
+        // We deliberately ignore FijsumSky here: sky boundary patches have
+        // large, overlapping VFs that push totalF >> 1, severely underestimating
+        // incoming LW and producing unphysical Tmrt (< 200 K at night).
+        if (vf.Fijsum[n] > 1.0) qin_lw /= vf.Fijsum[n];
+        double Fsky = std::max(0.0, 1.0 - std::min(vf.Fijsum[n], 1.0));
+        qin_lw += sigmaTsky4 * Fsky;
+        qin_sw /= std::max(1.0, vf.Fijsum[n]);
+        qin_sw += meteo.Idif * Fsky;
+        (void)useSkyViewFactors; // retained for API compatibility
 
         // Apply person's absorption coefficients (matching original Python):
         // Tmrt^4 = (eps_pers * qin_lw + abs_sw * qin_sw) / (sigma * eps_pers)
