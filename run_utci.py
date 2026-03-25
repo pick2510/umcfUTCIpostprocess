@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-UTCI post-processing orchestrator — utci_clement workflow + C++ calcTmrt.
+UTCI post-processing orchestrator.
 
 Stages
 ------
-  0  Write probe_locs and system probes dict (pedestrian grid at z=2m)
-  1  OpenFOAM: calculateqrsw, calcSf, calcWallRadOut, postProcess surfaces, postProcess probes
-  2  Run calcTmrt binary → Tmrt + UTCI VTK output
+  0  Write probe_locs and system probes dict
+       flat:    regular grid at constant z (derived from STL bounds)
+       terrain: ray-cast onto a surface mesh VTK, offset 2 m above terrain
+  1  OpenFOAM: calculateqrsw, calcSf, calcWallRadOut, postProcess surfaces + probes
+  2  Run umcfUTCIpostprocess binary → Tmrt + UTCI VTK output
 
 Usage
 -----
+  # flat domain (default)
   python3 run_utci.py --case /path/to/case [options]
-  python3 run_utci.py --case /path/to/case --stages 1 2
+
+  # terrain-following
+  python3 run_utci.py --case /path/to/case --mode terrain \\
+      --pedestrian-mesh /path/to/T_pedestrian.vtk \\
+      --pos-xmin -150 --pos-xmax 500 --pos-ymin -2350 --pos-ymax -1700 \\
+      --pos-grid-step 10
 """
 
 import argparse
@@ -38,11 +46,11 @@ PED_GRID_DX    = 3.0
 PED_GRID_DY    = 3.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PEDESTRIAN GRID
+# PEDESTRIAN GRID — flat
 # ──────────────────────────────────────────────────────────────────────────────
 
-def pedestrian_grid(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
-    """Return list of (x, y, z) probe positions derived from wallAndTreeSurfaces.stl bounds."""
+def pedestrian_grid_flat(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
+    """Regular grid at constant z derived from wallAndTreeSurfaces.stl bounds."""
     stl = os.path.join(case, 'constant', 'triSurface', 'wallAndTreeSurfaces.stl')
     if not os.path.isfile(stl):
         stl = os.path.join(case, 'constant', 'triSurface', 'walls.stl')
@@ -82,6 +90,63 @@ def pedestrian_grid(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
             return positions
 
     raise RuntimeError('Cannot determine pedestrian grid: no STL bounds and no probe_locs')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PEDESTRIAN GRID — terrain-following
+# ──────────────────────────────────────────────────────────────────────────────
+
+def pedestrian_grid_terrain(mesh_vtk, xmin, xmax, ymin, ymax, grid_step,
+                             z_offset=PED_Z, ray_z_start=300.0, ray_z_end=1000.0):
+    """
+    Cast vertical rays onto a surface mesh VTK and return positions offset
+    z_offset metres above each terrain intersection.
+
+    Parameters
+    ----------
+    mesh_vtk    : path to the pedestrian-level surface VTK (e.g. T_pedestrian.vtk)
+    xmin/xmax   : x domain bounds for ray origins
+    ymin/ymax   : y domain bounds for ray origins
+    grid_step   : horizontal spacing between rays [m]
+    z_offset    : height above terrain surface [m] (default 2 m)
+    ray_z_start : z of ray origin — below terrain [m]
+    ray_z_end   : z of ray terminus — above terrain [m]
+    """
+    import numpy as np
+    import vtk
+
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(mesh_vtk)
+    reader.ReadAllVectorsOn()
+    reader.ReadAllScalarsOn()
+    reader.Update()
+    mesh = reader.GetOutput()
+
+    obb = vtk.vtkOBBTree()
+    obb.SetDataSet(mesh)
+    obb.BuildLocator()
+
+    xs = np.arange(xmin, xmax + 0.5 * grid_step, grid_step)
+    ys = np.arange(ymin, ymax + 0.5 * grid_step, grid_step)
+    n_rays = len(xs) * len(ys)
+    print(f'  Terrain grid: X [{xmin:.0f}..{xmax:.0f}], Y [{ymin:.0f}..{ymax:.0f}] '
+          f'→ {n_rays} rays')
+
+    positions = []
+    for xi in xs:
+        for yi in ys:
+            start = [xi, yi, ray_z_start]
+            end   = [xi, yi, ray_z_end]
+            pts = vtk.vtkPoints()
+            obb.IntersectWithLine(start, end, pts, None)
+            n = pts.GetData().GetNumberOfTuples()
+            if n > 0:
+                p = [0.0, 0.0, 0.0]
+                pts.GetPoint(0, p)
+                positions.append((p[0], p[1], p[2] + z_offset))
+
+    print(f'  Terrain intersections found: {len(positions)} / {n_rays}')
+    return positions
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -202,13 +267,28 @@ def _compile_if_missing(binary, src_dir):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def stage0(args):
-    print('\n=== Stage 0: Write system files ===')
-    positions = pedestrian_grid(args.case)
+    print(f'\n=== Stage 0: Write system files ({args.mode}) ===')
+
+    if args.mode == 'terrain':
+        if not args.pedestrian_mesh:
+            print('[ERROR] --pedestrian-mesh is required for --mode terrain')
+            sys.exit(1)
+        positions = pedestrian_grid_terrain(
+            args.pedestrian_mesh,
+            args.pos_xmin, args.pos_xmax,
+            args.pos_ymin, args.pos_ymax,
+            args.pos_grid_step,
+            z_offset=PED_Z,
+        )
+    else:
+        positions = pedestrian_grid_flat(args.case,
+                                         dx=args.ped_grid_dx,
+                                         dy=args.ped_grid_dy)
 
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
 
-    # probe_locs (used by calcTmrt to know pedestrian positions)
+    # probe_locs (used by umcfUTCIpostprocess to know pedestrian positions)
     with open(os.path.join(sys_air, 'probe_locs'), 'w') as f:
         f.write('(\n')
         for p in positions:
@@ -276,7 +356,7 @@ def stage2(args):
     binary = args.calc_tmrt_bin
     if not os.path.isfile(binary):
         print(f'  [ERROR] Binary not found: {binary}')
-        print('  Build: cmake --build /mnt/nvme/UTCI_OF_CPP/UTCI_util/calcTmrt/build -j8')
+        print('  Build: cd src && mkdir -p build && cd build && cmake .. && make -j$(nproc)')
         sys.exit(1)
 
     cmd = [
@@ -326,6 +406,21 @@ def parse_args():
     p.add_argument('--force-recompute', action='store_true', dest='force_recompute')
     p.add_argument('--skip-utci',       action='store_true', dest='skip_utci')
     p.add_argument('--calc-tmrt-bin', default=CALC_TMRT_BIN, dest='calc_tmrt_bin')
+
+    # flat grid spacing
+    p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx')
+    p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy')
+
+    # terrain-following Stage 0
+    tg = p.add_argument_group('terrain mode (--mode terrain)')
+    tg.add_argument('--pedestrian-mesh', default=None, dest='pedestrian_mesh',
+                    help='Surface VTK to ray-cast onto (e.g. T_pedestrian.vtk)')
+    tg.add_argument('--pos-xmin',      type=float, default=None, dest='pos_xmin')
+    tg.add_argument('--pos-xmax',      type=float, default=None, dest='pos_xmax')
+    tg.add_argument('--pos-ymin',      type=float, default=None, dest='pos_ymin')
+    tg.add_argument('--pos-ymax',      type=float, default=None, dest='pos_ymax')
+    tg.add_argument('--pos-grid-step', type=float, default=10.0, dest='pos_grid_step',
+                    help='Horizontal grid spacing for terrain ray-casting [m]')
 
     return p.parse_args()
 
