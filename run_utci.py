@@ -9,6 +9,7 @@ Stages
        terrain: ray-cast onto a surface mesh VTK, offset 2 m above terrain
   1  OpenFOAM: calculateqrsw, calcSf, calcWallRadOut, postProcess surfaces + probes
   2  Run umcfUTCIpostprocess binary → Tmrt + UTCI VTK output
+  3  Collect all per-timestep VTK files into <output_dir>/results/ with timestep in filename
 
 Usage
 -----
@@ -23,8 +24,10 @@ Usage
 """
 
 import argparse
+import glob
 import math
 import os
+import shutil
 import subprocess
 import sys
 
@@ -382,6 +385,33 @@ def stage2(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# STAGE 3 – Collect results
+# ──────────────────────────────────────────────────────────────────────────────
+
+def stage3(args):
+    print('\n=== Stage 3: Collect VTK results ===')
+    base = os.path.join(args.case, args.output_dir)
+    results_dir = os.path.join(base, 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    print(f'  Results directory: {results_dir}')
+
+    timesteps = range(args.t_start, args.t_end + 1, args.t_step)
+    copied = 0
+    for t in timesteps:
+        t_dir = os.path.join(base, str(t))
+        if not os.path.isdir(t_dir):
+            print(f'  [WARN] Timestep directory not found: {t_dir}')
+            continue
+        for src in glob.glob(os.path.join(t_dir, '*.vtk')):
+            stem = os.path.splitext(os.path.basename(src))[0]
+            dst = os.path.join(results_dir, f'{stem}_t{t:06d}.vtk')
+            shutil.copy2(src, dst)
+            copied += 1
+
+    print(f'  Copied {copied} VTK file(s) → {results_dir}')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -391,8 +421,8 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     p.add_argument('--case',       required=True,  help='OpenFOAM case directory')
-    p.add_argument('--stages',     nargs='*', type=int, default=[0, 1, 2], metavar='N',
-                   help='Stages to run: 0=system files  1=OF postProcess  2=calcTmrt')
+    p.add_argument('--stages',     nargs='*', type=int, default=[0, 1, 2, 3], metavar='N',
+                   help='Stages to run: 0=system files  1=OF postProcess  2=calcTmrt  3=collect results')
     p.add_argument('--t-start',    type=int, default=3600,  dest='t_start')
     p.add_argument('--t-end',      type=int, default=86400, dest='t_end')
     p.add_argument('--t-step',     type=int, default=3600,  dest='t_step')
@@ -435,7 +465,7 @@ def main():
     print(f'Threads:   {args.threads}')
     print(f'Vegetation: {args.vegetation}')
 
-    stage_map = {0: stage0, 1: stage1, 2: stage2}
+    stage_map = {0: stage0, 1: stage1, 2: stage2, 3: stage3}
     for s in sorted(args.stages):
         if s not in stage_map:
             print(f'[ERROR] Unknown stage {s}')
