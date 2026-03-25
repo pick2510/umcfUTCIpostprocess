@@ -52,71 +52,84 @@ PED_GRID_DY    = 3.0
 # PEDESTRIAN GRID — flat
 # ──────────────────────────────────────────────────────────────────────────────
 
-def pedestrian_grid_flat(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
-    """Regular grid at constant z, with building cutout via horizontal ray parity test."""
-    stl = os.path.join(case, 'constant', 'triSurface', 'wallAndTreeSurfaces.stl')
-    if not os.path.isfile(stl):
-        stl = os.path.join(case, 'constant', 'triSurface', 'walls.stl')
+def _pedestrian_plane_dict(z=PED_Z):
+    """OpenFOAM surfaces dict: horizontal cutting plane at pedestrian height, vtk output."""
+    return (
+        "/*--------------------------------*- C++ -*----------------------------------*/\n"
+        + _FOAM_HEADER.format(obj='surfacesPedestrian')
+        + f"""surfaceFormat   vtk;
 
-    if os.path.isfile(stl):
-        try:
-            import vtk
+fields
+(
+    T
+);
+
+surfaces
+(
+    pedestrian
+    {{
+        type        cuttingPlane;
+        planeType   pointAndNormal;
+        pointAndNormalDict
+        {{
+            basePoint    (0 0 {z});
+            normalVector (0 0 1);
+        }}
+        interpolate false;
+    }}
+);
+"""
+    )
+
+
+def _bin_vtk_to_grid(vtk_path, dx, dy):
+    """
+    Read points from a pedestrian-plane VTK and snap them to a regular dx/dy grid.
+
+    Any VTK point within half a cell of a grid node marks that node as valid.
+    Returns a sorted list of unique (x, y, z) grid-node positions at the
+    z-height of the cutting plane.
+    """
+    import numpy as np
+    pts = np.array(_read_vtk_points(vtk_path))
+    if pts.size == 0:
+        return []
+
+    # Average z from the cutting plane (should all be ~PED_Z)
+    z = float(np.median(pts[:, 2]))
+
+    # Bin each point to the nearest grid node
+    gx = np.round(pts[:, 0] / dx) * dx
+    gy = np.round(pts[:, 1] / dy) * dy
+
+    unique = set(zip(gx.tolist(), gy.tolist()))
+    positions = sorted((float(x), float(y), z) for x, y in unique)
+    return positions
+
+
+def _read_vtk_points(vtk_path):
+    """Read point coordinates from a VTK legacy file (ASCII or pyvista)."""
+    try:
+        import pyvista as pv
+        pts = pv.read(vtk_path).points
+        return [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
+    except Exception:
+        pass
+    # Manual ASCII VTK parser fallback
+    with open(vtk_path) as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith('POINTS'):
+            n = int(line.split()[1])
+            data = []
+            j = i + 1
+            while len(data) < n * 3 and j < len(lines):
+                data.extend(map(float, lines[j].split()))
+                j += 1
             import numpy as np
-
-            reader = vtk.vtkSTLReader()
-            reader.SetFileName(stl)
-            reader.Update()
-            mesh = reader.GetOutput()
-            b = mesh.GetBounds()   # (xmin,xmax, ymin,ymax, zmin,zmax)
-
-            xmin = math.floor(b[0] / dx) * dx
-            xmax = math.ceil (b[1] / dx) * dx
-            ymin = math.floor(b[2] / dy) * dy
-            ymax = math.ceil (b[3] / dy) * dy
-            xs = np.arange(xmin, xmax + 0.5*dx, dx)
-            ys = np.arange(ymin, ymax + 0.5*dy, dy)
-            n_total = len(xs) * len(ys)
-            print(f'  Grid from STL bounds: X [{xmin:.0f}..{xmax:.0f}], '
-                  f'Y [{ymin:.0f}..{ymax:.0f}] → {n_total} candidate positions')
-
-            # Building cutout: horizontal parity test.
-            # Cast a ray in +x from each candidate to beyond the domain edge.
-            # Even number of wall intersections → outside building → keep.
-            # Odd number → inside building → discard.
-            obb = vtk.vtkOBBTree()
-            obb.SetDataSet(mesh)
-            obb.BuildLocator()
-            ray_end_x = b[1] + 1.0   # just past the domain boundary
-
-            positions = []
-            for yi in ys:
-                for xi in xs:
-                    pts = vtk.vtkPoints()
-                    obb.IntersectWithLine([xi, yi, PED_Z],
-                                         [ray_end_x, yi, PED_Z], pts, None)
-                    if pts.GetData().GetNumberOfTuples() % 2 == 0:
-                        positions.append((xi, yi, PED_Z))
-
-            print(f'  After building cutout: {len(positions)} / {n_total} positions kept')
-            return positions
-        except Exception as e:
-            print(f'  [WARN] Could not read STL bounds: {e}')
-
-    # Fallback: read existing probe_locs if present
-    probe_locs = os.path.join(case, 'system', 'air', 'probe_locs')
-    if os.path.isfile(probe_locs):
-        positions = []
-        with open(probe_locs) as f:
-            for line in f:
-                line = line.strip().strip('()')
-                parts = line.split()
-                if len(parts) == 3:
-                    positions.append(tuple(float(v) for v in parts))
-        if positions:
-            print(f'  Loaded {len(positions)} positions from existing probe_locs')
-            return positions
-
-    raise RuntimeError('Cannot determine pedestrian grid: no STL bounds and no probe_locs')
+            pts = np.array(data).reshape(-1, 3)
+            return [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
+    raise RuntimeError(f'Could not parse POINTS from {vtk_path}')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -308,12 +321,38 @@ def stage0(args):
             z_offset=PED_Z,
         )
     else:
-        positions = pedestrian_grid_flat(args.case,
-                                         dx=args.ped_grid_dx,
-                                         dy=args.ped_grid_dy)
+        # Flat mode: generate pedestrian cutting plane via OpenFOAM.
+        # The cutting plane lies in the air-region mesh only, so building
+        # interiors are naturally excluded without any raycasting.
+        sys_air = os.path.join(args.case, 'system', 'air')
+        os.makedirs(sys_air, exist_ok=True)
+        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_plane_dict(PED_Z))
 
-    sys_air = os.path.join(args.case, 'system', 'air')
-    os.makedirs(sys_air, exist_ok=True)
+        r = _run('postProcess -func surfacesPedestrian',
+                 args.case, region='air', time_range=str(args.t_start))
+
+        vtk_path = os.path.join(
+            args.case, 'postProcessing', 'surfacesPedestrian',
+            str(args.t_start), 'T_pedestrian.vtk')
+        if r.returncode == 0 and os.path.isfile(vtk_path):
+            positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy)
+            print(f'  Positions on {args.ped_grid_dx}×{args.ped_grid_dy} m grid '
+                  f'(building cutout from T.vtk): {len(positions)}')
+        else:
+            print('  [WARN] Pedestrian surface VTK not generated, falling back to probe_locs')
+            probe_locs = os.path.join(sys_air, 'probe_locs')
+            if not os.path.isfile(probe_locs):
+                print('[ERROR] No probe_locs fallback available')
+                sys.exit(1)
+            positions = []
+            with open(probe_locs) as f:
+                for line in f:
+                    line = line.strip().strip('()')
+                    parts = line.split()
+                    if len(parts) == 3:
+                        positions.append(tuple(float(v) for v in parts))
+            print(f'  Loaded {len(positions)} positions from existing probe_locs')
 
     # probe_locs (used by umcfUTCIpostprocess to know pedestrian positions)
     with open(os.path.join(sys_air, 'probe_locs'), 'w') as f:
