@@ -15,28 +15,6 @@ endif()
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
 
-set(VTK_LIBRARY_DIR "/usr/lib/x86_64-linux-gnu")
-
-set(VTK_LIBRARIES
-    ${VTK_LIBRARY_DIR}/libvtkCommonCore-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkCommonDataModel-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkCommonExecutionModel-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkFiltersCore-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkFiltersExtraction-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkFiltersGeneral-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkIOLegacy-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkIOXML-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkIOGeometry-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtkIOXMLParser-9.3.so.1
-    ${VTK_LIBRARY_DIR}/libvtksys-9.3.so.1
-    -lpthread
-    -ldl
-)
-
-find_path(VTK_INCLUDE_DIR "vtkSmartPointer.h" 
-    PATHS "/usr/include/vtk-9.3" "/usr/include/vtk9" "/usr/include")
-
-include_directories(${VTK_INCLUDE_DIR})
 include_directories(${EIGEN3_INCLUDE_DIR})
 
 set(SOURCES
@@ -56,7 +34,6 @@ add_executable(umcfUTCIpostprocess ${SOURCES})
 
 target_link_libraries(umcfUTCIpostprocess
     PRIVATE
-    ${VTK_LIBRARIES}
     Eigen3::Eigen
     OpenMP::OpenMP_CXX
 )
