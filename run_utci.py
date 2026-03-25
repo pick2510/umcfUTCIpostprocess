@@ -35,7 +35,7 @@ import sys
 
 OF_DIR         = '/home/strebdom/OpenFOAM-8'
 UTCI_UTIL      = os.path.join(os.path.dirname(__file__), 'openfoam')
-CALC_TMRT_BIN  = os.path.join(os.path.dirname(__file__), 'src', 'build', 'umcfUTCIpostprocess')
+CALC_TMRT_BIN  = os.path.join(os.path.dirname(__file__), 'build', 'umcfUTCIpostprocess')
 
 # Default patches — override via CLI if your case differs
 WALL_PATCHES   = ('buildings', 'roofs', 'street', 'ground')
