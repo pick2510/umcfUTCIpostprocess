@@ -53,7 +53,7 @@ PED_GRID_DY    = 3.0
 # ──────────────────────────────────────────────────────────────────────────────
 
 def pedestrian_grid_flat(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
-    """Regular grid at constant z derived from wallAndTreeSurfaces.stl bounds."""
+    """Regular grid at constant z, with building cutout via horizontal ray parity test."""
     stl = os.path.join(case, 'constant', 'triSurface', 'wallAndTreeSurfaces.stl')
     if not os.path.isfile(stl):
         stl = os.path.join(case, 'constant', 'triSurface', 'walls.stl')
@@ -61,20 +61,44 @@ def pedestrian_grid_flat(case, dx=PED_GRID_DX, dy=PED_GRID_DY):
     if os.path.isfile(stl):
         try:
             import vtk
+            import numpy as np
+
             reader = vtk.vtkSTLReader()
             reader.SetFileName(stl)
             reader.Update()
-            b = reader.GetOutput().GetBounds()   # (xmin,xmax, ymin,ymax, zmin,zmax)
+            mesh = reader.GetOutput()
+            b = mesh.GetBounds()   # (xmin,xmax, ymin,ymax, zmin,zmax)
+
             xmin = math.floor(b[0] / dx) * dx
             xmax = math.ceil (b[1] / dx) * dx
             ymin = math.floor(b[2] / dy) * dy
             ymax = math.ceil (b[3] / dy) * dy
-            import numpy as np
             xs = np.arange(xmin, xmax + 0.5*dx, dx)
             ys = np.arange(ymin, ymax + 0.5*dy, dy)
+            n_total = len(xs) * len(ys)
             print(f'  Grid from STL bounds: X [{xmin:.0f}..{xmax:.0f}], '
-                  f'Y [{ymin:.0f}..{ymax:.0f}] → {len(xs)*len(ys)} positions')
-            return [(x, y, PED_Z) for x in xs for y in ys]
+                  f'Y [{ymin:.0f}..{ymax:.0f}] → {n_total} candidate positions')
+
+            # Building cutout: horizontal parity test.
+            # Cast a ray in +x from each candidate to beyond the domain edge.
+            # Even number of wall intersections → outside building → keep.
+            # Odd number → inside building → discard.
+            obb = vtk.vtkOBBTree()
+            obb.SetDataSet(mesh)
+            obb.BuildLocator()
+            ray_end_x = b[1] + 1.0   # just past the domain boundary
+
+            positions = []
+            for yi in ys:
+                for xi in xs:
+                    pts = vtk.vtkPoints()
+                    obb.IntersectWithLine([xi, yi, PED_Z],
+                                         [ray_end_x, yi, PED_Z], pts, None)
+                    if pts.GetData().GetNumberOfTuples() % 2 == 0:
+                        positions.append((xi, yi, PED_Z))
+
+            print(f'  After building cutout: {len(positions)} / {n_total} positions kept')
+            return positions
         except Exception as e:
             print(f'  [WARN] Could not read STL bounds: {e}')
 
