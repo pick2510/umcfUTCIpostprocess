@@ -26,14 +26,14 @@ set_target_properties(Eigen3::Eigen PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
 
 set(SOURCES
-    src/umcfUTCIpostprocess.C
-    src/raycaster.C
-    src/viewFactor.C
-    src/tmrtSolver.C
-    src/utciSolver.C
-    src/pedestrian.C
-    src/io.C
-    src/caching.C
+    src/umcfUTCIpostprocess.cpp
+    src/raycaster.cpp
+    src/viewFactor.cpp
+    src/tmrtSolver.cpp
+    src/utciSolver.cpp
+    src/pedestrian.cpp
+    src/io.cpp
+    src/caching.cpp
 )
 
 add_executable(umcfUTCIpostprocess ${SOURCES})
