@@ -1,0 +1,11 @@
+# Python dependencies for the UTCI post-processing workflows in this case.
+# OpenFOAM itself is required separately and is not installable via pip.
+
+numpy==2.4.3
+scipy==1.17.1
+pyvista==0.47.1
+vtk==9.6.0
+joblib==1.5.3
+tqdm==4.67.3
+matplotlib==3.10.8
+pandas
