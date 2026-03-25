@@ -18,9 +18,7 @@ Usage
 
   # terrain-following
   python3 run_utci.py --case /path/to/case --mode terrain \\
-      --pedestrian-mesh /path/to/T_pedestrian.vtk \\
-      --pos-xmin -150 --pos-xmax 500 --pos-ymin -2350 --pos-ymax -1700 \\
-      --pos-grid-step 10
+      [--terrain-patches street ground] [--ped-grid-dx 5] [--ped-grid-dy 5]
 """
 
 import argparse
@@ -49,11 +47,42 @@ PED_GRID_DX    = 3.0
 PED_GRID_DY    = 3.0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PEDESTRIAN GRID — flat
+# PEDESTRIAN SURFACE — OF dict + grid binning (flat and terrain)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pedestrian_plane_dict(z=PED_Z):
-    """OpenFOAM surfaces dict: horizontal cutting plane at pedestrian height, vtk output."""
+def _pedestrian_surface_dict(terrain_patches=None, z=PED_Z):
+    """OpenFOAM surfaces dict for pedestrian position generation (vtk output).
+
+    flat mode (terrain_patches=None):
+        cuttingPlane at z=PED_Z — points lie in the air mesh only (building
+        interiors naturally excluded).
+    terrain mode (terrain_patches provided):
+        patch surface on ground/street patches — point z follows terrain height;
+        caller adds PED_Z offset when binning.
+    """
+    if terrain_patches is None:
+        surface_block = f"""\
+    pedestrian
+    {{
+        type        cuttingPlane;
+        planeType   pointAndNormal;
+        pointAndNormalDict
+        {{
+            basePoint    (0 0 {z});
+            normalVector (0 0 1);
+        }}
+        interpolate false;
+    }}"""
+    else:
+        patches_str = ' '.join(terrain_patches)
+        surface_block = f"""\
+    pedestrian
+    {{
+        type        patch;
+        patches     ({patches_str});
+        interpolate false;
+    }}"""
+
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfacesPedestrian')
@@ -66,44 +95,40 @@ fields
 
 surfaces
 (
-    pedestrian
-    {{
-        type        cuttingPlane;
-        planeType   pointAndNormal;
-        pointAndNormalDict
-        {{
-            basePoint    (0 0 {z});
-            normalVector (0 0 1);
-        }}
-        interpolate false;
-    }}
+{surface_block}
 );
 """
     )
 
 
-def _bin_vtk_to_grid(vtk_path, dx, dy):
+def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
     """
-    Read points from a pedestrian-plane VTK and snap them to a regular dx/dy grid.
+    Read points from a pedestrian surface VTK and snap them to a regular dx/dy grid.
 
-    Any VTK point within half a cell of a grid node marks that node as valid.
-    Returns a sorted list of unique (x, y, z) grid-node positions at the
-    z-height of the cutting plane.
+    For each (x, y) grid cell the z-coordinate is the median z of all VTK
+    points in that cell, plus z_offset.
+
+    flat mode  : z_offset=0  (cutting plane already at PED_Z)
+    terrain mode : z_offset=PED_Z  (ground patch z + 2 m above terrain)
     """
     import numpy as np
+    from collections import defaultdict
+
     pts = np.array(_read_vtk_points(vtk_path))
     if pts.size == 0:
         return []
 
-    # Average z from the cutting plane (should all be ~PED_Z)
-    z = float(np.median(pts[:, 2]))
-
-    # Bin each point to the nearest grid node
     gx = np.round(pts[:, 0] / dx) * dx
     gy = np.round(pts[:, 1] / dy) * dy
 
-    unique = set(zip(gx.tolist(), gy.tolist()))
-    positions = sorted((float(x), float(y), z) for x, y in unique)
+    bins = defaultdict(list)
+    for i in range(len(pts)):
+        bins[(float(gx[i]), float(gy[i]))].append(pts[i, 2])
+
+    positions = sorted(
+        (x, y, float(np.median(zs)) + z_offset)
+        for (x, y), zs in bins.items()
+    )
     return positions
 
 
@@ -131,62 +156,6 @@ def _read_vtk_points(vtk_path):
             return [(float(p[0]), float(p[1]), float(p[2])) for p in pts]
     raise RuntimeError(f'Could not parse POINTS from {vtk_path}')
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# PEDESTRIAN GRID — terrain-following
-# ──────────────────────────────────────────────────────────────────────────────
-
-def pedestrian_grid_terrain(mesh_vtk, xmin, xmax, ymin, ymax, grid_step,
-                             z_offset=PED_Z, ray_z_start=300.0, ray_z_end=1000.0):
-    """
-    Cast vertical rays onto a surface mesh VTK and return positions offset
-    z_offset metres above each terrain intersection.
-
-    Parameters
-    ----------
-    mesh_vtk    : path to the pedestrian-level surface VTK (e.g. T_pedestrian.vtk)
-    xmin/xmax   : x domain bounds for ray origins
-    ymin/ymax   : y domain bounds for ray origins
-    grid_step   : horizontal spacing between rays [m]
-    z_offset    : height above terrain surface [m] (default 2 m)
-    ray_z_start : z of ray origin — below terrain [m]
-    ray_z_end   : z of ray terminus — above terrain [m]
-    """
-    import numpy as np
-    import vtk
-
-    reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(mesh_vtk)
-    reader.ReadAllVectorsOn()
-    reader.ReadAllScalarsOn()
-    reader.Update()
-    mesh = reader.GetOutput()
-
-    obb = vtk.vtkOBBTree()
-    obb.SetDataSet(mesh)
-    obb.BuildLocator()
-
-    xs = np.arange(xmin, xmax + 0.5 * grid_step, grid_step)
-    ys = np.arange(ymin, ymax + 0.5 * grid_step, grid_step)
-    n_rays = len(xs) * len(ys)
-    print(f'  Terrain grid: X [{xmin:.0f}..{xmax:.0f}], Y [{ymin:.0f}..{ymax:.0f}] '
-          f'→ {n_rays} rays')
-
-    positions = []
-    for xi in xs:
-        for yi in ys:
-            start = [xi, yi, ray_z_start]
-            end   = [xi, yi, ray_z_end]
-            pts = vtk.vtkPoints()
-            obb.IntersectWithLine(start, end, pts, None)
-            n = pts.GetData().GetNumberOfTuples()
-            if n > 0:
-                p = [0.0, 0.0, 0.0]
-                pts.GetPoint(0, p)
-                positions.append((p[0], p[1], p[2] + z_offset))
-
-    print(f'  Terrain intersections found: {len(positions)} / {n_rays}')
-    return positions
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,53 +275,53 @@ def _compile_if_missing(binary, src_dir):
 # STAGE 0 – Write system files
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _stage0_generate_positions(args):
+    """Run postProcess to generate T_pedestrian.vtk and return binned positions."""
+    sys_air = os.path.join(args.case, 'system', 'air')
+    os.makedirs(sys_air, exist_ok=True)
+
+    terrain_patches = list(args.terrain_patches) if args.mode == 'terrain' else None
+    with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+        f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+
+    r = _run('postProcess -func surfacesPedestrian',
+             args.case, region='air', time_range=str(args.t_start))
+
+    vtk_path = os.path.join(
+        args.case, 'postProcessing', 'surfacesPedestrian',
+        str(args.t_start), 'T_pedestrian.vtk')
+
+    if r.returncode != 0 or not os.path.isfile(vtk_path):
+        return None
+
+    z_offset = PED_Z if args.mode == 'terrain' else 0.0
+    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=z_offset)
+
+
 def stage0(args):
     print(f'\n=== Stage 0: Write system files ({args.mode}) ===')
 
-    if args.mode == 'terrain':
-        if not args.pedestrian_mesh:
-            print('[ERROR] --pedestrian-mesh is required for --mode terrain')
-            sys.exit(1)
-        positions = pedestrian_grid_terrain(
-            args.pedestrian_mesh,
-            args.pos_xmin, args.pos_xmax,
-            args.pos_ymin, args.pos_ymax,
-            args.pos_grid_step,
-            z_offset=PED_Z,
-        )
+    sys_air = os.path.join(args.case, 'system', 'air')
+    positions = _stage0_generate_positions(args)
+
+    if positions is not None:
+        label = 'terrain+{:.0f}m'.format(PED_Z) if args.mode == 'terrain' else 'flat'
+        print(f'  Positions on {args.ped_grid_dx}×{args.ped_grid_dy} m grid '
+              f'({label}, from T_pedestrian.vtk): {len(positions)}')
     else:
-        # Flat mode: generate pedestrian cutting plane via OpenFOAM.
-        # The cutting plane lies in the air-region mesh only, so building
-        # interiors are naturally excluded without any raycasting.
-        sys_air = os.path.join(args.case, 'system', 'air')
-        os.makedirs(sys_air, exist_ok=True)
-        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
-            f.write(_pedestrian_plane_dict(PED_Z))
-
-        r = _run('postProcess -func surfacesPedestrian',
-                 args.case, region='air', time_range=str(args.t_start))
-
-        vtk_path = os.path.join(
-            args.case, 'postProcessing', 'surfacesPedestrian',
-            str(args.t_start), 'T_pedestrian.vtk')
-        if r.returncode == 0 and os.path.isfile(vtk_path):
-            positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy)
-            print(f'  Positions on {args.ped_grid_dx}×{args.ped_grid_dy} m grid '
-                  f'(building cutout from T.vtk): {len(positions)}')
-        else:
-            print('  [WARN] Pedestrian surface VTK not generated, falling back to probe_locs')
-            probe_locs = os.path.join(sys_air, 'probe_locs')
-            if not os.path.isfile(probe_locs):
-                print('[ERROR] No probe_locs fallback available')
-                sys.exit(1)
-            positions = []
-            with open(probe_locs) as f:
-                for line in f:
-                    line = line.strip().strip('()')
-                    parts = line.split()
-                    if len(parts) == 3:
-                        positions.append(tuple(float(v) for v in parts))
-            print(f'  Loaded {len(positions)} positions from existing probe_locs')
+        print('  [WARN] Pedestrian surface VTK not generated, falling back to probe_locs')
+        probe_locs = os.path.join(sys_air, 'probe_locs')
+        if not os.path.isfile(probe_locs):
+            print('[ERROR] No probe_locs fallback available')
+            sys.exit(1)
+        positions = []
+        with open(probe_locs) as f:
+            for line in f:
+                line = line.strip().strip('()')
+                parts = line.split()
+                if len(parts) == 3:
+                    positions.append(tuple(float(v) for v in parts))
+        print(f'  Loaded {len(positions)} positions from existing probe_locs')
 
     # probe_locs (used by umcfUTCIpostprocess to know pedestrian positions)
     with open(os.path.join(sys_air, 'probe_locs'), 'w') as f:
@@ -500,20 +469,17 @@ def parse_args():
     p.add_argument('--skip-utci',       action='store_true', dest='skip_utci')
     p.add_argument('--calc-tmrt-bin', default=CALC_TMRT_BIN, dest='calc_tmrt_bin')
 
-    # flat grid spacing
-    p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx')
-    p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy')
+    # pedestrian grid spacing (flat and terrain)
+    p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',
+                   help='Pedestrian grid x-spacing [m]')
+    p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
+                   help='Pedestrian grid y-spacing [m]')
 
     # terrain-following Stage 0
     tg = p.add_argument_group('terrain mode (--mode terrain)')
-    tg.add_argument('--pedestrian-mesh', default=None, dest='pedestrian_mesh',
-                    help='Surface VTK to ray-cast onto (e.g. T_pedestrian.vtk)')
-    tg.add_argument('--pos-xmin',      type=float, default=None, dest='pos_xmin')
-    tg.add_argument('--pos-xmax',      type=float, default=None, dest='pos_xmax')
-    tg.add_argument('--pos-ymin',      type=float, default=None, dest='pos_ymin')
-    tg.add_argument('--pos-ymax',      type=float, default=None, dest='pos_ymax')
-    tg.add_argument('--pos-grid-step', type=float, default=10.0, dest='pos_grid_step',
-                    help='Horizontal grid spacing for terrain ray-casting [m]')
+    tg.add_argument('--terrain-patches', nargs='+', default=['street', 'ground'],
+                    dest='terrain_patches',
+                    help='Ground patches to sample for terrain-following positions')
 
     return p.parse_args()
 
