@@ -1,0 +1,18 @@
+# C++ build
+src/build/
+src/CMakeFiles/
+src/cmake_install.cmake
+src/Makefile
+src/CMakeCache.txt
+
+# OpenFOAM wmake artifacts
+openfoam/*/Make/linux*/
+openfoam/*/lnInclude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Case-specific
+*.stl

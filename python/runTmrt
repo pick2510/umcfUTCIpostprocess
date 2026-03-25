@@ -1,0 +1,59 @@
+#!/bin/bash
+
+path=../3_umcFoam_vegLAD1 #relative path to case folder
+veg=True #True if there is vegetation in the simulation
+a=3600 #start time
+b=172800 #end time
+c=3600 #timestep between each openfoam output
+
+if [ $veg = 'False' ]; then
+    #calculate volume field for incoming direct solar radiation
+    calculateqrsw -case $path -region air -time $a:$b
+    
+    #calculate surface areas for wall patches
+    calcSf -case $path -region air -time $a
+    
+    #calculate wall surface outgoing radiation
+    calcWallRadOut -case $path -region air -time $a:$b
+    
+    #obtain qrOut, qsOut, Sf at the air region wall boundaries
+    cp ./postProcessDicts/surfaces.airPatch $path"/system/air/surfaces"
+    postProcess -func surfaces -case $path -region air -time $a:$b
+    
+    #obtain qrsw, T, U, w at pedestrian height
+    cp ./postProcessDicts/surfaces.airPedestrian $path"/system/air/surfaces"
+    postProcess -func surfaces -case $path -region air -time $a:$b
+    
+    ##run python codes that calculate Tmrt and UTCI
+    cp ./postProcessDicts/probe_locs $path"/system/air/"
+    # python3 -c "import Tmrt_parallel; Tmrt_parallel.calculate('$path',$a,$b,$c, veg=False)"
+    # python3 -c "import utci; utci.calculate('$path',$a,$b,$c)"
+fi
+
+if [ $veg = 'True' ]; then
+    #calculate volume field for incoming direct solar radiation
+    calculateqrsw -case $path -region vegetation -time $a:$b
+    
+    #calculate surface areas for wall patches
+    calcSf -case $path -region vegetation -time $a
+    
+    #calculate wall surface outgoing radiation
+    calcWallRadOut -case $path -region vegetation -time $a:$b
+    
+    #obtain qrOut, qsOut, Sf at the vegetation region wall boundaries
+    cp ./postProcessDicts/surfaces.vegPatch $path"/system/vegetation/surfaces"
+    postProcess -func surfaces -case $path -region vegetation -time $a:$b
+    
+    #obtain T, U, w at pedestrian height (from air region)
+    cp ./postProcessDicts/surfaces.airPedestrian $path"/system/air/surfaces"
+    postProcess -func surfaces -case $path -region air -time $a:$b
+    
+    #obtain qrsw at pedestrian height (from vegetation region)
+    cp ./postProcessDicts/surfaces.vegPedestrian $path"/system/vegetation/surfaces"
+    postProcess -func surfaces -case $path -region vegetation -time $a:$b
+    
+    ##run python codes that calculate Tmrt and UTCI
+    cp ./postProcessDicts/probe_locs $path"/system/air/"
+    # python3 -c "import Tmrt_parallel; Tmrt_parallel.calculate('$path',$a,$b,$c,veg=True)"
+    # python3 -c "import utci; utci.calculate('$path',$a,$b,$c)"
+fi
