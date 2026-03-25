@@ -86,7 +86,9 @@ def _pedestrian_surface_dict(terrain_patches=None, z=PED_Z):
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfacesPedestrian')
-        + f"""surfaceFormat   vtk;
+        + f"""#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+
+surfaceFormat   vtk;
 
 fields
 (
@@ -103,33 +105,60 @@ surfaces
 
 def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
     """
-    Read points from a pedestrian surface VTK and snap them to a regular dx/dy grid.
+    Build a regular dx/dy grid of pedestrian positions from a surface VTK.
 
-    For each (x, y) grid cell the z-coordinate is the median z of all VTK
-    points in that cell, plus z_offset.
+    flat mode (z_offset=0):
+        Generates a regular grid from the VTK bounds and keeps only points
+        that fall inside the surface mesh (building interiors excluded).
+        Uses pyvista select_interior_points for the inside test.
 
-    flat mode  : z_offset=0  (cutting plane already at PED_Z)
-    terrain mode : z_offset=PED_Z  (ground patch z + 2 m above terrain)
+    terrain mode (z_offset=PED_Z):
+        Bins face-center points from the ground-patch VTK onto the dx/dy grid;
+        each grid node gets the median terrain z of its bin + z_offset.
     """
     import numpy as np
-    from collections import defaultdict
+    import pyvista as pv
 
-    pts = np.array(_read_vtk_points(vtk_path))
-    if pts.size == 0:
-        return []
+    mesh = pv.read(vtk_path)
 
-    gx = np.round(pts[:, 0] / dx) * dx
-    gy = np.round(pts[:, 1] / dy) * dy
+    if z_offset == 0.0:
+        # Flat: regular grid filtered by 2-D triangulation containment test.
+        # Build a matplotlib TriFinder on the mesh triangles (exact, O(log N) per point,
+        # vectorised over the whole grid in one call).
+        import matplotlib.tri as mtri
 
-    bins = defaultdict(list)
-    for i in range(len(pts)):
-        bins[(float(gx[i]), float(gy[i]))].append(pts[i, 2])
+        mesh = mesh.triangulate()
+        pts  = mesh.points
+        tris = mesh.faces.reshape(-1, 4)[:, 1:]
+        tri    = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
+        finder = tri.get_trifinder()
 
-    positions = sorted(
-        (x, y, float(np.median(zs)) + z_offset)
-        for (x, y), zs in bins.items()
-    )
-    return positions
+        b  = mesh.bounds
+        xs = np.arange(round(b[0] / dx) * dx, b[1] + dx, dx)
+        ys = np.arange(round(b[2] / dy) * dy, b[3] + dy, dy)
+        gx, gy = np.meshgrid(xs, ys)
+        inside = finder(gx.ravel(), gy.ravel()) >= 0
+
+        z = float(np.median(pts[:, 2]))
+        vx = gx.ravel()[inside]
+        vy = gy.ravel()[inside]
+        positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
+        return positions
+
+    else:
+        # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z
+        from collections import defaultdict
+        centers = mesh.cell_centers().points
+        gx = np.round(centers[:, 0] / dx) * dx
+        gy = np.round(centers[:, 1] / dy) * dy
+        bins = defaultdict(list)
+        for i in range(len(centers)):
+            bins[(float(gx[i]), float(gy[i]))].append(centers[i, 2])
+        positions = sorted(
+            (x, y, float(np.median(zs)) + z_offset)
+            for (x, y), zs in bins.items()
+        )
+        return positions
 
 
 def _read_vtk_points(vtk_path):
