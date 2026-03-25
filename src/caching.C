@@ -19,7 +19,7 @@ bool createDirectory(const std::string& path) {
     return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
 }
 
-// Helper: write a sparse segment vector
+// Helper: write a sparse segment vector (values stored as float32 to halve entry size)
 static void writeSparseSegments(std::ofstream& f,
     const std::array<std::vector<std::pair<int,double>>, 5>& segs)
 {
@@ -27,13 +27,14 @@ static void writeSparseSegments(std::ofstream& f,
         int sz = static_cast<int>(segs[n].size());
         f.write(reinterpret_cast<const char*>(&sz), sizeof(int));
         for (const auto& [idx, val] : segs[n]) {
-            f.write(reinterpret_cast<const char*>(&idx), sizeof(int));
-            f.write(reinterpret_cast<const char*>(&val), sizeof(double));
+            float fval = static_cast<float>(val);
+            f.write(reinterpret_cast<const char*>(&idx),  sizeof(int));
+            f.write(reinterpret_cast<const char*>(&fval), sizeof(float));
         }
     }
 }
 
-// Helper: read a sparse segment vector
+// Helper: read a sparse segment vector (values stored as float32)
 static bool readSparseSegments(std::ifstream& f,
     std::array<std::vector<std::pair<int,double>>, 5>& segs)
 {
@@ -42,8 +43,10 @@ static bool readSparseSegments(std::ifstream& f,
         if (!f.read(reinterpret_cast<char*>(&sz), sizeof(int))) return false;
         segs[n].resize(sz);
         for (auto& [idx, val] : segs[n]) {
-            if (!f.read(reinterpret_cast<char*>(&idx), sizeof(int))) return false;
-            if (!f.read(reinterpret_cast<char*>(&val), sizeof(double))) return false;
+            float fval = 0.0f;
+            if (!f.read(reinterpret_cast<char*>(&idx),  sizeof(int)))   return false;
+            if (!f.read(reinterpret_cast<char*>(&fval), sizeof(float))) return false;
+            val = static_cast<double>(fval);
         }
     }
     return true;
@@ -56,7 +59,7 @@ bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
     // Version tag
     int version = 0;
     file.read(reinterpret_cast<char*>(&version), sizeof(int));
-    if (version != 2) return false;   // old dense cache → force recompute
+    if (version != 3) return false;   // version mismatch → force recompute
 
     result.Fijsum.resize(5);
     file.read(reinterpret_cast<char*>(result.Fijsum.data()), 5 * sizeof(double));
@@ -83,7 +86,7 @@ bool BinaryCache::save(const std::string& path, const ViewFactorResult& result) 
         return false;
     }
 
-    int version = 2;
+    int version = 3;
     file.write(reinterpret_cast<const char*>(&version), sizeof(int));
     file.write(reinterpret_cast<const char*>(result.Fijsum.data()),    5 * sizeof(double));
     file.write(reinterpret_cast<const char*>(result.FijsumSky.data()), 5 * sizeof(double));
@@ -95,7 +98,7 @@ bool BinaryCache::save(const std::string& path, const ViewFactorResult& result) 
 
 std::string BinaryCache::getCachePath(int pedIndex) const {
     std::ostringstream oss;
-    oss << baseDir_ << "/pos/" << pedIndex << "/F.bin";
+    oss << baseDir_ << "/pos/" << pedIndex << ".bin";
     return oss.str();
 }
 
