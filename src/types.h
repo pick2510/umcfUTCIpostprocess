@@ -75,24 +75,6 @@ struct UtciResult {
     double va;           // Wind speed at 10m [m/s]
 };
 
-enum class WorkflowMode {
-    Flat,      // Discrete/flat workflow (pedestrian grid at z=2m)
-    Terrain    // Terrain-following workflow (positions from mesh surface)
-};
-
-struct SimulationParams {
-    std::string casePath;
-    WorkflowMode mode;
-    int tStart;
-    int tEnd;
-    int tStep;
-    std::string outputDir;
-    int nThreads;
-    bool computeUtci;
-    bool forceRecompute;
-    bool useSkyViewFactors;
-    bool hasVegetation;
-};
 
 }
 

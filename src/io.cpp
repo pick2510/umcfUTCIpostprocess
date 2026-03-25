@@ -1,6 +1,6 @@
-#include "io.H"
-#include "constants.H"
-#include "pedestrian.H"
+#include "io.h"
+#include "constants.h"
+#include "pedestrian.h"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -140,85 +140,6 @@ std::vector<SurfacePatch> loadSurfacePatches(const std::string& rawPath) {
     return patches;
 }
 
-std::vector<SurfacePatch> loadSurfacePatchesWithTemp(const std::string& sfPath, const std::string& tempPath) {
-    std::vector<SurfacePatch> patches;
-    
-    std::vector<Vec3> centers;
-    std::vector<Vec3> areas;
-    
-    std::ifstream sfFile(sfPath);
-    if (!sfFile.is_open()) {
-        std::cerr << "Warning: Cannot open Sf file: " << sfPath << std::endl;
-        return patches;
-    }
-    
-    std::string line;
-    int headerLines = 0;
-    
-    while (std::getline(sfFile, line)) {
-        if (headerLines < 2) {
-            headerLines++;
-            continue;
-        }
-        line = trim(line);
-        if (line.empty()) continue;
-        
-        auto parts = split(line, ' ');
-        if (parts.size() >= 6) {
-            try {
-                Vec3 center(std::stod(parts[0]), std::stod(parts[1]), std::stod(parts[2]));
-                Vec3 area(std::stod(parts[3]), std::stod(parts[4]), std::stod(parts[5]));
-                centers.push_back(center);
-                areas.push_back(area);
-            } catch (...) {}
-        }
-    }
-    
-    std::vector<double> temps(centers.size(), 300.0);
-
-    std::ifstream tempFile(tempPath);
-    if (tempFile.is_open()) {
-        headerLines = 0;
-        size_t idx = 0;
-        while (std::getline(tempFile, line) && idx < temps.size()) {
-            if (headerLines < 2) {
-                headerLines++;
-                continue;
-            }
-            line = trim(line);
-            if (line.empty()) continue;
-
-            auto parts = split(line, ' ');
-            // T file format: x y z T  (column 3 is temperature)
-            if (parts.size() >= 4) {
-                try {
-                    temps[idx] = std::stod(parts[3]);
-                    idx++;
-                } catch (...) {
-                    idx++;
-                }
-            }
-        }
-    } else {
-        std::cerr << "Warning: Cannot open temperature file: " << tempPath << std::endl;
-    }
-
-    for (size_t i = 0; i < centers.size(); ++i) {
-        SurfacePatch patch;
-        patch.center = {centers[i].x(), centers[i].y(), centers[i].z()};
-        // Negate area vectors (OpenFOAM Sf points outward, we need inward)
-        patch.areaVector = -areas[i];
-        patch.area = areas[i].norm();
-        patch.temperature = temps[i];
-        patch.qr    = 0.0;
-        patch.qrOut = 0.0;
-        patch.qsOut = 0.0;
-        patches.push_back(patch);
-    }
-    
-    return patches;
-}
-
 // Generic: load scalar column (index 3) from a 4-column raw file
 std::vector<double> loadScalarField(const std::string& rawPath) {
     std::vector<double> vals;
@@ -255,45 +176,6 @@ std::vector<double> loadScalarField(const std::string& rawPath) {
 
 std::vector<double> loadQrData(const std::string& qrPath) {
     return loadScalarField(qrPath);
-}
-
-std::pair<Eigen::VectorXd, Eigen::VectorXd> loadTemperatureField(
-    const std::string& rawPath) 
-{
-    std::vector<double> temps;
-    
-    std::ifstream file(rawPath);
-    if (!file.is_open()) {
-        return {Eigen::VectorXd(0), Eigen::VectorXd(0)};
-    }
-    
-    std::string line;
-    int headerLines = 0;
-    
-    while (std::getline(file, line)) {
-        if (headerLines < 2) {
-            headerLines++;
-            continue;
-        }
-        
-        line = trim(line);
-        if (line.empty()) continue;
-        
-        auto parts = split(line, ' ');
-        if (!parts.empty()) {
-            try {
-                temps.push_back(std::stod(parts[0]));
-            } catch (...) {
-                temps.push_back(0.0);
-            }
-        }
-    }
-    
-    Eigen::VectorXd result(temps.size());
-    for (size_t i = 0; i < temps.size(); ++i) {
-        result[i] = temps[i];
-    }
-    return {result, Eigen::VectorXd()};
 }
 
 // Parse OpenFOAM time-vector3 table: "( (t (sx sy sz)) ... )"
@@ -538,50 +420,6 @@ loadProbeVelocityMagAll(const std::string& path) {
         if (!mags.empty()) rows.push_back({t, std::move(mags)});
     }
     return rows;
-}
-
-// Return the row whose time is closest to targetTime (or first row if targetTime<0).
-static const std::vector<double>&
-pickProbeRow(const std::vector<std::pair<double,std::vector<double>>>& rows,
-             double targetTime,
-             const std::vector<double>& fallback) {
-    if (rows.empty()) return fallback;
-    if (targetTime < 0.0) return rows.front().second;
-    const std::vector<double>* best = &rows.front().second;
-    double bestDiff = std::abs(rows.front().first - targetTime);
-    for (const auto& row : rows) {
-        double diff = std::abs(row.first - targetTime);
-        if (diff < bestDiff) { bestDiff = diff; best = &row.second; }
-    }
-    return *best;
-}
-
-std::vector<double> loadProbeScalar(const std::string& path, double targetTime) {
-    auto rows = loadProbeScalarAll(path);
-    if (rows.empty()) {
-        std::cerr << "Warning: Cannot open probe file: " << path << "\n";
-        return {};
-    }
-    static std::vector<double> dummy;
-    const auto& vals = pickProbeRow(rows, targetTime, dummy);
-    std::cout << "  Probe scalar: " << vals.size() << " values";
-    if (!rows.empty()) std::cout << " (rows=" << rows.size() << ", picked t~" << targetTime << ")";
-    std::cout << "\n";
-    return vals;
-}
-
-std::vector<double> loadProbeVelocityMag(const std::string& path, double targetTime) {
-    auto rows = loadProbeVelocityMagAll(path);
-    if (rows.empty()) {
-        std::cerr << "Warning: Cannot open probe file: " << path << "\n";
-        return {};
-    }
-    static std::vector<double> dummy;
-    const auto& vals = pickProbeRow(rows, targetTime, dummy);
-    std::cout << "  Probe velocity: " << vals.size() << " magnitudes";
-    if (!rows.empty()) std::cout << " (rows=" << rows.size() << ", picked t~" << targetTime << ")";
-    std::cout << "\n";
-    return vals;
 }
 
 // --------------------------------------------------------------------------

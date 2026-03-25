@@ -1,7 +1,7 @@
 #ifndef TMRTSOLVER_H
 #define TMRTSOLVER_H
 
-#include "types.H"
+#include "types.h"
 #include <string>
 #include <vector>
 #include <memory>

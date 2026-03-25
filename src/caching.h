@@ -1,7 +1,7 @@
 #ifndef CACHING_H
 #define CACHING_H
 
-#include "types.H"
+#include "types.h"
 #include <string>
 
 namespace utci {

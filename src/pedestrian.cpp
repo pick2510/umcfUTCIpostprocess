@@ -1,5 +1,5 @@
-#include "pedestrian.H"
-#include "constants.H"
+#include "pedestrian.h"
+#include "constants.h"
 #include <cmath>
 
 namespace utci {
@@ -29,10 +29,6 @@ PedestrianPosition createPedestrianPosition(const Point3& center) {
     ped.areaVectors[4] = Vec3(0.0, 0.0, 0.16);    // top (facing +Z)
     
     return ped;
-}
-
-std::array<Vec3, 5> getPedestrianAreaVectors(const PedestrianPosition& ped) {
-    return ped.areaVectors;
 }
 
 }

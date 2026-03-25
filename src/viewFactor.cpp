@@ -1,6 +1,6 @@
-#include "viewFactor.H"
-#include "raycaster.H"
-#include "constants.H"
+#include "viewFactor.h"
+#include "raycaster.h"
+#include "constants.h"
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -133,13 +133,6 @@ ViewFactorResult ViewFactorCalculator::compute(
     return result;
 }
 
-bool ViewFactorCalculator::loadCache(const std::string& cachePath) {
-    std::ifstream file(cachePath, std::ios::binary);
-    return file.good();
-}
 
-void ViewFactorCalculator::saveCache(const std::string& cachePath) const {
-    std::ofstream file(cachePath, std::ios::binary);
-}
 
 }

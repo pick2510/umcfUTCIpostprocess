@@ -1,5 +1,5 @@
-#include "tmrtSolver.H"
-#include "constants.H"
+#include "tmrtSolver.h"
+#include "constants.h"
 #include <cmath>
 #include <iostream>
 

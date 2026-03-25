@@ -1,5 +1,5 @@
-#include "raycaster.H"
-#include "constants.H"
+#include "raycaster.h"
+#include "constants.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -251,12 +251,6 @@ bool Raycaster::isBlocked(const Vec3& start, const Vec3& end) const {
     return false;
 }
 
-bool Raycaster::isBlockedBatch(const std::vector<Vec3>& starts,
-                                const std::vector<Vec3>& ends) const {
-    for (size_t i = 0; i < starts.size(); ++i)
-        if (isBlocked(starts[i], ends[i])) return true;
-    return false;
-}
 
 bool Raycaster::isValid() const { return pImpl->wallsLoaded; }
 

@@ -1,7 +1,7 @@
 #ifndef UTCISOLVER_H
 #define UTCISOLVER_H
 
-#include "types.H"
+#include "types.h"
 
 namespace utci {
 

@@ -1,4 +1,4 @@
-#include "utciSolver.H"
+#include "utciSolver.h"
 #include <cmath>
 #include <iostream>
 

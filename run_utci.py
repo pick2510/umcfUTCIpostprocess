@@ -420,13 +420,12 @@ def stage2(args):
     binary = args.calc_tmrt_bin
     if not os.path.isfile(binary):
         print(f'  [ERROR] Binary not found: {binary}')
-        print('  Build: cd src && mkdir -p build && cd build && cmake .. && make -j$(nproc)')
+        print('  Build: mkdir -p build && cd build && cmake .. && make -j$(nproc)')
         sys.exit(1)
 
     cmd = [
         binary,
         '--case',       args.case,
-        '--mode',       args.mode,
         '--start',      str(args.t_start),
         '--end',        str(args.t_end),
         '--step',       str(args.t_step),

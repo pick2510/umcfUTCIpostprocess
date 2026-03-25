@@ -11,15 +11,15 @@
 #include <cstring>
 #include <iomanip>
 
-#include "constants.H"
-#include "types.H"
-#include "pedestrian.H"
-#include "raycaster.H"
-#include "viewFactor.H"
-#include "tmrtSolver.H"
-#include "utciSolver.H"
-#include "io.H"
-#include "caching.H"
+#include "constants.h"
+#include "types.h"
+#include "pedestrian.h"
+#include "raycaster.h"
+#include "viewFactor.h"
+#include "tmrtSolver.h"
+#include "utciSolver.h"
+#include "io.h"
+#include "caching.h"
 #include <fstream>
 
 #ifdef _OPENMP
@@ -30,7 +30,6 @@ using namespace utci;
 
 struct CommandLineArgs {
     std::string casePath;
-    WorkflowMode mode = WorkflowMode::Flat;
     int tStart = 3600;
     int tEnd = 86400;
     int tStep = 3600;
@@ -39,7 +38,6 @@ struct CommandLineArgs {
     bool computeUtci = true;
     bool forceRecompute = false;
     bool useSkyViewFactors = true;
-    bool hasVegetation = true;
     // Optional spatial filter (radius <= 0 means no filter)
     double filterCenterX = -1.0;
     double filterCenterY = -1.0;
@@ -54,7 +52,6 @@ void printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
               << "Options:\n"
               << "  --case <path>          Case directory (required)\n"
-              << "  --mode flat|terrain    Workflow mode (default: flat)\n"
               << "  --start <time>         Start timestep (default: 3600)\n"
               << "  --end <time>           End timestep (default: 86400)\n"
               << "  --step <time>          Timestep interval (default: 3600)\n"
@@ -78,13 +75,6 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
 
         if (arg == "--case" && i + 1 < argc) {
             args.casePath = argv[++i];
-        } else if (arg == "--mode" && i + 1 < argc) {
-            std::string mode = argv[++i];
-            if (mode == "terrain") {
-                args.mode = WorkflowMode::Terrain;
-            } else {
-                args.mode = WorkflowMode::Flat;
-            }
         } else if (arg == "--start" && i + 1 < argc) {
             args.tStart = std::stoi(argv[++i]);
         } else if (arg == "--end" && i + 1 < argc) {
@@ -171,7 +161,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "=== umcfUTCIpostprocess: C++ Tmrt/UTCI Calculator ===\n";
     std::cout << "Case: " << args.casePath << "\n";
-    std::cout << "Mode: " << (args.mode == WorkflowMode::Flat ? "flat" : "terrain") << "\n";
 
     std::vector<int> timesteps = getTimesteps(args.tStart, args.tEnd, args.tStep);
     std::cout << "Timesteps: " << timesteps.size() << " (";
