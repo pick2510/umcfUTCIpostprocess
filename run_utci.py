@@ -28,6 +28,9 @@ import shutil
 import subprocess
 import sys
 
+# Force line-buffered stdout so output appears in SLURM logs without delay.
+sys.stdout.reconfigure(line_buffering=True)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # DEFAULTS
 # ──────────────────────────────────────────────────────────────────────────────
