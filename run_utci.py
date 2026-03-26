@@ -455,6 +455,24 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
 
 def stage2(args):
     print('\n=== Stage 2: calcTmrt ===')
+
+    # Preflight: verify qrOut files exist for at least one timestep.
+    # If missing, Stage 1 (calcWallRadOut) was not run or ran against the wrong
+    # region, and the C++ binary would produce near-zero Tmrt for shadowed positions.
+    surf_base = os.path.join(args.case, 'postProcessing', 'surfaces')
+    qrout_found = False
+    if os.path.isdir(surf_base):
+        for t_dir in sorted(os.listdir(surf_base)):
+            qrout = os.path.join(surf_base, t_dir, 'qrOut_wallAndTreeSurfaces.raw')
+            if os.path.isfile(qrout):
+                qrout_found = True
+                break
+    if not qrout_found:
+        print('  [ERROR] No qrOut_wallAndTreeSurfaces.raw found under postProcessing/surfaces/.')
+        print('  Run Stage 1 first (calcWallRadOut must complete before Stage 2).')
+        print('  If using a vegetation region, ensure --vegetation is set (it is the default).')
+        sys.exit(1)
+
     binary = args.calc_tmrt_bin
     if not os.path.isfile(binary):
         print(f'  [ERROR] Binary not found: {binary}')
@@ -534,8 +552,10 @@ def parse_args():
     p.add_argument('--mode',       default='flat', choices=['flat', 'terrain'])
     p.add_argument('--output-dir', default='UTCI',  dest='output_dir')
     p.add_argument('-j', '--threads', type=int, default=20)
-    p.add_argument('--vegetation', action='store_true',
-                   help='Use vegetation region for surface/radiation sampling')
+    p.add_argument('--vegetation', action='store_true', default=True,
+                   help='Use vegetation region for surface/radiation sampling (default: True)')
+    p.add_argument('--no-vegetation', action='store_false', dest='vegetation',
+                   help='Use air region instead of vegetation for surface/radiation sampling')
     p.add_argument('--wall-patches', nargs='+', default=list(WALL_PATCHES), dest='wall_patches')
     p.add_argument('--sky-patches',  nargs='+', default=list(SKY_PATCHES),  dest='sky_patches')
     p.add_argument('--force-recompute', action='store_true', dest='force_recompute')
