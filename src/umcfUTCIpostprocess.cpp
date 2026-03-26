@@ -46,6 +46,10 @@ struct CommandLineArgs {
     int maxPositions = -1;
     // Batch size for view factor processing (limits peak memory)
     int batchSize = 500;
+    // UTCI calculation method
+    UtciMethod utciMethod = UtciMethod::POLYNOMIAL;
+    // LUT file path (empty = look for utci_offset.Dat next to binary)
+    std::string lutPath;
 };
 
 void printUsage(const char* progName) {
@@ -57,6 +61,8 @@ void printUsage(const char* progName) {
               << "  --step <time>          Timestep interval (default: 3600)\n"
               << "  --output-dir <dir>     Output directory (default: UTCI)\n"
               << "  --skip-utci            Skip UTCI calculation\n"
+              << "  --utci-method <m>      UTCI method: poly (default) or lut\n"
+              << "  --lut-path <file>      Path to utci_offset.Dat (default: next to binary)\n"
               << "  --force-recompute      Force recompute view factors\n"
               << "  --filter-radius <r>    Filter positions within radius r of center\n"
               << "  --filter-cx <x>        Filter center X (used with --filter-radius)\n"
@@ -85,6 +91,13 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.outputDir = argv[++i];
         } else if (arg == "--skip-utci") {
             args.computeUtci = false;
+        } else if (arg == "--utci-method" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "lut")  args.utciMethod = UtciMethod::LUT;
+            else if (m == "poly") args.utciMethod = UtciMethod::POLYNOMIAL;
+            else { std::cerr << "Unknown --utci-method: " << m << " (use poly or lut)\n"; exit(1); }
+        } else if (arg == "--lut-path" && i + 1 < argc) {
+            args.lutPath = argv[++i];
         } else if (arg == "--force-recompute") {
             args.forceRecompute = true;
         } else if (arg == "--max-positions" && i + 1 < argc) {
@@ -339,6 +352,32 @@ int main(int argc, char* argv[]) {
     cache.setBaseDir(cacheBaseDir);
     TmrtSolver tmrtSolver;
     UtciSolver utciSolver;
+    utciSolver.setMethod(args.utciMethod);
+    if (args.utciMethod == UtciMethod::LUT) {
+        // Resolve LUT path: explicit arg → next to binary → next to case
+        std::string lutFile = args.lutPath;
+        if (lutFile.empty()) {
+            // argv[0] gives binary path; look in same directory
+            std::string binDir = std::string(getenv("_") ? getenv("_") : "");
+            // Fallback: look next to the source build dir
+            std::string candidate = std::string(argv[0]);
+            auto slash = candidate.rfind('/');
+            std::string binDirPath = (slash != std::string::npos)
+                ? candidate.substr(0, slash) : ".";
+            lutFile = binDirPath + "/../utci_offset.Dat";
+            if (!std::ifstream(lutFile).good())
+                lutFile = binDirPath + "/utci_offset.Dat";
+            if (!std::ifstream(lutFile).good())
+                lutFile = args.casePath + "/utci_offset.Dat";
+        }
+        std::cout << "Loading UTCI LUT: " << lutFile << "\n";
+        if (!utciSolver.loadLUT(lutFile)) {
+            std::cerr << "Failed to load LUT — falling back to polynomial.\n";
+            utciSolver.setMethod(UtciMethod::POLYNOMIAL);
+        }
+    }
+    std::cout << "UTCI method: "
+              << (utciSolver.method() == UtciMethod::LUT ? "LUT" : "polynomial") << "\n";
 
     size_t nPos      = positions.size();
     size_t batchSz   = static_cast<size_t>(std::max(1, args.batchSize));

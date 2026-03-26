@@ -1,6 +1,11 @@
 #include "utciSolver.h"
+#include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <sstream>
+#include <stdexcept>
 
 namespace utci {
 
@@ -18,7 +23,13 @@ double UtciSolver::calcVaporPressure(double Ta_K, double RH) {
     return es * RH / 100.0;
 }
 
-double UtciSolver::calculate(double Ta_c, double va, double f, double Tmrt_c) {
+double UtciSolver::calculate(double Ta_c, double va, double RH, double Tmrt_c) {
+    if (method_ == UtciMethod::LUT)
+        return calculateLUT(Ta_c, va, RH, Tmrt_c);
+    return calculatePoly(Ta_c, va, RH, Tmrt_c);
+}
+
+double UtciSolver::calculatePoly(double Ta_c, double va, double f, double Tmrt_c) {
     double Ta = Ta_c;                               // polynomial expects °C
     double D  = Tmrt_c - Ta_c;                     // delta Tmrt [K or °C, same]
     double Pa = calcVaporPressure(Ta_c + 273.15, f) / 10.0;  // hPa → kPa (polynomial expects kPa)
@@ -163,8 +174,146 @@ double UtciSolver::calculate(double Ta_c, double va, double f, double Tmrt_c) {
         + 3.94367674e-08 * D * D * D * D * Pa
         - 1.18566247e-09 * Ta * D * D * D * D * Pa
         + 3.34678041e-10 * va * D * D * D * D * Pa;
-    
+
     return UTCI;
+}
+
+// ── LUT loading ────────────────────────────────────────────────────────────
+
+bool UtciSolver::loadLUT(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "  [LUT] Cannot open: " << path << "\n";
+        return false;
+    }
+
+    struct Row { double Ta, TrTa, va, rH, offset; };
+    std::vector<Row> rows;
+
+    std::string line;
+    bool header_seen = false;
+    while (std::getline(f, line)) {
+        // Strip UTF-8 BOM if present
+        if (!line.empty() && (unsigned char)line[0] == 0xEF) {
+            line = line.substr(line.find_first_not_of("\xEF\xBB\xBF"));
+        }
+        if (line.empty() || line[0] == '*') continue;
+        // Header row
+        if (!header_seen) { header_seen = true; continue; }
+        std::istringstream ss(line);
+        Row r;
+        double pa;
+        if (ss >> r.Ta >> r.TrTa >> r.va >> r.rH >> pa >> r.offset)
+            rows.push_back(r);
+    }
+
+    if (rows.empty()) {
+        std::cerr << "  [LUT] No data rows parsed from " << path << "\n";
+        return false;
+    }
+
+    // Build sorted unique axis grids
+    auto uniq = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    };
+    std::vector<double> all_Ta, all_TrTa, all_va, all_rH;
+    for (auto& r : rows) {
+        all_Ta.push_back(r.Ta); all_TrTa.push_back(r.TrTa);
+        all_va.push_back(r.va); all_rH.push_back(r.rH);
+    }
+    lut_Ta_    = uniq(all_Ta);
+    lut_TrTa_  = uniq(all_TrTa);
+    lut_va_    = uniq(all_va);
+    lut_rH_    = uniq(all_rH);
+    lut_nTa_   = (int)lut_Ta_.size();
+    lut_nTrTa_ = (int)lut_TrTa_.size();
+    lut_nva_   = (int)lut_va_.size();
+    lut_nrH_   = (int)lut_rH_.size();
+
+    lut_off_.assign((size_t)lut_nTa_ * lut_nva_ * lut_nTrTa_ * lut_nrH_, 0.0);
+
+    // The raw data is sparse in the rH axis: each (Ta, TrTa, va) group has
+    // only a subset of rH values. Interpolate onto the full rH grid per group,
+    // matching the Python np.interp approach, so no LUT cell is left at 0.
+    auto idx = [](const std::vector<double>& g, double v) {
+        return (int)(std::lower_bound(g.begin(), g.end(), v) - g.begin());
+    };
+
+    // Group rows by (Ta, TrTa, va)
+    using Key = std::tuple<double,double,double>;
+    std::map<Key, std::vector<std::pair<double,double>>> groups; // key → [(rH, offset)]
+    for (auto& r : rows)
+        groups[{r.Ta, r.TrTa, r.va}].emplace_back(r.rH, r.offset);
+
+    for (auto& [key, pts] : groups) {
+        auto [Ta, TrTa, va] = key;
+        int iT = idx(lut_Ta_,   Ta);
+        int iM = idx(lut_TrTa_, TrTa);
+        int iV = idx(lut_va_,   va);
+
+        // Sort by rH
+        std::sort(pts.begin(), pts.end());
+
+        // Interpolate onto the full lut_rH_ grid (matches Python np.interp)
+        for (int iR = 0; iR < lut_nrH_; ++iR) {
+            double rh = lut_rH_[iR];
+            // Linear interpolation / extrapolation clamped to endpoints
+            double val;
+            if (rh <= pts.front().first) {
+                val = pts.front().second;
+            } else if (rh >= pts.back().first) {
+                val = pts.back().second;
+            } else {
+                // find bracket
+                auto it = std::lower_bound(pts.begin(), pts.end(),
+                                           std::make_pair(rh, -1e30));
+                auto hi = it; auto lo = std::prev(it);
+                double f = (rh - lo->first) / (hi->first - lo->first);
+                val = lo->second + f * (hi->second - lo->second);
+            }
+            lutSet(iT, iV, iM, iR, val);
+        }
+    }
+
+    std::cout << "  [LUT] Loaded " << rows.size() << " rows  "
+              << "Ta[" << lut_Ta_.front() << ".." << lut_Ta_.back() << "]  "
+              << "TrTa[" << lut_TrTa_.front() << ".." << lut_TrTa_.back() << "]  "
+              << "va[" << lut_va_.front() << ".." << lut_va_.back() << "]  "
+              << "rH[" << lut_rH_.front() << ".." << lut_rH_.back() << "]\n";
+    return true;
+}
+
+// ── LUT interpolation ──────────────────────────────────────────────────────
+
+int UtciSolver::lowerIdx(const std::vector<double>& g, double x, double& frac) {
+    double xc = std::clamp(x, g.front(), g.back());
+    int i = (int)(std::lower_bound(g.begin(), g.end(), xc) - g.begin());
+    i = std::clamp(i - 1, 0, (int)g.size() - 2);
+    frac = (xc - g[i]) / (g[i+1] - g[i]);
+    return i;
+}
+
+double UtciSolver::calculateLUT(double Ta_c, double va, double RH, double Tmrt_c) {
+    double TrTa = Tmrt_c - Ta_c;
+    double fT, fV, fM, fR;
+    int iT = lowerIdx(lut_Ta_,   Ta_c, fT);
+    int iV = lowerIdx(lut_va_,   va,   fV);
+    int iM = lowerIdx(lut_TrTa_, TrTa, fM);
+    int iR = lowerIdx(lut_rH_,   RH,   fR);
+
+    // 4D linear interpolation over 16 corners
+    double offset = 0.0;
+    for (int dT = 0; dT < 2; ++dT)
+    for (int dV = 0; dV < 2; ++dV)
+    for (int dM = 0; dM < 2; ++dM)
+    for (int dR = 0; dR < 2; ++dR) {
+        double w = (dT ? fT : 1-fT) * (dV ? fV : 1-fV)
+                 * (dM ? fM : 1-fM) * (dR ? fR : 1-fR);
+        offset += w * lutGet(iT+dT, iV+dV, iM+dM, iR+dR);
+    }
+    return Ta_c + offset;
 }
 
 }

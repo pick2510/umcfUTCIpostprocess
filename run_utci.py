@@ -411,6 +411,9 @@ def stage2(args):
         cmd.append('--force-recompute')
     if args.skip_utci:
         cmd.append('--skip-utci')
+    cmd += ['--utci-method', args.utci_method]
+    if args.lut_path:
+        cmd += ['--lut-path', args.lut_path]
 
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
@@ -471,6 +474,10 @@ def parse_args():
     p.add_argument('--force-recompute', action='store_true', dest='force_recompute')
     p.add_argument('--skip-utci',       action='store_true', dest='skip_utci')
     p.add_argument('--calc-tmrt-bin', default=CALC_TMRT_BIN, dest='calc_tmrt_bin')
+    p.add_argument('--utci-method', default='poly', choices=['poly', 'lut'], dest='utci_method',
+                   help='UTCI calculation method: poly=165-term polynomial, lut=lookup table')
+    p.add_argument('--lut-path', default='', dest='lut_path',
+                   help='Path to utci_offset.Dat LUT file (default: auto-resolved near binary)')
 
     # pedestrian grid spacing (flat and terrain)
     p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',
@@ -496,6 +503,7 @@ def main():
     print(f'Stages:    {args.stages}')
     print(f'Threads:   {args.threads}')
     print(f'Vegetation: {args.vegetation}')
+    print(f'UTCI method: {args.utci_method}' + (f' ({args.lut_path})' if args.lut_path else ''))
 
     stage_map = {0: stage0, 1: stage1, 2: stage2, 3: stage3}
     for s in sorted(args.stages):

@@ -60,16 +60,16 @@ Eigen::VectorXd TmrtSolver::compute(
             qin_sw += surfaces[m].qsOut * fij_val;
         }
 
-        // Sky fraction = complement of wall/veg VF sum (clamped to [0,1]).
-        // We deliberately ignore FijsumSky here: sky boundary patches have
-        // large, overlapping VFs that push totalF >> 1, severely underestimating
-        // incoming LW and producing unphysical Tmrt (< 200 K at night).
-        if (vf.Fijsum[n] > 1.0) qin_lw /= vf.Fijsum[n];
-        double Fsky = std::max(0.0, 1.0 - std::min(vf.Fijsum[n], 1.0));
-        qin_lw += sigmaTsky4 * Fsky;
-        qin_sw /= std::max(1.0, vf.Fijsum[n]);
-        qin_sw += meteo.Idif * Fsky;
-        (void)useSkyViewFactors; // retained for API compatibility
+        // Clement normalization: add sky radiation weighted by explicit FijsumSky,
+        // then divide both LW and SW by (Fijsum + FijsumSky) so the total sums to 1.
+        qin_lw += sigmaTsky4 * vf.FijsumSky[n];
+        qin_sw += meteo.Idif * vf.FijsumSky[n];
+        double total_vf = vf.Fijsum[n] + vf.FijsumSky[n];
+        if (total_vf > 0.0) {
+            qin_lw /= total_vf;
+            qin_sw /= total_vf;
+        }
+        (void)useSkyViewFactors;
 
         // Apply person's absorption coefficients (matching original Python):
         // Tmrt^4 = (eps_pers * qin_lw + abs_sw * qin_sw) / (sigma * eps_pers)
