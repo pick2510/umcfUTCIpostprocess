@@ -592,8 +592,8 @@ int main(int argc, char* argv[]) {
             Eigen::VectorXd TmrtC = allTmrt[tIdx].array() - 273.15;
             writeVtkMultiScalar(outDir + "/UTCI.vtk", positions,
                 { {"Tmrt", TmrtC}, {"UTCI", allUtci[tIdx]} });
-            writeVtkStructuredSurface(outDir + "/UTCI_surface.vtk", positions,
-                { {"Tmrt", TmrtC}, {"UTCI", allUtci[tIdx]} });
+            // UTCI_surface.vtk is written by run_utci.py after interpolation
+            // onto the dense CFD pedestrian surface mesh (cubic griddata).
         }
 
         // Print stats
