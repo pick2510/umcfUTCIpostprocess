@@ -95,7 +95,12 @@ ViewFactorResult ViewFactorCalculator::compute(
             double cosTI = std::abs(ni.dot(r)) / rMag;
             double cosTJ = std::abs(nj.dot(r)) / rMag;
 
-            double Fij_val = cosTI * cosTJ * AjMag / (rMag * rMag * M_PI);
+            // Finite-area correction: replace A/(π r²) with A/(π r² + A).
+            // The differential approximation A/(π r²) diverges for large nearby
+            // patches (A >> π r²).  The corrected formula is exact for a coaxial
+            // disk and reduces to the differential limit when A << π r².
+            double r2 = rMag * rMag;
+            double Fij_val = cosTI * cosTJ * AjMag / (r2 * M_PI + AjMag);
             result.Fij[n].emplace_back(m, Fij_val);
             result.Fijsum[n] += Fij_val;
         }
@@ -123,7 +128,8 @@ ViewFactorResult ViewFactorCalculator::compute(
                 double cosTI = std::abs(ni.dot(r)) / rMag;
                 double cosTJ = std::abs(nj.dot(r)) / rMag;
 
-                double FijSky_val = cosTI * cosTJ * AjSkyMag / (rMag * rMag * M_PI);
+                double r2sky = rMag * rMag;
+                double FijSky_val = cosTI * cosTJ * AjSkyMag / (r2sky * M_PI + AjSkyMag);
                 result.FijSky[n].emplace_back(m, FijSky_val);
                 result.FijsumSky[n] += FijSky_val;
             }

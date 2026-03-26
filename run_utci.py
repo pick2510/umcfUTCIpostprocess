@@ -438,12 +438,13 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
 
         for name in probe.point_data.keys():
             vals = probe.point_data[name]
-            # Cubic interpolation; fill outside convex hull with nearest neighbour
             interp = griddata((px, py), vals, (mx, my), method='cubic')
             nan_mask = np.isnan(interp)
             if nan_mask.any():
                 interp[nan_mask] = griddata(
                     (px, py), vals, (mx[nan_mask], my[nan_mask]), method='nearest')
+            # Clip cubic overshoot to the probe data range
+            interp = np.clip(interp, vals.min(), vals.max())
             out.point_data[name] = interp.astype('float32')
 
         out.save(os.path.join(case, output_dir, str(t), 'UTCI_surface.vtk'))
