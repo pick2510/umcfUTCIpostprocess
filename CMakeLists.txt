@@ -25,6 +25,14 @@ add_library(Eigen3::Eigen INTERFACE IMPORTED)
 set_target_properties(Eigen3::Eigen PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
 
+# zstr (header-only zlib stream wrapper)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/zstr/src/zstr.hpp")
+    message(FATAL_ERROR
+        "zstr headers not found at extern/zstr.\n"
+        "Run:  git submodule update --init --recursive")
+endif()
+add_subdirectory(extern/zstr)
+
 set(SOURCES
     src/umcfUTCIpostprocess.cpp
     src/raycaster.cpp
@@ -44,6 +52,7 @@ target_link_libraries(umcfUTCIpostprocess
     PRIVATE
     Eigen3::Eigen
     OpenMP::OpenMP_CXX
+    zstr::zstr
 )
 
 install(TARGETS umcfUTCIpostprocess DESTINATION bin)
