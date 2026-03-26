@@ -27,7 +27,6 @@ import os
 import shutil
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
 # Force line-buffered stdout so output appears in SLURM logs without delay.
 sys.stdout.reconfigure(line_buffering=True)
@@ -283,61 +282,47 @@ def _compile_if_missing(binary, src_dir):
 # STAGE 0 – Write system files
 # ──────────────────────────────────────────────────────────────────────────────
 
-def stage0(args):
-    print(f'\n=== Stage 0: Write system files ({args.mode}) ===')
-
+def _stage0_generate_positions(args):
+    """Run postProcess to generate T_pedestrian.vtk and return binned positions."""
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
 
-    # Write the surfacesPedestrian dict before the postProcess call needs it.
     terrain_patches = list(args.terrain_patches) if args.mode == 'terrain' else None
     with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
         f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
 
-    # ── Parallel block 1 ──────────────────────────────────────────────────────
-    # postProcess to get pedestrian positions (slow OF call) runs in parallel
-    # with writing the stage-1 wall/sky surfaces dict (independent file write).
-    def _run_pp():
-        return _run('postProcess -func surfacesPedestrian',
-                    args.case, region='air', time_range=str(args.t_start))
-
-    def _write_surfaces_dict():
-        region = 'vegetation' if args.vegetation else 'air'
-        wall_patches = list(args.wall_patches)
-        if args.vegetation:
-            wall_patches.append(VEG_PATCH)
-        sys_region = os.path.join(args.case, 'system', region)
-        os.makedirs(sys_region, exist_ok=True)
-        with open(os.path.join(sys_region, 'surfaces'), 'w') as f:
-            f.write(_surfaces_patch_dict(wall_patches, args.sky_patches))
-        print(f'  Written system/{region}/surfaces')
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_pp   = pool.submit(_run_pp)
-        fut_surf = pool.submit(_write_surfaces_dict)
-        r        = fut_pp.result()
-        fut_surf.result()
-    # ─────────────────────────────────────────────────────────────────────────
+    r = _run('postProcess -func surfacesPedestrian',
+             args.case, region='air', time_range=str(args.t_start))
 
     vtk_path = os.path.join(
         args.case, 'postProcessing', 'surfacesPedestrian',
         str(args.t_start), 'T_pedestrian.vtk')
 
-    if r.returncode == 0 and os.path.isfile(vtk_path):
-        z_offset = PED_Z if args.mode == 'terrain' else 0.0
-        positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                     z_offset=z_offset)
+    if r.returncode != 0 or not os.path.isfile(vtk_path):
+        return None
+
+    z_offset = PED_Z if args.mode == 'terrain' else 0.0
+    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=z_offset)
+
+
+def stage0(args):
+    print(f'\n=== Stage 0: Write system files ({args.mode}) ===')
+
+    sys_air = os.path.join(args.case, 'system', 'air')
+    positions = _stage0_generate_positions(args)
+
+    if positions is not None:
         label = 'terrain+{:.0f}m'.format(PED_Z) if args.mode == 'terrain' else 'flat'
         print(f'  Positions on {args.ped_grid_dx}×{args.ped_grid_dy} m grid '
               f'({label}, from T_pedestrian.vtk): {len(positions)}')
     else:
         print('  [WARN] Pedestrian surface VTK not generated, falling back to probe_locs')
-        probe_locs_path = os.path.join(sys_air, 'probe_locs')
-        if not os.path.isfile(probe_locs_path):
+        probe_locs = os.path.join(sys_air, 'probe_locs')
+        if not os.path.isfile(probe_locs):
             print('[ERROR] No probe_locs fallback available')
             sys.exit(1)
         positions = []
-        with open(probe_locs_path) as f:
+        with open(probe_locs) as f:
             for line in f:
                 line = line.strip().strip('()')
                 parts = line.split()
@@ -345,25 +330,18 @@ def stage0(args):
                     positions.append(tuple(float(v) for v in parts))
         print(f'  Loaded {len(positions)} positions from existing probe_locs')
 
-    # ── Parallel block 2 ──────────────────────────────────────────────────────
-    # probe_locs and probes dict are independent once positions are available.
-    def _write_probe_locs():
-        with open(os.path.join(sys_air, 'probe_locs'), 'w') as f:
-            f.write('(\n')
-            for p in positions:
-                f.write(f'({p[0]} {p[1]} {p[2]})\n')
-            f.write(')\n')
-        print(f'  Written probe_locs ({len(positions)} positions)')
+    # probe_locs (used by umcfUTCIpostprocess to know pedestrian positions)
+    with open(os.path.join(sys_air, 'probe_locs'), 'w') as f:
+        f.write('(\n')
+        for p in positions:
+            f.write(f'({p[0]} {p[1]} {p[2]})\n')
+        f.write(')\n')
+    print(f'  Written probe_locs ({len(positions)} positions)')
 
-    def _write_probes():
-        with open(os.path.join(sys_air, 'probes'), 'w') as f:
-            f.write(_probes_dict(positions))
-        print('  Written system/air/probes')
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        pool.submit(_write_probe_locs)
-        pool.submit(_write_probes)
-    # ─────────────────────────────────────────────────────────────────────────
+    # probes dict (used by postProcess to sample T, U, w)
+    with open(os.path.join(sys_air, 'probes'), 'w') as f:
+        f.write(_probes_dict(positions))
+    print(f'  Written system/air/probes')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
