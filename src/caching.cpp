@@ -6,7 +6,15 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+#ifdef UTCI_HAVE_ZLIB
+#include "zstr.hpp"
+#endif
+
 namespace utci {
+
+// Cache version tags
+static constexpr int VERSION_PLAIN      = 3;
+static constexpr int VERSION_COMPRESSED = 4;
 
 bool createDirectory(const std::string& path) {
     // Create all intermediate directories (like mkdir -p)
@@ -19,8 +27,31 @@ bool createDirectory(const std::string& path) {
     return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
 }
 
-// Helper: write a sparse segment vector (values stored as float32 to halve entry size)
-static void writeSparseSegments(std::ofstream& f,
+bool BinaryCache::compressionAvailable() {
+#ifdef UTCI_HAVE_ZLIB
+    return true;
+#else
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Helper: detect gzip magic bytes without consuming the stream
+// ---------------------------------------------------------------------------
+static bool fileIsGzip(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    unsigned char b[2] = {0, 0};
+    f.read(reinterpret_cast<char*>(b), 2);
+    return b[0] == 0x1f && b[1] == 0x8b;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: write/read sparse segment vectors (values stored as float32)
+// ---------------------------------------------------------------------------
+
+template<typename Stream>
+static void writeSparseSegments(Stream& f,
     const std::array<std::vector<std::pair<int,double>>, 5>& segs)
 {
     for (int n = 0; n < 5; ++n) {
@@ -34,8 +65,8 @@ static void writeSparseSegments(std::ofstream& f,
     }
 }
 
-// Helper: read a sparse segment vector (values stored as float32)
-static bool readSparseSegments(std::ifstream& f,
+template<typename Stream>
+static bool readSparseSegments(Stream& f,
     std::array<std::vector<std::pair<int,double>>, 5>& segs)
 {
     for (int n = 0; n < 5; ++n) {
@@ -52,15 +83,12 @@ static bool readSparseSegments(std::ifstream& f,
     return true;
 }
 
-bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
+// ---------------------------------------------------------------------------
+// Shared body for load, templated on stream type
+// ---------------------------------------------------------------------------
 
-    // Version tag
-    int version = 0;
-    file.read(reinterpret_cast<char*>(&version), sizeof(int));
-    if (version != 3) return false;   // version mismatch → force recompute
-
+template<typename Stream>
+static bool loadFromStream(Stream& file, ViewFactorResult& result) {
     result.Fijsum.resize(5);
     file.read(reinterpret_cast<char*>(result.Fijsum.data()), 5 * sizeof(double));
 
@@ -73,6 +101,42 @@ bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
     return file.good();
 }
 
+// ---------------------------------------------------------------------------
+// BinaryCache::load
+// ---------------------------------------------------------------------------
+
+bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
+    if (fileIsGzip(path)) {
+#ifdef UTCI_HAVE_ZLIB
+        zstr::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        int version = 0;
+        file.read(reinterpret_cast<char*>(&version), sizeof(int));
+        if (version != VERSION_COMPRESSED) return false;
+
+        return loadFromStream(file, result);
+#else
+        // File is compressed but we were built without zlib — force recompute.
+        std::cerr << "Warning: compressed cache found but ZLIB support not compiled in; recomputing.\n";
+        return false;
+#endif
+    } else {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        int version = 0;
+        file.read(reinterpret_cast<char*>(&version), sizeof(int));
+        if (version != VERSION_PLAIN) return false;
+
+        return loadFromStream(file, result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BinaryCache::save
+// ---------------------------------------------------------------------------
+
 bool BinaryCache::save(const std::string& path, const ViewFactorResult& result) {
     std::string dir = path.substr(0, path.find_last_of('/'));
     if (!createDirectory(dir)) {
@@ -80,21 +144,38 @@ bool BinaryCache::save(const std::string& path, const ViewFactorResult& result) 
         return false;
     }
 
+#ifdef UTCI_HAVE_ZLIB
+    if (compressed_) {
+        zstr::ofstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Cannot write cache: " << path << std::endl;
+            return false;
+        }
+        int version = VERSION_COMPRESSED;
+        file.write(reinterpret_cast<const char*>(&version),               sizeof(int));
+        file.write(reinterpret_cast<const char*>(result.Fijsum.data()),    5 * sizeof(double));
+        file.write(reinterpret_cast<const char*>(result.FijsumSky.data()), 5 * sizeof(double));
+        writeSparseSegments(file, result.Fij);
+        writeSparseSegments(file, result.FijSky);
+        return true;
+    }
+#endif
+
     std::ofstream file(path, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "Error: Cannot write cache: " << path << std::endl;
         return false;
     }
-
-    int version = 3;
-    file.write(reinterpret_cast<const char*>(&version), sizeof(int));
+    int version = VERSION_PLAIN;
+    file.write(reinterpret_cast<const char*>(&version),               sizeof(int));
     file.write(reinterpret_cast<const char*>(result.Fijsum.data()),    5 * sizeof(double));
     file.write(reinterpret_cast<const char*>(result.FijsumSky.data()), 5 * sizeof(double));
     writeSparseSegments(file, result.Fij);
     writeSparseSegments(file, result.FijSky);
-
     return true;
 }
+
+// ---------------------------------------------------------------------------
 
 std::string BinaryCache::getCachePath(int pedIndex) const {
     std::ostringstream oss;

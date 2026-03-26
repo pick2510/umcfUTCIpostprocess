@@ -50,6 +50,8 @@ struct CommandLineArgs {
     UtciMethod utciMethod = UtciMethod::POLYNOMIAL;
     // LUT file path (empty = look for utci_offset.Dat next to binary)
     std::string lutPath;
+    // Write compressed (gzip) cache files; auto-enabled when ZLIB is available
+    bool compressCache = BinaryCache::compressionAvailable();
 };
 
 void printUsage(const char* progName) {
@@ -69,6 +71,8 @@ void printUsage(const char* progName) {
               << "  --filter-cy <y>        Filter center Y (used with --filter-radius)\n"
               << "  --max-positions <N>    Cap number of positions (for testing)\n"
               << "  --batch-size <N>       VF batch size (default 500, lower = less memory)\n"
+              << "  --compress-cache       Write gzip-compressed cache files (default when ZLIB available)\n"
+              << "  --no-compress-cache    Write uncompressed cache files\n"
               << "  -j <N>                 Number of threads (default: 1)\n"
               << "  --help                 Show this message\n";
 }
@@ -114,6 +118,10 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.nThreads = std::stoi(argv[++i]);
         } else if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'j') {
             args.nThreads = std::stoi(arg.substr(2));
+        } else if (arg == "--compress-cache") {
+            args.compressCache = true;
+        } else if (arg == "--no-compress-cache") {
+            args.compressCache = false;
         } else if (arg == "--help") {
             printUsage(argv[0]);
             exit(0);
@@ -350,6 +358,7 @@ int main(int argc, char* argv[]) {
     BinaryCache cache;
     std::string cacheBaseDir = args.casePath + "/" + args.outputDir;
     cache.setBaseDir(cacheBaseDir);
+    cache.setCompressed(args.compressCache);
     TmrtSolver tmrtSolver;
     UtciSolver utciSolver;
     utciSolver.setMethod(args.utciMethod);

@@ -25,13 +25,19 @@ add_library(Eigen3::Eigen INTERFACE IMPORTED)
 set_target_properties(Eigen3::Eigen PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
 
-# zstr (header-only zlib stream wrapper)
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/zstr/src/zstr.hpp")
-    message(FATAL_ERROR
-        "zstr headers not found at extern/zstr.\n"
-        "Run:  git submodule update --init --recursive")
+# zstr (header-only zlib stream wrapper) — optional, enables cache compression
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/zstr/src/zstr.hpp")
+        message(FATAL_ERROR
+            "zstr headers not found at extern/zstr.\n"
+            "Run:  git submodule update --init --recursive")
+    endif()
+    add_subdirectory(extern/zstr)
+    message(STATUS "ZLIB ${ZLIB_VERSION_STRING} found — cache compression enabled")
+else()
+    message(STATUS "ZLIB not found — cache compression disabled")
 endif()
-add_subdirectory(extern/zstr)
 
 set(SOURCES
     src/umcfUTCIpostprocess.cpp
@@ -52,7 +58,11 @@ target_link_libraries(umcfUTCIpostprocess
     PRIVATE
     Eigen3::Eigen
     OpenMP::OpenMP_CXX
-    zstr::zstr
+    $<$<BOOL:${ZLIB_FOUND}>:zstr::zstr>
 )
+
+if(ZLIB_FOUND)
+    target_compile_definitions(umcfUTCIpostprocess PRIVATE UTCI_HAVE_ZLIB=1)
+endif()
 
 install(TARGETS umcfUTCIpostprocess DESTINATION bin)
