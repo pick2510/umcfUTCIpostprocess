@@ -393,6 +393,65 @@ def stage1(args):
 # STAGE 2 – calcTmrt
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
+    """Resample C++ UTCI/Tmrt point-cloud results onto the dense CFD pedestrian
+    surface mesh using cubic interpolation (same approach as utci_clement).
+
+    Reads:  postProcessing/surfacesPedestrian/<t_start>/T_pedestrian.vtk  (CFD mesh)
+            <output_dir>/<t>/UTCI.vtk                                     (probe point cloud)
+    Writes: <output_dir>/<t>/UTCI_surface.vtk                             (dense interpolated mesh)
+    """
+    try:
+        import numpy as np
+        import pyvista as pv
+        from scipy.interpolate import griddata
+    except ImportError as e:
+        print(f'  [WARN] Skipping surface interpolation – missing dependency: {e}')
+        return
+
+    # Load the dense CFD cutting-plane mesh once (building interiors absent)
+    mesh_path = os.path.join(case, 'postProcessing', 'surfacesPedestrian',
+                             str(t_start), 'T_pedestrian.vtk')
+    if not os.path.isfile(mesh_path):
+        print(f'  [WARN] CFD surface mesh not found: {mesh_path}  – skipping interpolation')
+        return
+
+    mesh = pv.read(mesh_path)
+    # Ensure point data (cutting plane may write cell data)
+    if mesh.n_points == 0:
+        mesh = mesh.cell_data_to_point_data()
+    mesh_pts = mesh.points
+    mx, my = mesh_pts[:, 0], mesh_pts[:, 1]
+    print(f'  Interpolating onto CFD surface ({len(mesh_pts)} points) ...')
+
+    done = 0
+    for t in timesteps:
+        utci_path = os.path.join(case, output_dir, str(t), 'UTCI.vtk')
+        if not os.path.isfile(utci_path):
+            continue
+
+        probe = pv.read(utci_path)
+        px, py = probe.points[:, 0], probe.points[:, 1]
+
+        out = mesh.copy(deep=True)
+        out.clear_data()
+
+        for name in probe.point_data.keys():
+            vals = probe.point_data[name]
+            # Cubic interpolation; fill outside convex hull with nearest neighbour
+            interp = griddata((px, py), vals, (mx, my), method='cubic')
+            nan_mask = np.isnan(interp)
+            if nan_mask.any():
+                interp[nan_mask] = griddata(
+                    (px, py), vals, (mx[nan_mask], my[nan_mask]), method='nearest')
+            out.point_data[name] = interp.astype('float32')
+
+        out.save(os.path.join(case, output_dir, str(t), 'UTCI_surface.vtk'))
+        done += 1
+
+    print(f'  Written UTCI_surface.vtk for {done}/{len(timesteps)} timesteps')
+
+
 def stage2(args):
     print('\n=== Stage 2: calcTmrt ===')
     binary = args.calc_tmrt_bin
@@ -423,6 +482,10 @@ def stage2(args):
     if result.returncode != 0:
         sys.exit(result.returncode)
     print('  calcTmrt finished')
+
+    if not args.skip_utci:
+        timesteps = list(range(args.t_start, args.t_end + 1, args.t_step))
+        _interpolate_utci_surface(args.case, args.output_dir, args.t_start, timesteps)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
