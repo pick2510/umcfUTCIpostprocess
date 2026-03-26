@@ -14,9 +14,10 @@ namespace utci {
 static std::string trim(const std::string& s) {
     auto start = s.begin();
     while (start != s.end() && std::isspace(*start)) start++;
+    if (start == s.end()) return {};
     auto end = s.end();
-    do { end--; } while (std::distance(start, end) > 0 && std::isspace(*end));
-    return std::string(start, end + 1);
+    while (end != start && std::isspace(*std::prev(end))) --end;
+    return std::string(start, end);
 }
 
 static std::vector<std::string> split(const std::string& s, char delim) {

@@ -469,9 +469,9 @@ int main(int argc, char* argv[]) {
             for (size_t i = 0; i < allSurfaces.size() && i < sc.allQsOut.size(); ++i)
                 allSurfaces[i].qsOut = sc.allQsOut[i];
 
-            Eigen::VectorXd batchTmrt(bN);
-            Eigen::VectorXd batchUtci(bN);
-            Eigen::VectorXd batchRH  (bN);
+            Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
+            Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);
+            Eigen::VectorXd batchRH   = Eigen::VectorXd::Zero(bN);
 
             // Pick probe data row for this radiation timestep
             double tDouble = static_cast<double>(t);
