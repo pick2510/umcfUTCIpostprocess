@@ -359,6 +359,10 @@ int main(int argc, char* argv[]) {
     std::string cacheBaseDir = args.casePath + "/" + args.outputDir;
     cache.setBaseDir(cacheBaseDir);
     cache.setCompressed(args.compressCache);
+    if (args.compressCache && !BinaryCache::compressionAvailable()) {
+        std::cerr << "Warning: --compress-cache requested but binary was built without ZLIB support; "
+                     "cache files will be written uncompressed.\n";
+    }
     TmrtSolver tmrtSolver;
     UtciSolver utciSolver;
     utciSolver.setMethod(args.utciMethod);
