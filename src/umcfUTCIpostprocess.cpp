@@ -547,14 +547,15 @@ int main(int argc, char* argv[]) {
                 batchTmrt[bi] = TumrtAvg;
 
                 // --- Per-position UTCI inputs ---
-                double Ta_K = (pedIdx < probeT.size()) ? probeT[pedIdx] : meteo.Ta;
+                int origIdx = positions[pedIdx].originalIndex;
+                double Ta_K = (origIdx < (int)probeT.size()) ? probeT[origIdx] : meteo.Ta;
                 if (Ta_K < 200.0) Ta_K = meteo.Ta;  // guard against bad probe values
                 double Ta_c = Ta_K - 273.15;
-                double va   = (pedIdx < probeU.size()) ? probeU[pedIdx] / 0.667 : meteo.va;
+                double va   = (origIdx < (int)probeU.size()) ? probeU[origIdx] / 0.667 : meteo.va;
                 va = std::max(0.5, std::min(17.0, va));  // UTCI polynomial valid range
 
                 // RH from specific humidity (original Python formula)
-                double w   = (pedIdx < probeW.size()) ? probeW[pedIdx] : 0.01;
+                double w   = (origIdx < (int)probeW.size()) ? probeW[origIdx] : 0.01;
                 double psat = std::exp(77.345 + 0.0057*Ta_K - 7235.0/Ta_K)
                               / std::pow(Ta_K, 8.2);
                 double pv   = w * 1e5 / 0.62;
