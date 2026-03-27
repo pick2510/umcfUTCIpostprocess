@@ -117,6 +117,10 @@ Idn       = direct normal irradiance [W/m²]
 
 ### 7. UTCI
 
+Two methods are available, selected at runtime via `--utci-method`:
+
+#### 7a. Polynomial method (`--utci-method poly`, default)
+
 A **165-term polynomial** in four inputs (Fiala/Bröde 2012, UTCI-A):
 
 ```
@@ -125,10 +129,42 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
   Ta      = air temperature [°C]
   va      = wind speed at 10 m reference height [m/s]  (clamped to 0.5–17 m/s)
   D_Tmrt  = Tmrt − Ta  [°C]
-  Pa      = vapour pressure [hPa]
+  Pa      = vapour pressure [kPa]
 ```
 
-**Wind speed conversion:** CFD probe values are at pedestrian height (~2 m). Conversion to the 10 m reference height required by the polynomial:
+Terms span Pa⁰ through Pa⁶ combined with Ta⁰⁻⁶, va⁰⁻⁶, and D⁰⁻⁶ cross-products.
+
+#### 7b. Lookup-table method (`--utci-method lut`)
+
+Uses the official tabulated offset file `utci_offset.Dat` (Bröde et al. 2012, supplemental to IJB UTCI special issue), which encodes `UTCI − Ta` as a function of four variables:
+
+| Axis | Range | Values |
+|------|-------|--------|
+| Ta [°C] | −50 … +50 | 1 °C steps (101 levels) |
+| Tr − Ta [°C] | −30 … +70 | 5 °C steps (21 levels) |
+| va [m/s] | 0.5 … 30.3 | 10 non-uniform levels |
+| RH [%] | 5 … 100 | ~50 non-uniform levels |
+
+The file has ~104 600 rows and 6 columns (Ta, Tr−Ta, va, RH, pa, offset).
+
+**Loading:** rows are grouped by (Ta, Tr−Ta, va) and the sparse RH axis is linearly interpolated onto the full RH grid, matching the Python `np.interp` convention. The result is stored as a flat 4D array indexed `[iTa][iva][iTrTa][irH]`.
+
+**Evaluation:** 4D linear interpolation over the 16 enclosing hypercube corners:
+
+```
+offset = Σ_{dT,dV,dM,dR ∈ {0,1}}  w(dT,dV,dM,dR) × table[iT+dT][iV+dV][iM+dM][iR+dR]
+
+  w = (dT ? fT : 1−fT) × (dV ? fV : 1−fV) × (dM ? fM : 1−fM) × (dR ? fR : 1−fR)
+  f* = fractional position within the bracketing interval (clamped to [0,1])
+
+UTCI = Ta + offset
+```
+
+The LUT method is equivalent to the utci_clement Python implementation. The polynomial method is equivalent to the UTCI_OF Fortran reference (UTCI_a002.f90).
+
+#### Shared inputs
+
+**Wind speed conversion:** CFD probe values are at pedestrian height (~2 m). Conversion to the 10 m reference height required by both methods:
 
 ```
 va_ref = v_CFD / 0.667
@@ -142,7 +178,7 @@ va_ref = v_CFD / 0.667
 pv   = P_ref × w / (ε_H₂O + w)          [Pa]   (urbanMicroclimateFoam convention)
 psat = exp(77.345 + 0.0057 Ta_K − 7235/Ta_K) / Ta_K^8.2   [Pa]
 RH   = pv / psat × 100 %
-Pa   = pv / 100                          [hPa]
+Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 
   P_ref   = 101325 Pa
   ε_H₂O  = 0.621945  (ratio of molar masses M_water/M_dryair)
