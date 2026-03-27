@@ -121,18 +121,28 @@ surfaces
     )
 
 
-def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
+def _stl_bbox(stl_path, padding=0.0):
+    """Return (xmin, xmax, ymin, ymax) of an STL file, expanded by padding."""
+    mesh = pv.read(stl_path)
+    b = mesh.bounds   # (xmin, xmax, ymin, ymax, zmin, zmax)
+    return (b[0] - padding, b[1] + padding,
+            b[2] - padding, b[3] + padding)
+
+
+def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
     """
     Build a regular dx/dy grid of pedestrian positions from a surface VTK.
 
     flat mode (z_offset=0):
-        Generates a regular grid from the VTK bounds and keeps only points
-        that fall inside the surface mesh (building interiors excluded).
-        Uses pyvista select_interior_points for the inside test.
+        Generates a regular grid and keeps only points inside the surface mesh
+        (building interiors excluded via matplotlib TriFinder).
 
     terrain mode (z_offset=PED_Z):
-        Bins face-center points from the ground-patch VTK onto the dx/dy grid;
-        each grid node gets the median terrain z of its bin + z_offset.
+        Bins face-center points onto the dx/dy grid; each cell gets the median
+        terrain z + z_offset.
+
+    bbox: optional (xmin, xmax, ymin, ymax) to clip the grid extent.
+          When None the VTK mesh bounds are used (full domain).
     """
     mesh = pv.read(vtk_path)
 
@@ -146,9 +156,14 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
         tri    = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
         finder = tri.get_trifinder()
 
-        b  = mesh.bounds
-        xs = np.arange(round(b[0] / dx) * dx, b[1] + dx, dx)
-        ys = np.arange(round(b[2] / dy) * dy, b[3] + dy, dy)
+        if bbox is not None:
+            xmin, xmax, ymin, ymax = bbox
+        else:
+            b = mesh.bounds
+            xmin, xmax, ymin, ymax = b[0], b[1], b[2], b[3]
+
+        xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
+        ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
         gx, gy = np.meshgrid(xs, ys)
         inside = finder(gx.ravel(), gy.ravel()) >= 0
 
@@ -161,6 +176,11 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
     else:
         # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z
         centers = mesh.cell_centers().points
+        if bbox is not None:
+            xmin, xmax, ymin, ymax = bbox
+            mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
+                    (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
+            centers = centers[mask]
         gx = np.round(centers[:, 0] / dx) * dx
         gy = np.round(centers[:, 1] / dy) * dy
         bins = defaultdict(list)
@@ -315,6 +335,19 @@ def _stage0_generate_positions(args):
         args.case, 'postProcessing', 'surfacesPedestrian',
         str(args.t_start), 'T_pedestrian.vtk')
 
+    # Optional STL bounding-box clipping
+    bbox = None
+    if args.bbox_padding is not None:
+        stl_path = os.path.join(args.case, 'constant', 'triSurface',
+                                'wallAndTreeSurfaces.stl')
+        if os.path.isfile(stl_path):
+            bbox = _stl_bbox(stl_path, padding=args.bbox_padding)
+            print(f'  STL bbox + {args.bbox_padding} m padding: '
+                  f'x=[{bbox[0]:.1f}, {bbox[1]:.1f}]  '
+                  f'y=[{bbox[2]:.1f}, {bbox[3]:.1f}]')
+        else:
+            print(f'  [WARN] STL not found for bbox clipping: {stl_path}')
+
     # ── forced flat ──────────────────────────────────────────────────────────
     if args.mode == 'flat':
         with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
@@ -323,7 +356,8 @@ def _stage0_generate_positions(args):
                  args.case, region='air', time_range=str(args.t_start))
         if r.returncode != 0 or not os.path.isfile(vtk_path):
             return None, 'flat'
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=0.0), 'flat'
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                 z_offset=0.0, bbox=bbox), 'flat'
 
     # ── forced terrain ───────────────────────────────────────────────────────
     if args.mode == 'terrain':
@@ -334,7 +368,8 @@ def _stage0_generate_positions(args):
                  args.case, region='air', time_range=str(args.t_start))
         if r.returncode != 0 or not os.path.isfile(vtk_path):
             return None, 'terrain'
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=PED_Z), 'terrain'
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                 z_offset=PED_Z, bbox=bbox), 'terrain'
 
     # ── auto-detect (default) ─────────────────────────────────────────────────
     # Step 1: always try flat (cuttingPlane at PED_Z) first
@@ -348,7 +383,8 @@ def _stage0_generate_positions(args):
 
     # Step 2: inspect result
     if not _detect_terrain(vtk_path):
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=0.0), 'flat'
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                 z_offset=0.0, bbox=bbox), 'flat'
 
     # Step 3: re-run as terrain
     print('  Auto-detected terrain domain (z-spread > 0.5 m or empty cutting plane) '
@@ -360,7 +396,8 @@ def _stage0_generate_positions(args):
              args.case, region='air', time_range=str(args.t_start))
     if r.returncode != 0 or not os.path.isfile(vtk_path):
         return None, 'terrain'
-    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=PED_Z), 'terrain'
+    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                             z_offset=PED_Z, bbox=bbox), 'terrain'
 
 
 def stage0(args):
@@ -445,6 +482,7 @@ def stage1(args):
     os.makedirs(sys_air, exist_ok=True)
     print('  postProcess: probes T, U, w (air) ...')
     _run('postProcess -func probes', args.case, region='air', time_range=time_range)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -640,6 +678,10 @@ def parse_args():
                    help='Pedestrian grid x-spacing [m]')
     p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
                    help='Pedestrian grid y-spacing [m]')
+    p.add_argument('--bbox-padding', type=float, default=None, dest='bbox_padding',
+                   metavar='M',
+                   help='Clip probe grid to STL bounding box + M m padding. '
+                        'Default: None (use full domain extent).')
 
     # terrain-following Stage 0 (also used by auto-detect)
     tg = p.add_argument_group('terrain mode (--mode terrain or auto-detected terrain)')
