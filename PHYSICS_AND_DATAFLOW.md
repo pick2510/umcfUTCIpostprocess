@@ -39,9 +39,10 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 **Implementation details:**
 - Only patches within `R_MAG_MAX = 100 m` of the pedestrian are considered
 - Pairs where the body segment does not face the surface (`nᵢ · r < 0`) are skipped
-- Each candidate pair is tested for ray occlusion against the STL BVH (embree); blocked pairs contribute zero
+- Each candidate pair is tested for ray occlusion against the STL BVH; blocked pairs contribute zero
 - Results stored as sparse `(patch_index, float32_value)` pairs per segment
-- Cached to `UTCI/pos/<pedestrian_index>.bin` (binary, version 3)
+- Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
+- Cache format: version 3 (plain binary) or version 4 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
 
 **Sky fraction** (complement approach):
 ```
@@ -112,17 +113,39 @@ fp_solar  = 0.308 cos( β (1 − β²/48402) π/180 )    [β = solar elevation i
 Idn       = direct normal irradiance [W/m²]
 ```
 
+`fp_solar` is the projected-area factor for a standing person. Source: Fiala et al. (2012) / Bröde et al. (2012), as used in the UTCI standard.
+
 ### 7. UTCI
 
-A **165-term polynomial** in four inputs:
+A **165-term polynomial** in four inputs (Fiala/Bröde 2012, UTCI-A):
 
 ```
 UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
 
   Ta      = air temperature [°C]
-  va      = wind speed at 10 m [m/s]  (clamped to 0.5–17 m/s)
+  va      = wind speed at 10 m reference height [m/s]  (clamped to 0.5–17 m/s)
   D_Tmrt  = Tmrt − Ta  [°C]
-  Pa      = vapour pressure [hPa]  (from specific humidity + Magnus formula)
+  Pa      = vapour pressure [hPa]
+```
+
+**Wind speed conversion:** CFD probe values are at pedestrian height (~2 m). Conversion to the 10 m reference height required by the polynomial:
+
+```
+va_ref = v_CFD / 0.667
+
+  0.667 ≈ u(2 m)/u(10 m)  for a log profile with z0 ≈ 0.1 m
+```
+
+**Vapour pressure** from CFD specific humidity `w` [kg/kg]:
+
+```
+pv   = P_ref × w / (ε_H₂O + w)          [Pa]   (urbanMicroclimateFoam convention)
+psat = exp(77.345 + 0.0057 Ta_K − 7235/Ta_K) / Ta_K^8.2   [Pa]
+RH   = pv / psat × 100 %
+Pa   = pv / 100                          [hPa]
+
+  P_ref   = 101325 Pa
+  ε_H₂O  = 0.621945  (ratio of molar masses M_water/M_dryair)
 ```
 
 ---
@@ -144,9 +167,14 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Pedestrian position generation                          run_utci.py│
 │                                                                     │
-│  postProcess cuttingPlane z=2 m  →  T_pedestrian.vtk               │
-│  matplotlib TriFinder containment  →  regular dx×dy grid            │
-│  (building interiors excluded — air mesh only)                      │
+│  auto mode (default):                                               │
+│    postProcess cuttingPlane z=2 m  →  T_pedestrian.vtk             │
+│    if std(z) > 0.5 m or result empty  →  terrain detected:         │
+│      postProcess patch surface (street/ground)  →  T_pedestrian.vtk│
+│      bin face centres onto dx×dy grid + 2 m offset                 │
+│    else (flat domain):                                              │
+│      matplotlib TriFinder containment  →  regular dx×dy grid       │
+│      (building interiors excluded — air mesh only)                  │
 │  → system/air/probe_locs   (N × "(x y z)")                         │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
@@ -168,19 +196,20 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
                            │
          ▼  Stage 2  (C++ binary, re-run per new meteorology)
 ┌─────────────────────────────────────────────────────────────────────┐
-│  umcfUTCIpostprocess  -j 20  --mode flat  --start 3600 --end 86400 │
+│  umcfUTCIpostprocess  -j 20  --start 3600 --end 86400               │
 │                                                                     │
 │  Load once:                                                         │
-│    allGeo     ← Sf_wallAndTreeSurfaces.raw  (329 023 patch faces)   │
+│    allGeo     ← Sf_wallAndTreeSurfaces.raw  (~329 k patch faces)    │
 │    skyGeo     ← Sf_skySurfaces.raw          (5 boundary patches)    │
 │    STL BVH    ← wallAndTreeSurfaces.stl      (ray occlusion)        │
 │    meteo[t]   ← Tambient, cc, Idif, Idn, sunDir, va                 │
-│    probeT/U/w ← per-position per-timestep rows                      │
+│    probeT/U/w ← per-position per-timestep rows (indexed by          │
+│                 original probe file order, not post-filter index)   │
 │                                                                     │
 │  Batch loop (500 pos / batch, OpenMP):                              │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │ For each position p:                                          │  │
-│  │   Load UTCI/pos/<p>.bin  OR  compute + cache:                │  │
+│  │   Load UTCI/pos/<originalIndex>.bin  OR  compute + cache:    │  │
 │  │     Fij[5][sparse]  ←  geometric formula + ray test          │  │
 │  │     Fijsum[5],  Fsky[5] = 1 − min(Fijsum, 1)               │  │
 │  │                                                              │  │
@@ -190,13 +219,15 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
 │  │   Tmrt[5]  ←  (ε_p qin_LW + α_sw qin_SW) / (σ ε_p) ^0.25  │  │
 │  │   Tmrt_avg  ←  area-weighted mean                           │  │
 │  │   if unshaded:  add fp_solar × Idn  via solar ray test      │  │
-│  │   UTCI  ←  165-term polynomial(Ta, va, Tmrt_avg, RH)        │  │
+│  │   va_ref  ←  v_CFD / 0.667  (2 m → 10 m log profile)       │  │
+│  │   pv  ←  P_ref × w / (ε_H₂O + w)                          │  │
+│  │   UTCI  ←  165-term polynomial(Ta, va_ref, Tmrt_avg, Pa)    │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  Write per timestep t:                                              │
 │    UTCI/<t>/Tmrt_pedestrian.vtk    (point cloud, Kelvin)           │
 │    UTCI/<t>/UTCI.vtk               (Tmrt[°C] + UTCI[°C])          │
-│    UTCI/<t>/UTCI_surface.vtk       (structured grid)               │
+│    UTCI/<t>/UTCI_surface.vtk       (interpolated onto CFD surface) │
 │    UTCI/<t>/RH_pedestrian.vtk                                      │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
@@ -210,7 +241,7 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
 
 ---
 
-## Key Constants (`src/constants.H`)
+## Key Constants (`src/constants.h`)
 
 | Symbol | Value | Meaning |
 |--------|-------|---------|
@@ -220,20 +251,23 @@ UTCI [°C]  =  Ta  +  Δ(Ta, va, D_Tmrt, Pa)
 | ε_surf | 0.90 | Wall/veg emissivity |
 | R_MAG_MAX | 100 m | Max view-factor range |
 | PED_Z | 2.0 m | Pedestrian height above ground |
+| P_ref | 101325 Pa | Reference atmospheric pressure |
+| ε_H₂O | 0.621945 | Molar mass ratio M_water/M_dryair |
 
 ## Key Source Files
 
 | File | Role |
 |------|------|
 | `run_utci.py` | Orchestration — 4-stage pipeline |
-| `src/umcfUTCIpostprocess.C` | Main: batch loop, I/O wiring |
-| `src/tmrtSolver.C` | Tmrt physics (LW+SW balance, sky temp) |
-| `src/viewFactor.C` | View factor geometry + ray occlusion |
-| `src/utciSolver.C` | UTCI 165-term polynomial |
-| `src/pedestrian.C` | 5-segment body model |
-| `src/caching.C` | Binary VF cache (float32, version 3) |
-| `src/io.C` | Raw/probe file readers, VTK writers |
-| `src/constants.H` | All physical constants |
+| `src/umcfUTCIpostprocess.cpp` | Main: batch loop, CLI, I/O wiring |
+| `src/tmrtSolver.cpp` | Tmrt physics (LW+SW balance, sky temp) |
+| `src/viewFactor.cpp` | View factor geometry + ray occlusion |
+| `src/utciSolver.cpp` | UTCI 165-term polynomial + LUT |
+| `src/pedestrian.cpp` | 5-segment body model |
+| `src/raycaster.cpp` | STL BVH ray intersection |
+| `src/caching.cpp` | Binary VF cache (v3 plain / v4 gzip) |
+| `src/io.cpp` | Raw/probe file readers, VTK writers |
+| `src/constants.h` | All physical constants |
 | `openfoam/calculateqrsw/` | OF utility — direct solar volume field |
 | `openfoam/calcSf/` | OF utility — surface area vectors |
 | `openfoam/calcWallRadOut/` | OF utility — outgoing LW at patches |
