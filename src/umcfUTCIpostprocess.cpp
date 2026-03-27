@@ -516,6 +516,9 @@ int main(int argc, char* argv[]) {
             double fp_solar = 0.0;
             if (hasSolar) {
                 double betaDeg = std::asin(std::min(1.0, sinBeta)) * 180.0 / M_PI;
+                // Projected-area factor for direct solar on a standing person.
+                // Source: Fiala et al. (2012) / Bröde et al. (2012), eq. used in UTCI standard.
+                // fp_solar = 0.308 * cos(β_rad * (1 − β_deg²/48402))
                 fp_solar = 0.308 * std::cos(betaDeg * (1.0 - betaDeg*betaDeg/48402.0) * M_PI/180.0);
             }
 
@@ -551,6 +554,9 @@ int main(int argc, char* argv[]) {
                 double Ta_K = (origIdx < (int)probeT.size()) ? probeT[origIdx] : meteo.Ta;
                 if (Ta_K < 200.0) Ta_K = meteo.Ta;  // guard against bad probe values
                 double Ta_c = Ta_K - 273.15;
+                // Convert pedestrian-height CFD wind speed to 10 m reference height.
+                // Factor 0.667 ≈ u(z_ped)/u(10m) for a log profile with z0≈0.1 m, z_ped=2 m
+                // (same convention as urbanMicroclimateFoam / utci_clement).
                 double va   = (origIdx < (int)probeU.size()) ? probeU[origIdx] / 0.667 : meteo.va;
                 va = std::max(0.5, std::min(17.0, va));  // UTCI polynomial valid range
 
