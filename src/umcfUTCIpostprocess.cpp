@@ -428,7 +428,7 @@ int main(int argc, char* argv[]) {
         #pragma omp parallel for schedule(dynamic)
         for (size_t bi = 0; bi < bN; ++bi) {
             size_t pedIdx = bStart + bi;
-            std::string cachePath = cache.getCachePath(static_cast<int>(pedIdx));
+            std::string cachePath = cache.getCachePath(positions[pedIdx].originalIndex);
             bool loaded = false;
             if (!args.forceRecompute) {
                 loaded = cache.load(cachePath, batchVF[bi]);

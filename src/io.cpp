@@ -80,7 +80,9 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
                         std::stod(parts[1]),
                         std::stod(parts[2])
                     };
-                    positions.push_back(createPedestrianPosition(center));
+                    PedestrianPosition pos = createPedestrianPosition(center);
+                    pos.originalIndex = static_cast<int>(positions.size());
+                    positions.push_back(pos);
                 } catch (...) {
                     // Skip invalid lines
                 }

@@ -38,6 +38,7 @@ struct SurfacePatch {
 };
 
 struct PedestrianPosition {
+    int originalIndex = 0;              // Index in probe_locs file; stable cache key across filtered runs
     Point3 center;
     std::array<Point3, 5> bodyPoints;   // 5 body segments
     std::array<Vec3, 5> areaVectors;    // Area vectors for each segment
