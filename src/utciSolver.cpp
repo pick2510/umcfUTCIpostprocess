@@ -270,7 +270,7 @@ bool UtciSolver::loadLUT(const std::string& path) {
                 auto it = std::lower_bound(pts.begin(), pts.end(),
                                            std::make_pair(rh, -1e30));
                 auto hi = it; auto lo = std::prev(it);
-                double f = (rh - lo->first) / (hi->first - lo->first);
+                const double f = (rh - lo->first) / (hi->first - lo->first);
                 val = lo->second + f * (hi->second - lo->second);
             }
             lutSet(iT, iV, iM, iR, val);

@@ -24,7 +24,7 @@ public:
     double computeAreaWeightedAverage(
         const Eigen::VectorXd& Tmrt,
         const std::array<Vec3, 5>& areaVectors
-    );
+    ) const;
 
 private:
     struct Impl;

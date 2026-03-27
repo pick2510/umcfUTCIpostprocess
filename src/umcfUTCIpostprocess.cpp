@@ -81,7 +81,7 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
     CommandLineArgs args;
 
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
 
         if (arg == "--case" && i + 1 < argc) {
             args.casePath = argv[++i];

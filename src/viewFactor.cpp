@@ -145,8 +145,8 @@ ViewFactorResult ViewFactorCalculator::compute(
     }
 
     for (int n = 0; n < nBody; ++n) {
-        Vec3 i_n = ped.bodyPoints[n].toVec3();
-        Vec3 Ai_n = ped.areaVectors[n];
+        const Vec3 i_n = ped.bodyPoints[n].toVec3();
+        const Vec3 Ai_n = ped.areaVectors[n];
         double AiMag = Ai_n.norm();
 
         if (AiMag < 1e-10) continue;

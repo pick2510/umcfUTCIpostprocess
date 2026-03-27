@@ -97,7 +97,11 @@ struct GridMesh {
         nx = static_cast<int>((mx[0]-mn[0]+2*cs)/cs) + 1;
         ny = static_cast<int>((mx[1]-mn[1]+2*cs)/cs) + 1;
         nz = static_cast<int>((mx[2]-mn[2]+2*cs)/cs) + 1;
-        cells.resize(nx*ny*nz);
+        if ((long long)nx * ny * nz > 50'000'000LL)
+            throw std::runtime_error("BVH grid too large (" + std::to_string(nx) + "x"
+                + std::to_string(ny) + "x" + std::to_string(nz)
+                + ") — reduce domain size or increase cell size");
+        cells.resize((size_t)nx * ny * nz);
 
         for (int i = 0; i < (int)tris.size(); ++i) {
             const Tri& t = tris[i];

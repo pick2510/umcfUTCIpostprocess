@@ -324,31 +324,6 @@ std::vector<MeteoData> loadMeteoData(const std::string& casePath,
     return result;
 }
 
-MeteoData interpolateMeteo(const std::vector<MeteoData>& meteo, double timestep) {
-    MeteoData result = meteo.front();
-    
-    if (meteo.size() == 1 || timestep <= meteo.front().Ta) {
-        return meteo.front();
-    }
-    if (timestep >= meteo.back().Ta) {
-        return meteo.back();
-    }
-    
-    for (size_t i = 0; i < meteo.size() - 1; ++i) {
-        if (meteo[i].Ta <= timestep && timestep <= meteo[i + 1].Ta) {
-            double t = (timestep - meteo[i].Ta) / (meteo[i + 1].Ta - meteo[i].Ta);
-            result.Ta = meteo[i].Ta + t * (meteo[i + 1].Ta - meteo[i].Ta);
-            result.Tsky = meteo[i].Tsky + t * (meteo[i + 1].Tsky - meteo[i].Tsky);
-            result.cc = meteo[i].cc + t * (meteo[i + 1].cc - meteo[i].cc);
-            result.Idif = meteo[i].Idif + t * (meteo[i + 1].Idif - meteo[i].Idif);
-            result.Idn = meteo[i].Idn + t * (meteo[i + 1].Idn - meteo[i].Idn);
-            result.sunDir = meteo[i].sunDir + t * (meteo[i + 1].sunDir - meteo[i].sunDir);
-            break;
-        }
-    }
-    
-    return result;
-}
 
 bool writeTumrtAvg(const std::string& path,
                    const std::vector<PedestrianPosition>& positions,

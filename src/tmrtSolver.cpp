@@ -46,8 +46,8 @@ Eigen::VectorXd TmrtSolver::compute(
     }
     
     // Compute sky temperature once
-    double Tsky = computeSkyTemperature(meteo.Ta, meteo.cc);
-    double sigmaTsky4 = SIGMA * std::pow(Tsky, 4);
+    const double Tsky = computeSkyTemperature(meteo.Ta, meteo.cc);
+    const double sigmaTsky4 = SIGMA * std::pow(Tsky, 4);
 
     for (int n = 0; n < nBody; ++n) {
         // Split into long-wave (LW) and short-wave (SW) incident radiation
@@ -83,7 +83,7 @@ Eigen::VectorXd TmrtSolver::compute(
 
 double TmrtSolver::computeAreaWeightedAverage(
     const Eigen::VectorXd& Tmrt,
-    const std::array<Vec3, 5>& areaVectors)
+    const std::array<Vec3, 5>& areaVectors) const
 {
     double sumTmrtArea = 0.0;
     double sumArea = 0.0;
