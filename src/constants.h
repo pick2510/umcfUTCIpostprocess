@@ -17,6 +17,10 @@ constexpr double PI_INV = 1.0 / M_PI;
 
 constexpr double AIR_GAS_CONSTANT = 461.5;  // Gas constant for water vapor [J/(kg·K)]
 
+// Humidity constants — kept consistent with urbanMicroclimateFoam conventions
+constexpr double P_REF        = 101325.0;   // Reference atmospheric pressure [Pa]
+constexpr double EPSILON_H2O  = 0.621945;   // Ratio of molar masses M_water/M_dryair [-]
+
 constexpr double INVALID_SENTINEL = -1.79769e+307;
 
 }

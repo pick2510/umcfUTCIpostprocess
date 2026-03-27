@@ -558,7 +558,7 @@ int main(int argc, char* argv[]) {
                 double w   = (origIdx < (int)probeW.size()) ? probeW[origIdx] : 0.01;
                 double psat = std::exp(77.345 + 0.0057*Ta_K - 7235.0/Ta_K)
                               / std::pow(Ta_K, 8.2);
-                double pv   = w * 1e5 / 0.62;
+                double pv   = P_REF * w / (EPSILON_H2O + w);
                 double RH   = std::min(100.0, std::max(0.0, pv / psat * 100.0));
                 batchRH[bi] = RH;
 
