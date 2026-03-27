@@ -476,6 +476,11 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
         mesh = mesh.cell_data_to_point_data()
     mesh_pts = mesh.points
     mx, my = mesh_pts[:, 0], mesh_pts[:, 1]
+
+    # Restrict interpolation to the interior of the probe bounding box (1 m inset
+    # on each side) to avoid edge artefacts from cubic extrapolation.
+    # Points outside this box are set to NaN and filled by nearest-neighbour below.
+    BBOX_INSET = 1.0
     print(f'  Interpolating onto CFD surface ({len(mesh_pts)} points) ...')
 
     done = 0
@@ -487,12 +492,20 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
         probe = pv.read(utci_path)
         px, py = probe.points[:, 0], probe.points[:, 1]
 
+        # Mesh points inside the inset probe bounding box
+        in_bbox = (
+            (mx >= px.min() + BBOX_INSET) & (mx <= px.max() - BBOX_INSET) &
+            (my >= py.min() + BBOX_INSET) & (my <= py.max() - BBOX_INSET)
+        )
+
         out = mesh.copy(deep=True)
         out.clear_data()
 
         for name in probe.point_data.keys():
             vals = probe.point_data[name]
-            interp = _scipy_griddata((px, py), vals, (mx, my), method='cubic')
+            interp = np.full(len(mx), np.nan)
+            interp[in_bbox] = _scipy_griddata(
+                (px, py), vals, (mx[in_bbox], my[in_bbox]), method='cubic')
             nan_mask = np.isnan(interp)
             if nan_mask.any():
                 interp[nan_mask] = _scipy_griddata(
