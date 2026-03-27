@@ -173,7 +173,83 @@ double UtciSolver::calculatePoly(double Ta_c, double va, double f, double Tmrt_c
         + 1.62897058e-09 * va * va * D * D * D * Pa
         + 3.94367674e-08 * D * D * D * D * Pa
         - 1.18566247e-09 * Ta * D * D * D * D * Pa
-        + 3.34678041e-10 * va * D * D * D * D * Pa;
+        + 3.34678041e-10 * va * D * D * D * D * Pa
+        - 1.15606447e-10 * D * D * D * D * D * Pa
+        // Pa^2 terms
+        - 2.80626406e+00 * Pa * Pa
+        + 5.48712484e-01 * Ta * Pa * Pa
+        - 3.99428410e-03 * Ta * Ta * Pa * Pa
+        - 9.54009191e-04 * Ta * Ta * Ta * Pa * Pa
+        + 1.93090978e-05 * Ta * Ta * Ta * Ta * Pa * Pa
+        - 3.08806365e-01 * va * Pa * Pa
+        + 1.16952364e-02 * Ta * va * Pa * Pa
+        + 4.95271903e-04 * Ta * Ta * va * Pa * Pa
+        - 1.90710882e-05 * Ta * Ta * Ta * va * Pa * Pa
+        + 2.10787756e-03 * va * va * Pa * Pa
+        - 6.98445738e-04 * Ta * va * va * Pa * Pa
+        + 2.30109073e-05 * Ta * Ta * va * va * Pa * Pa
+        + 4.17856590e-04 * va * va * va * Pa * Pa
+        - 1.27043871e-05 * Ta * va * va * va * Pa * Pa
+        - 3.04620472e-06 * va * va * va * va * Pa * Pa
+        + 5.14507424e-02 * D * Pa * Pa
+        - 4.32510997e-03 * Ta * D * Pa * Pa
+        + 8.99281156e-05 * Ta * Ta * D * Pa * Pa
+        - 7.14663943e-07 * Ta * Ta * Ta * D * Pa * Pa
+        - 2.66016305e-04 * va * D * Pa * Pa
+        + 2.63789586e-04 * Ta * va * D * Pa * Pa
+        - 7.01199003e-06 * Ta * Ta * va * D * Pa * Pa
+        - 1.06823306e-04 * va * va * D * Pa * Pa
+        + 3.61341136e-06 * Ta * va * va * D * Pa * Pa
+        + 2.29748967e-07 * va * va * va * D * Pa * Pa
+        + 3.04788893e-04 * D * D * Pa * Pa
+        - 6.42070836e-05 * Ta * D * D * Pa * Pa
+        + 1.16257971e-06 * Ta * Ta * D * D * Pa * Pa
+        + 7.68023384e-06 * va * D * D * Pa * Pa
+        - 5.47446896e-07 * Ta * va * D * D * Pa * Pa
+        - 3.59937910e-08 * va * va * D * D * Pa * Pa
+        - 4.36497725e-06 * D * D * D * Pa * Pa
+        + 1.68737969e-07 * Ta * D * D * D * Pa * Pa
+        + 2.67489271e-08 * va * D * D * D * Pa * Pa
+        + 3.23926897e-09 * D * D * D * D * Pa * Pa
+        // Pa^3 terms
+        - 3.53874123e-02 * Pa * Pa * Pa
+        - 2.21201190e-01 * Ta * Pa * Pa * Pa
+        + 1.55126038e-02 * Ta * Ta * Pa * Pa * Pa
+        - 2.63917279e-04 * Ta * Ta * Ta * Pa * Pa * Pa
+        + 4.53433455e-02 * va * Pa * Pa * Pa
+        - 4.32943862e-03 * Ta * va * Pa * Pa * Pa
+        + 1.45389826e-04 * Ta * Ta * va * Pa * Pa * Pa
+        + 2.17508610e-04 * va * va * Pa * Pa * Pa
+        - 6.66724702e-05 * Ta * va * va * Pa * Pa * Pa
+        + 3.33217140e-05 * va * va * va * Pa * Pa * Pa
+        - 2.26921615e-03 * D * Pa * Pa * Pa
+        + 3.80261982e-04 * Ta * D * Pa * Pa * Pa
+        - 5.45314314e-09 * Ta * Ta * D * Pa * Pa * Pa
+        - 7.96355448e-04 * va * D * Pa * Pa * Pa
+        + 2.53458034e-05 * Ta * va * D * Pa * Pa * Pa
+        - 6.31223658e-06 * va * va * D * Pa * Pa * Pa
+        + 3.02122035e-04 * D * D * Pa * Pa * Pa
+        - 4.77403547e-06 * Ta * D * D * Pa * Pa * Pa
+        + 1.73825715e-06 * va * D * D * Pa * Pa * Pa
+        - 4.09087898e-07 * D * D * D * Pa * Pa * Pa
+        // Pa^4 terms
+        + 6.14155345e-01 * Pa * Pa * Pa * Pa
+        - 6.16755931e-02 * Ta * Pa * Pa * Pa * Pa
+        + 1.33374846e-03 * Ta * Ta * Pa * Pa * Pa * Pa
+        + 3.55375387e-03 * va * Pa * Pa * Pa * Pa
+        - 5.13027851e-04 * Ta * va * Pa * Pa * Pa * Pa
+        + 1.02449757e-04 * va * va * Pa * Pa * Pa * Pa
+        - 1.48526421e-03 * D * Pa * Pa * Pa * Pa
+        - 4.11469183e-05 * Ta * D * Pa * Pa * Pa * Pa
+        - 6.80434415e-06 * va * D * Pa * Pa * Pa * Pa
+        - 9.77675906e-06 * D * D * Pa * Pa * Pa * Pa
+        // Pa^5 terms
+        + 8.82773108e-02 * Pa * Pa * Pa * Pa * Pa
+        - 3.01859306e-03 * Ta * Pa * Pa * Pa * Pa * Pa
+        + 1.04452989e-03 * va * Pa * Pa * Pa * Pa * Pa
+        + 2.47090539e-04 * D * Pa * Pa * Pa * Pa * Pa
+        // Pa^6 term
+        + 1.48348065e-03 * Pa * Pa * Pa * Pa * Pa * Pa;
 
     return UTCI;
 }
