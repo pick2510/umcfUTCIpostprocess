@@ -5,18 +5,23 @@ UTCI post-processing orchestrator.
 Stages
 ------
   0  Write probe_locs and system probes dict
+       auto:    run flat cuttingPlane first; if z-spread > 0.5 m or result empty,
+                re-run as terrain (patch surface + PED_Z offset) automatically
        flat:    regular grid at constant z (derived from STL bounds)
-       terrain: ray-cast onto a surface mesh VTK, offset 2 m above terrain
+       terrain: patch surface on ground/street patches, offset PED_Z above terrain
   1  OpenFOAM: calculateqrsw, calcSf, calcWallRadOut, postProcess surfaces + probes
   2  Run umcfUTCIpostprocess binary → Tmrt + UTCI VTK output
   3  Collect all per-timestep VTK files into <output_dir>/results/ with timestep in filename
 
 Usage
 -----
-  # flat domain (default)
+  # auto-detect flat vs terrain (default)
   python3 run_utci.py --case /path/to/case [options]
 
-  # terrain-following
+  # force flat
+  python3 run_utci.py --case /path/to/case --mode flat
+
+  # force terrain
   python3 run_utci.py --case /path/to/case --mode terrain \\
       [--terrain-patches street ground] [--ped-grid-dx 5] [--ped-grid-dy 5]
 """
@@ -27,6 +32,17 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
+
+import matplotlib.tri as mtri
+import numpy as np
+import pyvista as pv
+
+try:
+    from scipy.interpolate import griddata as _scipy_griddata
+    _HAVE_SCIPY = True
+except ImportError:
+    _HAVE_SCIPY = False
 
 # Force line-buffered stdout so output appears in SLURM logs without delay.
 sys.stdout.reconfigure(line_buffering=True)
@@ -118,17 +134,12 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
         Bins face-center points from the ground-patch VTK onto the dx/dy grid;
         each grid node gets the median terrain z of its bin + z_offset.
     """
-    import numpy as np
-    import pyvista as pv
-
     mesh = pv.read(vtk_path)
 
     if z_offset == 0.0:
         # Flat: regular grid filtered by 2-D triangulation containment test.
         # Build a matplotlib TriFinder on the mesh triangles (exact, O(log N) per point,
         # vectorised over the whole grid in one call).
-        import matplotlib.tri as mtri
-
         mesh = mesh.triangulate()
         pts  = mesh.points
         tris = mesh.faces.reshape(-1, 4)[:, 1:]
@@ -149,7 +160,6 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0):
 
     else:
         # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z
-        from collections import defaultdict
         centers = mesh.cell_centers().points
         gx = np.round(centers[:, 0] / dx) * dx
         gy = np.round(centers[:, 1] / dy) * dy
@@ -282,37 +292,85 @@ def _compile_if_missing(binary, src_dir):
 # STAGE 0 – Write system files
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _detect_terrain(vtk_path):
+    """Return True if vtk_path looks like a terrain domain.
+
+    Criteria (either triggers terrain mode):
+      - VTK has no points (cutting plane at z=PED_Z missed the domain entirely)
+      - std(z) of mesh points > 0.5 m (sloped terrain)
+    """
+    mesh = pv.read(vtk_path)
+    if mesh.n_points == 0:
+        return True
+    z = mesh.points[:, 2]
+    return float(np.std(z)) > 0.5
+
+
 def _stage0_generate_positions(args):
-    """Run postProcess to generate T_pedestrian.vtk and return binned positions."""
+    """Run postProcess to generate T_pedestrian.vtk and return (positions, resolved_mode)."""
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
-
-    terrain_patches = list(args.terrain_patches) if args.mode == 'terrain' else None
-    with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
-        f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
-
-    r = _run('postProcess -func surfacesPedestrian',
-             args.case, region='air', time_range=str(args.t_start))
 
     vtk_path = os.path.join(
         args.case, 'postProcessing', 'surfacesPedestrian',
         str(args.t_start), 'T_pedestrian.vtk')
 
-    if r.returncode != 0 or not os.path.isfile(vtk_path):
-        return None
+    # ── forced flat ──────────────────────────────────────────────────────────
+    if args.mode == 'flat':
+        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_surface_dict(terrain_patches=None))
+        r = _run('postProcess -func surfacesPedestrian',
+                 args.case, region='air', time_range=str(args.t_start))
+        if r.returncode != 0 or not os.path.isfile(vtk_path):
+            return None, 'flat'
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=0.0), 'flat'
 
-    z_offset = PED_Z if args.mode == 'terrain' else 0.0
-    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=z_offset)
+    # ── forced terrain ───────────────────────────────────────────────────────
+    if args.mode == 'terrain':
+        terrain_patches = list(args.terrain_patches)
+        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+        r = _run('postProcess -func surfacesPedestrian',
+                 args.case, region='air', time_range=str(args.t_start))
+        if r.returncode != 0 or not os.path.isfile(vtk_path):
+            return None, 'terrain'
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=PED_Z), 'terrain'
+
+    # ── auto-detect (default) ─────────────────────────────────────────────────
+    # Step 1: always try flat (cuttingPlane at PED_Z) first
+    with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+        f.write(_pedestrian_surface_dict(terrain_patches=None))
+    r = _run('postProcess -func surfacesPedestrian',
+             args.case, region='air', time_range=str(args.t_start))
+
+    if r.returncode != 0 or not os.path.isfile(vtk_path):
+        return None, 'auto'
+
+    # Step 2: inspect result
+    if not _detect_terrain(vtk_path):
+        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=0.0), 'flat'
+
+    # Step 3: re-run as terrain
+    print('  Auto-detected terrain domain (z-spread > 0.5 m or empty cutting plane) '
+          '— switching to terrain mode')
+    terrain_patches = list(args.terrain_patches)
+    with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+        f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+    r = _run('postProcess -func surfacesPedestrian',
+             args.case, region='air', time_range=str(args.t_start))
+    if r.returncode != 0 or not os.path.isfile(vtk_path):
+        return None, 'terrain'
+    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy, z_offset=PED_Z), 'terrain'
 
 
 def stage0(args):
-    print(f'\n=== Stage 0: Write system files ({args.mode}) ===')
+    print(f'\n=== Stage 0: Write system files (mode={args.mode}) ===')
 
     sys_air = os.path.join(args.case, 'system', 'air')
-    positions = _stage0_generate_positions(args)
+    positions, resolved_mode = _stage0_generate_positions(args)
 
     if positions is not None:
-        label = 'terrain+{:.0f}m'.format(PED_Z) if args.mode == 'terrain' else 'flat'
+        label = 'terrain+{:.0f}m'.format(PED_Z) if resolved_mode == 'terrain' else 'flat'
         print(f'  Positions on {args.ped_grid_dx}×{args.ped_grid_dy} m grid '
               f'({label}, from T_pedestrian.vtk): {len(positions)}')
     else:
@@ -401,12 +459,8 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
             <output_dir>/<t>/UTCI.vtk                                     (probe point cloud)
     Writes: <output_dir>/<t>/UTCI_surface.vtk                             (dense interpolated mesh)
     """
-    try:
-        import numpy as np
-        import pyvista as pv
-        from scipy.interpolate import griddata
-    except ImportError as e:
-        print(f'  [WARN] Skipping surface interpolation – missing dependency: {e}')
+    if not _HAVE_SCIPY:
+        print('  [WARN] Skipping surface interpolation – scipy not available')
         return
 
     # Load the dense CFD cutting-plane mesh once (building interiors absent)
@@ -438,10 +492,10 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
 
         for name in probe.point_data.keys():
             vals = probe.point_data[name]
-            interp = griddata((px, py), vals, (mx, my), method='cubic')
+            interp = _scipy_griddata((px, py), vals, (mx, my), method='cubic')
             nan_mask = np.isnan(interp)
             if nan_mask.any():
-                interp[nan_mask] = griddata(
+                interp[nan_mask] = _scipy_griddata(
                     (px, py), vals, (mx[nan_mask], my[nan_mask]), method='nearest')
             # Clip cubic overshoot to the probe data range
             interp = np.clip(interp, vals.min(), vals.max())
@@ -549,7 +603,9 @@ def parse_args():
     p.add_argument('--t-start',    type=int, default=3600,  dest='t_start')
     p.add_argument('--t-end',      type=int, default=86400, dest='t_end')
     p.add_argument('--t-step',     type=int, default=3600,  dest='t_step')
-    p.add_argument('--mode',       default='flat', choices=['flat', 'terrain'])
+    p.add_argument('--mode',       default='auto', choices=['auto', 'flat', 'terrain'],
+                   help='Probe grid mode: auto=detect from cuttingPlane z-spread, '
+                        'flat=constant z=PED_Z, terrain=follow ground patches + PED_Z offset')
     p.add_argument('--output-dir', default='UTCI',  dest='output_dir')
     p.add_argument('-j', '--threads', type=int, default=20)
     p.add_argument('--vegetation', action='store_true', default=True,
@@ -572,8 +628,8 @@ def parse_args():
     p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
                    help='Pedestrian grid y-spacing [m]')
 
-    # terrain-following Stage 0
-    tg = p.add_argument_group('terrain mode (--mode terrain)')
+    # terrain-following Stage 0 (also used by auto-detect)
+    tg = p.add_argument_group('terrain mode (--mode terrain or auto-detected terrain)')
     tg.add_argument('--terrain-patches', nargs='+', default=['street', 'ground'],
                     dest='terrain_patches',
                     help='Ground patches to sample for terrain-following positions')
