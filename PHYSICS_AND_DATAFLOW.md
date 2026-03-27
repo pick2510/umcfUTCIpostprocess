@@ -147,20 +147,7 @@ Uses the official tabulated offset file `utci_offset.Dat` (Bröde et al. 2012, s
 
 The file has ~104 600 rows and 6 columns (Ta, Tr−Ta, va, RH, pa, offset).
 
-**Loading:** rows are grouped by (Ta, Tr−Ta, va) and the sparse RH axis is linearly interpolated onto the full RH grid, matching the Python `np.interp` convention. The result is stored as a flat 4D array indexed `[iTa][iva][iTrTa][irH]`.
-
-**Evaluation:** 4D linear interpolation over the 16 enclosing hypercube corners:
-
-```
-offset = Σ_{dT,dV,dM,dR ∈ {0,1}}  w(dT,dV,dM,dR) × table[iT+dT][iV+dV][iM+dM][iR+dR]
-
-  w = (dT ? fT : 1−fT) × (dV ? fV : 1−fV) × (dM ? fM : 1−fM) × (dR ? fR : 1−fR)
-  f* = fractional position within the bracketing interval (clamped to [0,1])
-
-UTCI = Ta + offset
-```
-
-The LUT method is equivalent to the utci_clement Python implementation. The polynomial method is equivalent to the UTCI_OF Fortran reference (UTCI_a002.f90).
+**Evaluation:** 4D linear interpolation over the 16 corners of the enclosing hypercube. Values outside the table range are clamped to the nearest boundary.
 
 #### Shared inputs
 
