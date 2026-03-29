@@ -34,6 +34,13 @@ std::vector<std::pair<double,std::vector<double>>>
 std::vector<std::pair<double,std::vector<double>>>
     loadProbeVelocityMagAll(const std::string& path);
 
+// Load probe coordinates from OpenFOAM probe file headers: "# Probe i (x y z)"
+std::vector<Point3> loadProbePoints(const std::string& path);
+
+// Load qrsw probe data written by Stage 1 at postProcessing/probes/qrsw/qrsw.
+std::vector<std::pair<double,std::vector<double>>>
+    loadQrswProbeData(const std::string& casePath);
+
 // Find the probe directory under postProcessing/probes/<region>/
 // Returns the first timestep subdirectory found, or empty string.
 std::string findProbeDir(const std::string& casePath, const std::string& region = "air");
@@ -55,6 +62,12 @@ bool writeVtkMultiScalar(const std::string& path,
 bool writeVtkStructuredSurface(const std::string& path,
                                 const std::vector<PedestrianPosition>& positions,
                                 const std::vector<std::pair<std::string, Eigen::VectorXd>>& arrays);
+
+bool readLegacyVtkMesh(const std::string& path, VtkMeshData& mesh);
+
+bool writeLegacyVtkMesh(const std::string& path,
+                        const VtkMeshData& mesh,
+                        const std::vector<std::pair<std::string, Eigen::VectorXd>>& pointScalars);
 
 }
 

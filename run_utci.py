@@ -68,7 +68,7 @@ PED_GRID_DY    = 3.0
 # PEDESTRIAN SURFACE — OF dict + grid binning (flat and terrain)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pedestrian_surface_dict(terrain_patches=None, z=PED_Z):
+def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
     """OpenFOAM surfaces dict for pedestrian position generation (vtk output).
 
     flat mode (terrain_patches=None):
@@ -79,7 +79,7 @@ def _pedestrian_surface_dict(terrain_patches=None, z=PED_Z):
         caller adds PED_Z offset when binning.
     """
     if terrain_patches is None:
-        surface_block = f"""\
+        surface_block = """\
     pedestrian
     {{
         type        cuttingPlane;
@@ -90,34 +90,35 @@ def _pedestrian_surface_dict(terrain_patches=None, z=PED_Z):
             normalVector (0 0 1);
         }}
         interpolate false;
-    }}"""
+    }}""".format(z=z)
     else:
         patches_str = ' '.join(terrain_patches)
-        surface_block = f"""\
+        surface_block = """\
     pedestrian
     {{
         type        patch;
-        patches     ({patches_str});
+        patches     ({patches});
         interpolate false;
-    }}"""
+    }}""".format(patches=patches_str)
 
+    fields_str = '\n    '.join(fields)
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfacesPedestrian')
-        + f"""#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+        + """#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
 
 surfaceFormat   vtk;
 
 fields
 (
-    T
+    {fields}
 );
 
 surfaces
 (
-{surface_block}
+{surface}
 );
-"""
+""".format(fields=fields_str, surface=surface_block)
     )
 
 
@@ -217,14 +218,14 @@ def _surfaces_patch_dict(wall_patches, sky_patches, fields=('Sf', 'qrOut', 'qsOu
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfaces')
-        + f"""
+        + """
 #includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
 
 surfaceFormat   raw;
 
 fields
 (
-    {fields_str}
+    {fields}
 );
 
 surfaces
@@ -232,7 +233,7 @@ surfaces
     wallAndTreeSurfaces
     {{
         type            patch;
-        patches         ({wall_str});
+        patches         ({wall});
         interpolate     false;
         triangulate     false;
     }}
@@ -240,12 +241,12 @@ surfaces
     skySurfaces
     {{
         type            patch;
-        patches         ({sky_str});
+        patches         ({sky});
         interpolate     false;
         triangulate     false;
     }}
 );
-"""
+""".format(fields=fields_str, wall=wall_str, sky=sky_str)
     )
 
 
@@ -255,7 +256,7 @@ def _probes_dict(positions):
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='probes')
-        + f"""
+        + """
 #includeEtc "caseDicts/postProcessing/probes/probes.cfg"
 
 fields
@@ -267,9 +268,9 @@ fields
 
 probeLocations
 (
-{pts_block}
+{points}
 );
-"""
+""".format(points=pts_block)
     )
 
 
@@ -443,9 +444,86 @@ def stage0(args):
 # STAGE 1 – OpenFOAM postprocessing (utci_clement workflow)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _qrsw_cutting_plane_dict():
+    return """\
+/*--------------------------------*- C++ -*----------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      qrswCuttingPlane;
+}
+
+#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+
+surfaceFormat   vtk;
+fields          ( qrsw );
+
+surfaces
+(
+    pedestrian
+    {
+        type            cuttingPlane;
+        planeType       pointAndNormal;
+        pointAndNormalDict { point (0 0 2); normal (0 0 1); }
+        interpolate     false;
+    }
+);
+"""
+
+
+def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
+    from scipy.spatial import cKDTree
+    from io import StringIO as _StringIO
+
+    probe_locs = os.path.join(case, 'system', 'air', 'probe_locs')
+    if not os.path.isfile(probe_locs):
+        print('  [WARN] probe_locs not found – skipping qrsw probe sampling')
+        return
+
+    s = open(probe_locs).read().replace('(', '').replace(')', '')
+    pos = np.loadtxt(_StringIO(s), ndmin=2)
+    px, py = pos[:, 0], pos[:, 1]
+    n_probes = len(pos)
+
+    out_dir = os.path.join(case, 'postProcessing', 'probes', 'qrsw')
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, 'qrsw')
+
+    rows = []
+    for t in range(t_start, t_end + 1, t_step):
+        vtk_path = os.path.join(case, 'postProcessing', 'qrswCuttingPlane', str(t),
+                                'qrsw_pedestrian.vtk')
+        if not os.path.isfile(vtk_path):
+            rows.append((t, np.zeros(n_probes)))
+            continue
+
+        ds = pv.read(vtk_path)
+        if 'qrsw' in ds.cell_data:
+            ds = ds.cell_data_to_point_data()
+        q = ds.point_data['qrsw']
+        qmag = np.linalg.norm(q, axis=1) if q.ndim == 2 else np.abs(q)
+        kd = cKDTree(ds.points[:, :2])
+        _, idx = kd.query(np.column_stack([px, py]))
+        rows.append((t, qmag[idx]))
+
+    with open(out_path, 'w') as f:
+        for i in range(n_probes):
+            f.write(f'# Probe {i} ({pos[i,0]:.3f} {pos[i,1]:.3f} {pos[i,2]:.3f})\n')
+        for t, vals in rows:
+            f.write(f'{t}')
+            for v in vals:
+                f.write(f'\t{v:.4f}')
+            f.write('\n')
+
+    print(f'  qrsw sampled at {n_probes} probe positions -> {out_path}')
+
 def stage1(args):
     print('\n=== Stage 1: OpenFOAM postprocessing ===')
     time_range = f'{args.t_start}:{args.t_end}'
+    sys_air = os.path.join(args.case, 'system', 'air')
+    os.makedirs(sys_air, exist_ok=True)
 
     # Compile utilities
     _compile_if_missing('calculateqrsw', os.path.join(UTCI_UTIL, 'calculateqrsw'))
@@ -477,11 +555,47 @@ def stage1(args):
     print(f'  postProcess: Sf, qrOut, qsOut at patches ({region}) ...')
     _run('postProcess -func surfaces', args.case, region=region, time_range=time_range)
 
-    # Step 5: Extract T, U, w at pedestrian positions (air region, probes)
-    sys_air = os.path.join(args.case, 'system', 'air')
-    os.makedirs(sys_air, exist_ok=True)
+    # Step 5: Extract dense pedestrian-surface fields used by C++ Stage 2
+    ped_vtk = os.path.join(args.case, 'postProcessing', 'surfacesPedestrian',
+                           str(args.t_start), 'T_pedestrian.vtk')
+    ped_mode = args.mode
+    if ped_mode == 'auto':
+        ped_mode = 'terrain' if (os.path.isfile(ped_vtk) and _detect_terrain(ped_vtk)) else 'flat'
+
+    terrain_patches = list(args.terrain_patches) if ped_mode == 'terrain' else None
+
+    with open(os.path.join(sys_air, 'surfacesPedestrianAir'), 'w') as f:
+        f.write(_pedestrian_surface_dict(fields=('T', 'U', 'w'),
+                                         terrain_patches=terrain_patches))
+    print(f'  postProcess: dense pedestrian T, U, w ({ped_mode}, air) ...')
+    _run('postProcess -func surfacesPedestrianAir',
+         args.case, region='air', time_range=time_range)
+
+    rad_region = 'vegetation' if args.vegetation else 'air'
+    sys_rad = os.path.join(args.case, 'system', rad_region)
+    os.makedirs(sys_rad, exist_ok=True)
+    with open(os.path.join(sys_rad, 'surfacesPedestrianRad'), 'w') as f:
+        f.write(_pedestrian_surface_dict(fields=('qrsw',),
+                                         terrain_patches=terrain_patches))
+    print(f'  postProcess: dense pedestrian qrsw ({ped_mode}, {rad_region}) ...')
+    _run('postProcess -func surfacesPedestrianRad',
+         args.case, region=rad_region, time_range=time_range)
+
+    # Step 6: Extract T, U, w at pedestrian positions (air region, probes)
     print('  postProcess: probes T, U, w (air) ...')
     _run('postProcess -func probes', args.case, region='air', time_range=time_range)
+
+    # Step 7: Sample qrsw magnitude at probe positions from a z=2 m cutting plane.
+    # This provides direct-solar irradiance including canopy attenuation.
+    if args.vegetation:
+        print('  qrsw cutting plane (vegetation) ...')
+        sys_veg = os.path.join(args.case, 'system', 'vegetation')
+        os.makedirs(sys_veg, exist_ok=True)
+        with open(os.path.join(sys_veg, 'qrswCuttingPlane'), 'w') as f:
+            f.write(_qrsw_cutting_plane_dict())
+        _run('postProcess -func qrswCuttingPlane',
+             args.case, region='vegetation', time_range=time_range)
+        _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
 
 
 
@@ -608,8 +722,7 @@ def stage2(args):
     print('  calcTmrt finished')
 
     if not args.skip_utci:
-        timesteps = list(range(args.t_start, args.t_end + 1, args.t_step))
-        _interpolate_utci_surface(args.case, args.output_dir, args.t_start, timesteps)
+        print('  Dense surface postprocess is handled in the C++ binary')
 
 
 # ──────────────────────────────────────────────────────────────────────────────

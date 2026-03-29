@@ -8,6 +8,8 @@
 #include <cmath>
 #include <iostream>
 #include <dirent.h>
+#include <limits>
+#include <unordered_map>
 
 namespace utci {
 
@@ -114,29 +116,19 @@ std::vector<SurfacePatch> loadSurfacePatches(const std::string& rawPath) {
         line = trim(line);
         if (line.empty()) continue;
 
-        auto parts = split(line, ' ');
-        if (parts.size() >= 6) {
-            try {
-                SurfacePatch patch;
-                patch.center.x = std::stod(parts[0]);
-                patch.center.y = std::stod(parts[1]);
-                patch.center.z = std::stod(parts[2]);
-                // Negate area vectors: OpenFOAM Sf points outward from owner cell,
-                // we need inward-facing normals for the view factor calculation.
-                patch.areaVector = Vec3(
-                    -std::stod(parts[3]),
-                    -std::stod(parts[4]),
-                    -std::stod(parts[5])
-                );
-                patch.area = patch.areaVector.norm();
-                patch.temperature = 0.0;
-                patch.qr    = 0.0;
-                patch.qrOut = 0.0;
-                patch.qsOut = 0.0;
-                patches.push_back(patch);
-            } catch (...) {
-                // Skip invalid lines
-            }
+        std::istringstream iss(line);
+        SurfacePatch patch;
+        double sfx = 0.0, sfy = 0.0, sfz = 0.0;
+        if (iss >> patch.center.x >> patch.center.y >> patch.center.z >> sfx >> sfy >> sfz) {
+            // Negate area vectors: OpenFOAM Sf points outward from owner cell,
+            // we need inward-facing normals for the view factor calculation.
+            patch.areaVector = Vec3(-sfx, -sfy, -sfz);
+            patch.area = patch.areaVector.norm();
+            patch.temperature = 0.0;
+            patch.qr    = 0.0;
+            patch.qrOut = 0.0;
+            patch.qsOut = 0.0;
+            patches.push_back(patch);
         }
     }
 
@@ -163,14 +155,11 @@ std::vector<double> loadScalarField(const std::string& rawPath) {
         line = trim(line);
         if (line.empty()) continue;
 
-        auto parts = split(line, ' ');
-        // Format: x y z value  (column 3 is the scalar)
-        if (parts.size() >= 4) {
-            try {
-                vals.push_back(std::stod(parts[3]));
-            } catch (...) {
-                vals.push_back(0.0);
-            }
+        std::istringstream iss(line);
+        double x = 0.0, y = 0.0, z = 0.0, value = 0.0;
+        // Format: x y z value
+        if (iss >> x >> y >> z >> value) {
+            vals.push_back(value);
         }
     }
 
@@ -400,6 +389,31 @@ loadProbeVelocityMagAll(const std::string& path) {
     return rows;
 }
 
+std::vector<Point3> loadProbePoints(const std::string& path) {
+    std::vector<Point3> points;
+    std::ifstream file(path);
+    if (!file.is_open()) return points;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.rfind("# Probe ", 0) != 0) continue;
+        auto l = line.find('(');
+        auto r = line.find(')', l);
+        if (l == std::string::npos || r == std::string::npos || r <= l + 1) continue;
+        std::istringstream iss(line.substr(l + 1, r - l - 1));
+        Point3 p{};
+        if (iss >> p.x >> p.y >> p.z) {
+            points.push_back(p);
+        }
+    }
+    return points;
+}
+
+std::vector<std::pair<double,std::vector<double>>>
+loadQrswProbeData(const std::string& casePath) {
+    return loadProbeScalarAll(casePath + "/postProcessing/probes/qrsw/qrsw");
+}
+
 // --------------------------------------------------------------------------
 // Find first timestep directory under postProcessing/probes/<region>/
 // --------------------------------------------------------------------------
@@ -554,6 +568,286 @@ bool writeVtkStructuredSurface(const std::string& path,
                 int idx = grid[iy * NX + ix];
                 f << (idx >= 0 ? vals[idx] : 0.0) << "\n";
             }
+    }
+    return true;
+}
+
+static bool isIntegerToken(const std::string& s) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    std::strtol(s.c_str(), &end, 10);
+    return end != nullptr && *end == '\0';
+}
+
+static std::vector<double> averageCellScalarsToPoints(const std::vector<std::vector<int>>& cells,
+                                                      size_t nPoints,
+                                                      const std::vector<double>& cellValues) {
+    std::vector<double> sums(nPoints, 0.0);
+    std::vector<int> counts(nPoints, 0);
+    for (size_t ci = 0; ci < cells.size() && ci < cellValues.size(); ++ci) {
+        for (int pid : cells[ci]) {
+            if (pid >= 0 && static_cast<size_t>(pid) < nPoints) {
+                sums[pid] += cellValues[ci];
+                counts[pid] += 1;
+            }
+        }
+    }
+    for (size_t i = 0; i < nPoints; ++i) {
+        if (counts[i] > 0) sums[i] /= static_cast<double>(counts[i]);
+    }
+    return sums;
+}
+
+static std::vector<Vec3> averageCellVectorsToPoints(const std::vector<std::vector<int>>& cells,
+                                                    size_t nPoints,
+                                                    const std::vector<Vec3>& cellValues) {
+    std::vector<Vec3> sums(nPoints, Vec3::Zero());
+    std::vector<int> counts(nPoints, 0);
+    for (size_t ci = 0; ci < cells.size() && ci < cellValues.size(); ++ci) {
+        for (int pid : cells[ci]) {
+            if (pid >= 0 && static_cast<size_t>(pid) < nPoints) {
+                sums[pid] += cellValues[ci];
+                counts[pid] += 1;
+            }
+        }
+    }
+    for (size_t i = 0; i < nPoints; ++i) {
+        if (counts[i] > 0) sums[i] /= static_cast<double>(counts[i]);
+    }
+    return sums;
+}
+
+bool readLegacyVtkMesh(const std::string& path, VtkMeshData& mesh) {
+    mesh = VtkMeshData{};
+
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    if (!std::getline(f, mesh.title)) return false;
+    if (!std::getline(f, line)) return false; // ASCII/BINARY
+    if (!std::getline(f, line)) return false; // DATASET ...
+
+    if (line.find("DATASET POLYDATA") != std::string::npos) {
+        mesh.datasetType = VtkDatasetType::POLYDATA;
+    } else if (line.find("DATASET STRUCTURED_GRID") != std::string::npos) {
+        mesh.datasetType = VtkDatasetType::STRUCTURED_GRID;
+    } else {
+        std::cerr << "Unsupported VTK dataset in " << path << ": " << line << "\n";
+        return false;
+    }
+
+    std::unordered_map<std::string, std::vector<double>> cellScalars;
+    std::unordered_map<std::string, std::vector<Vec3>> cellVectors;
+    enum class DataMode { NONE, POINT, CELL };
+    DataMode mode = DataMode::NONE;
+    size_t pointDataCount = 0;
+    size_t cellDataCount = 0;
+    std::string pending;
+
+    auto nextToken = [&](std::string& tok) -> bool {
+        if (!pending.empty()) {
+            tok = pending;
+            pending.clear();
+            return true;
+        }
+        return static_cast<bool>(f >> tok);
+    };
+
+    std::string tok;
+    while (nextToken(tok)) {
+        if (tok == "DIMENSIONS") {
+            f >> mesh.dimX >> mesh.dimY >> mesh.dimZ;
+        } else if (tok == "POINTS") {
+            size_t n = 0;
+            std::string vtkType;
+            f >> n >> vtkType;
+            mesh.points.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                f >> mesh.points[i].x >> mesh.points[i].y >> mesh.points[i].z;
+            }
+        } else if (tok == "POLYGONS" || tok == "VERTICES" || tok == "LINES") {
+            size_t nCells = 0, totalSize = 0;
+            f >> nCells >> totalSize;
+            mesh.cells.resize(nCells);
+            for (size_t ci = 0; ci < nCells; ++ci) {
+                int nIds = 0;
+                f >> nIds;
+                mesh.cells[ci].resize(std::max(0, nIds));
+                for (int j = 0; j < nIds; ++j) f >> mesh.cells[ci][j];
+            }
+        } else if (tok == "POINT_DATA") {
+            f >> pointDataCount;
+            mode = DataMode::POINT;
+        } else if (tok == "CELL_DATA") {
+            f >> cellDataCount;
+            mode = DataMode::CELL;
+        } else if (tok == "FIELD") {
+            std::string fieldName;
+            size_t nArrays = 0;
+            f >> fieldName >> nArrays;
+            for (size_t ai = 0; ai < nArrays; ++ai) {
+                std::string name, vtkType;
+                int nComp = 0;
+                size_t nTuples = 0;
+                f >> name >> nComp >> nTuples >> vtkType;
+                if (nComp <= 1) {
+                    std::vector<double> vals(nTuples, 0.0);
+                    for (size_t i = 0; i < nTuples; ++i) f >> vals[i];
+                    if (mode == DataMode::POINT) {
+                        mesh.pointScalars[name] = Eigen::Map<const Eigen::VectorXd>(vals.data(), vals.size());
+                    } else {
+                        cellScalars[name] = std::move(vals);
+                    }
+                } else if (nComp == 3) {
+                    std::vector<Vec3> vals(nTuples, Vec3::Zero());
+                    for (size_t i = 0; i < nTuples; ++i) {
+                        double x = 0.0, y = 0.0, z = 0.0;
+                        f >> x >> y >> z;
+                        vals[i] = Vec3(x, y, z);
+                    }
+                    if (mode == DataMode::POINT) {
+                        mesh.pointVectors[name] = std::move(vals);
+                    } else {
+                        cellVectors[name] = std::move(vals);
+                    }
+                } else {
+                    // Unsupported field component count: read and discard.
+                    double discard = 0.0;
+                    for (size_t i = 0; i < nTuples * static_cast<size_t>(nComp); ++i) f >> discard;
+                }
+            }
+        } else if (tok == "SCALARS") {
+            std::string name, vtkType, maybe;
+            f >> name >> vtkType;
+            int nComp = 1;
+            if (nextToken(maybe)) {
+                if (isIntegerToken(maybe)) {
+                    nComp = std::stoi(maybe);
+                } else {
+                    pending = maybe;
+                }
+            }
+            std::string lookup, lookupName;
+            nextToken(lookup);
+            nextToken(lookupName);
+            size_t count = (mode == DataMode::POINT) ? pointDataCount : cellDataCount;
+            std::vector<double> vals(count, 0.0);
+            for (size_t i = 0; i < count; ++i) {
+                double v = 0.0;
+                f >> v;
+                vals[i] = v;
+                for (int c = 1; c < nComp; ++c) {
+                    double discard = 0.0;
+                    f >> discard;
+                }
+            }
+            if (mode == DataMode::POINT) {
+                mesh.pointScalars[name] = Eigen::Map<Eigen::VectorXd>(vals.data(), vals.size());
+            } else {
+                cellScalars[name] = std::move(vals);
+            }
+        } else if (tok == "VECTORS") {
+            std::string name, vtkType;
+            f >> name >> vtkType;
+            size_t count = (mode == DataMode::POINT) ? pointDataCount : cellDataCount;
+            std::vector<Vec3> vals(count, Vec3::Zero());
+            for (size_t i = 0; i < count; ++i) {
+                double x = 0.0, y = 0.0, z = 0.0;
+                f >> x >> y >> z;
+                vals[i] = Vec3(x, y, z);
+            }
+            if (mode == DataMode::POINT) {
+                mesh.pointVectors[name] = std::move(vals);
+            } else {
+                cellVectors[name] = std::move(vals);
+            }
+        }
+    }
+
+    for (const auto& [name, vals] : cellScalars) {
+        mesh.cellScalars[name] = Eigen::Map<const Eigen::VectorXd>(vals.data(), vals.size());
+        if (vals.size() == mesh.points.size()) {
+            mesh.pointScalars[name] = Eigen::Map<const Eigen::VectorXd>(vals.data(), vals.size());
+        } else if (!mesh.cells.empty()) {
+            auto pointVals = averageCellScalarsToPoints(mesh.cells, mesh.points.size(), vals);
+            mesh.pointScalars[name] = Eigen::Map<const Eigen::VectorXd>(pointVals.data(), pointVals.size());
+        }
+    }
+    for (const auto& [name, vals] : cellVectors) {
+        mesh.cellVectors[name] = vals;
+        if (vals.size() == mesh.points.size()) {
+            mesh.pointVectors[name] = vals;
+        } else if (!mesh.cells.empty()) {
+            mesh.pointVectors[name] = averageCellVectorsToPoints(mesh.cells, mesh.points.size(), vals);
+        }
+    }
+
+    if (mesh.datasetType == VtkDatasetType::STRUCTURED_GRID &&
+        mesh.dimX == 0 && !mesh.points.empty()) {
+        mesh.dimX = static_cast<int>(mesh.points.size());
+        mesh.dimY = 1;
+        mesh.dimZ = 1;
+    }
+
+    return !mesh.points.empty();
+}
+
+bool writeLegacyVtkMesh(const std::string& path,
+                        const VtkMeshData& mesh,
+                        const std::vector<std::pair<std::string, Eigen::VectorXd>>& pointScalars) {
+    std::ofstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "Error: Cannot write VTK: " << path << "\n";
+        return false;
+    }
+
+    f << "# vtk DataFile Version 2.0\n"
+      << mesh.title << "\n"
+      << "ASCII\n";
+
+    if (mesh.datasetType == VtkDatasetType::STRUCTURED_GRID) {
+        f << "DATASET STRUCTURED_GRID\n";
+        f << "DIMENSIONS " << mesh.dimX << " " << mesh.dimY << " " << mesh.dimZ << "\n";
+    } else {
+        f << "DATASET POLYDATA\n";
+    }
+
+    f << "POINTS " << mesh.points.size() << " float\n";
+    f << std::fixed << std::setprecision(6);
+    for (const auto& p : mesh.points) {
+        f << p.x << " " << p.y << " " << p.z << "\n";
+    }
+
+    if (mesh.datasetType == VtkDatasetType::POLYDATA) {
+        if (!mesh.cells.empty()) {
+            size_t totalSize = 0;
+            for (const auto& cell : mesh.cells) totalSize += 1 + cell.size();
+            f << "\nPOLYGONS " << mesh.cells.size() << " " << totalSize << "\n";
+            for (const auto& cell : mesh.cells) {
+                f << cell.size();
+                for (int pid : cell) f << " " << pid;
+                f << "\n";
+            }
+        } else {
+            f << "\nVERTICES " << mesh.points.size() << " " << (mesh.points.size() * 2) << "\n";
+            for (size_t i = 0; i < mesh.points.size(); ++i) f << "1 " << i << "\n";
+        }
+    }
+
+    f << "\nPOINT_DATA " << mesh.points.size() << "\n";
+    f << std::setprecision(4);
+    for (const auto& [name, vals] : pointScalars) {
+        if (static_cast<size_t>(vals.size()) != mesh.points.size()) {
+            std::cerr << "Warning: skipping VTK array " << name << " due to size mismatch\n";
+            continue;
+        }
+        f << "SCALARS " << name << " float 1\n"
+          << "LOOKUP_TABLE default\n";
+        for (int i = 0; i < vals.size(); ++i) f << vals[i] << "\n";
     }
     return true;
 }

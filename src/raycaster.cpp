@@ -119,19 +119,24 @@ struct GridMesh {
     }
 
     // DDA ray traversal: test only triangles in cells the ray passes through
-    bool isBlocked(const double* p1, const double* p2) const {
+    bool isBlocked(const double* p1, const double* p2, bool enforceRangeLimit) const {
         if (tris.empty()) return false;
 
         double dir[3] = {p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2]};
         double len = std::sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
         if (len < 1e-12) return false;
-        if (len >= R_MAG_MAX) return false;  // beyond range → assume unblocked
+        if (enforceRangeLimit && len >= R_MAG_MAX) return false;  // beyond range → assume unblocked
         double inv = 1.0/len;
         double d[3] = {dir[0]*inv, dir[1]*inv, dir[2]*inv};
 
-        // Offset 3cm from each endpoint
-        double s[3] = {p1[0]+d[0]*0.03, p1[1]+d[1]*0.03, p1[2]+d[2]*0.03};
-        double tmax = len - 0.06;
+        // Match the Clement workflow: trim each ray to the 3%..97% segment.
+        double startOffset = len * 0.03;
+        double s[3] = {
+            p1[0] + d[0] * startOffset,
+            p1[1] + d[1] * startOffset,
+            p1[2] + d[2] * startOffset
+        };
+        double tmax = len * 0.94;
         if (tmax <= 0) return false;
 
         // Starting grid cell
@@ -247,11 +252,11 @@ void Raycaster::loadVegetation(const std::string& stlPath) {
     }
 }
 
-bool Raycaster::isBlocked(const Vec3& start, const Vec3& end) const {
+bool Raycaster::isBlocked(const Vec3& start, const Vec3& end, bool enforceRangeLimit) const {
     double s[3] = {start.x(), start.y(), start.z()};
     double e[3] = {end.x(),   end.y(),   end.z()};
-    if (pImpl->wallMesh.isBlocked(s, e)) return true;
-    if (pImpl->vegLoaded && pImpl->vegMesh.isBlocked(s, e)) return true;
+    if (pImpl->wallMesh.isBlocked(s, e, enforceRangeLimit)) return true;
+    if (pImpl->vegLoaded && pImpl->vegMesh.isBlocked(s, e, enforceRangeLimit)) return true;
     return false;
 }
 

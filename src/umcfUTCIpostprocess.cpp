@@ -10,6 +10,10 @@
 #include <atomic>
 #include <cstring>
 #include <iomanip>
+#include <limits>
+#include <optional>
+#include <sstream>
+#include <unordered_map>
 
 #include "constants.h"
 #include "types.h"
@@ -52,6 +56,9 @@ struct CommandLineArgs {
     std::string lutPath;
     // Write compressed (gzip) cache files; auto-enabled when ZLIB is available
     bool compressCache = BinaryCache::compressionAvailable();
+    // Optional debug outputs from the investigation phase
+    bool writeDebugTerms = false;
+    bool writeDebugQrswSurface = false;
 };
 
 void printUsage(const char* progName) {
@@ -73,6 +80,8 @@ void printUsage(const char* progName) {
               << "  --batch-size <N>       VF batch size (default 500, lower = less memory)\n"
               << "  --compress-cache       Write gzip-compressed cache files (default when ZLIB available)\n"
               << "  --no-compress-cache    Write uncompressed cache files\n"
+              << "  --write-debug-terms    Write TumrtAvg_terms debug output\n"
+              << "  --write-debug-qrsw     Write qrsw_surface.vtk debug output\n"
               << "  -j <N>                 Number of threads (default: 1)\n"
               << "  --help                 Show this message\n";
 }
@@ -122,6 +131,10 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.compressCache = true;
         } else if (arg == "--no-compress-cache") {
             args.compressCache = false;
+        } else if (arg == "--write-debug-terms") {
+            args.writeDebugTerms = true;
+        } else if (arg == "--write-debug-qrsw") {
+            args.writeDebugQrswSurface = true;
         } else if (arg == "--help") {
             printUsage(argv[0]);
             exit(0);
@@ -158,6 +171,535 @@ static std::vector<SurfacePatch> concat(const std::vector<SurfacePatch>& a,
     std::vector<SurfacePatch> out = a;
     out.insert(out.end(), b.begin(), b.end());
     return out;
+}
+
+static std::string probeKey(const Point3& p) {
+    auto q = [](double v) {
+        return static_cast<long long>(std::llround(v * 1000.0));
+    };
+    return std::to_string(q(p.x)) + ":" + std::to_string(q(p.y)) + ":" + std::to_string(q(p.z));
+}
+
+struct UniformGridField {
+    std::vector<double> xs;
+    std::vector<double> ys;
+    std::vector<double> values;
+    std::unordered_map<long long, size_t> indexByCell;
+    bool valid = false;
+};
+
+static constexpr double DENSE_INTERP_BBOX_INSET = 1.0;
+
+static long long gridKey(int ix, int iy) {
+    return (static_cast<long long>(ix) << 32) ^
+           static_cast<unsigned int>(iy);
+}
+
+static UniformGridField buildUniformGridField(const std::vector<PedestrianPosition>& positions,
+                                              const Eigen::VectorXd& values) {
+    UniformGridField field;
+    field.xs.reserve(positions.size());
+    field.ys.reserve(positions.size());
+    for (const auto& p : positions) {
+        field.xs.push_back(p.center.x);
+        field.ys.push_back(p.center.y);
+    }
+    auto dedupe = [](std::vector<double>& coords) {
+        std::sort(coords.begin(), coords.end());
+        coords.erase(std::unique(coords.begin(), coords.end(),
+            [](double a, double b) { return std::abs(a - b) < 1e-4; }),
+            coords.end());
+    };
+    dedupe(field.xs);
+    dedupe(field.ys);
+    if (field.xs.size() < 2 || field.ys.size() < 2) return field;
+
+    field.values.assign(field.xs.size() * field.ys.size(),
+                        std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 0; i < positions.size() && i < static_cast<size_t>(values.size()); ++i) {
+        auto xit = std::lower_bound(field.xs.begin(), field.xs.end(), positions[i].center.x - 1e-4);
+        auto yit = std::lower_bound(field.ys.begin(), field.ys.end(), positions[i].center.y - 1e-4);
+        if (xit == field.xs.end() || yit == field.ys.end()) continue;
+        int ix = static_cast<int>(xit - field.xs.begin());
+        int iy = static_cast<int>(yit - field.ys.begin());
+        if (ix >= 0 && iy >= 0 && ix < static_cast<int>(field.xs.size()) &&
+            iy < static_cast<int>(field.ys.size())) {
+            field.values[iy * field.xs.size() + ix] = values[i];
+            field.indexByCell[gridKey(ix, iy)] = i;
+        }
+    }
+    field.valid = true;
+    return field;
+}
+
+static double nearestSparseValue(const std::vector<PedestrianPosition>& positions,
+                                 const Eigen::VectorXd& values,
+                                 double x, double y) {
+    double bestD2 = std::numeric_limits<double>::infinity();
+    double best = 0.0;
+    for (size_t i = 0; i < positions.size() && i < static_cast<size_t>(values.size()); ++i) {
+        double dx = positions[i].center.x - x;
+        double dy = positions[i].center.y - y;
+        double d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = values[i];
+        }
+    }
+    return best;
+}
+
+static double cubicInterpolate1D(double p0, double p1, double p2, double p3, double t) {
+    double a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    double a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    double a2 = -0.5 * p0 + 0.5 * p2;
+    double a3 = p1;
+    return ((a0 * t + a1) * t + a2) * t + a3;
+}
+
+static double interpolateSparseTumrt(const UniformGridField& field,
+                                     const std::vector<PedestrianPosition>& positions,
+                                     const Eigen::VectorXd& values,
+                                     double x, double y) {
+    if (!field.valid || field.xs.empty() || field.ys.empty()) {
+        return nearestSparseValue(positions, values, x, y);
+    }
+    if (x < field.xs.front() || x > field.xs.back() || y < field.ys.front() || y > field.ys.back()) {
+        return nearestSparseValue(positions, values, x, y);
+    }
+
+    // Match the Clement workflow: use cubic interpolation only inside an inset
+    // bounding box and fall back to nearest outside that region or when the
+    // required 4x4 stencil is incomplete.
+    if (x < field.xs.front() + DENSE_INTERP_BBOX_INSET ||
+        x > field.xs.back() - DENSE_INTERP_BBOX_INSET ||
+        y < field.ys.front() + DENSE_INTERP_BBOX_INSET ||
+        y > field.ys.back() - DENSE_INTERP_BBOX_INSET) {
+        return nearestSparseValue(positions, values, x, y);
+    }
+
+    auto xhi = std::lower_bound(field.xs.begin(), field.xs.end(), x);
+    auto yhi = std::lower_bound(field.ys.begin(), field.ys.end(), y);
+    if (xhi == field.xs.begin() || yhi == field.ys.begin() ||
+        xhi == field.xs.end() || yhi == field.ys.end()) {
+        return nearestSparseValue(positions, values, x, y);
+    }
+
+    int ix1 = static_cast<int>(xhi - field.xs.begin());
+    int iy1 = static_cast<int>(yhi - field.ys.begin());
+    int ix0 = ix1 - 1;
+    int iy0 = iy1 - 1;
+    int ixm1 = ix0 - 1;
+    int ix2 = ix1 + 1;
+    int iym1 = iy0 - 1;
+    int iy2 = iy1 + 1;
+    if (ixm1 < 0 || iym1 < 0 ||
+        ix2 >= static_cast<int>(field.xs.size()) ||
+        iy2 >= static_cast<int>(field.ys.size())) {
+        return nearestSparseValue(positions, values, x, y);
+    }
+
+    auto getVal = [&](int ix, int iy) -> double {
+        auto it = field.indexByCell.find(gridKey(ix, iy));
+        if (it == field.indexByCell.end()) return std::numeric_limits<double>::quiet_NaN();
+        return values[it->second];
+    };
+
+    double x0 = field.xs[ix0];
+    double x1 = field.xs[ix1];
+    double y0 = field.ys[iy0];
+    double y1 = field.ys[iy1];
+    double tx = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0;
+    double ty = (y1 > y0) ? (y - y0) / (y1 - y0) : 0.0;
+    double rowVals[4];
+    const int yIdx[4] = {iym1, iy0, iy1, iy2};
+    const int xIdx[4] = {ixm1, ix0, ix1, ix2};
+    for (int ry = 0; ry < 4; ++ry) {
+        double samples[4];
+        for (int rx = 0; rx < 4; ++rx) {
+            samples[rx] = getVal(xIdx[rx], yIdx[ry]);
+            if (!std::isfinite(samples[rx])) {
+                return nearestSparseValue(positions, values, x, y);
+            }
+        }
+        rowVals[ry] = cubicInterpolate1D(samples[0], samples[1], samples[2], samples[3], tx);
+    }
+    return cubicInterpolate1D(rowVals[0], rowVals[1], rowVals[2], rowVals[3], ty);
+}
+
+static Eigen::VectorXd vectorMagnitudes(const std::vector<Vec3>& vecs) {
+    Eigen::VectorXd out(vecs.size());
+    for (size_t i = 0; i < vecs.size(); ++i) out[i] = vecs[i].norm();
+    return out;
+}
+
+static std::string firstExistingPath(const std::vector<std::string>& paths) {
+    for (const auto& path : paths) {
+        std::ifstream f(path);
+        if (f.good()) return path;
+    }
+    return "";
+}
+
+static double areaWeightedAverage(const Eigen::VectorXd& values,
+                                  const std::array<Vec3, 5>& areaVectors) {
+    double sum = 0.0;
+    double sumArea = 0.0;
+    for (int i = 0; i < values.size() && i < static_cast<int>(areaVectors.size()); ++i) {
+        const double area = areaVectors[i].norm();
+        sum += values[i] * area;
+        sumArea += area;
+    }
+    return sumArea > 0.0 ? sum / sumArea : 0.0;
+}
+
+static bool writeTumrtTerms(const std::string& path,
+                            const std::vector<PedestrianPosition>& positions,
+                            int timestep,
+                            const Eigen::VectorXd& tumrtNoSolar,
+                            const Eigen::VectorXd& tumrtFinal,
+                            const Eigen::VectorXd& qlwSurfaces,
+                            const Eigen::VectorXd& qlwSky,
+                            const Eigen::VectorXd& qswSurfaces,
+                            const Eigen::VectorXd& qswSky,
+                            const Eigen::VectorXd& qswDirect,
+                            const Eigen::VectorXd& qswGround,
+                            const Eigen::VectorXd& qswElevatedDown,
+                            const Eigen::VectorXd& qswVertical,
+                            const Eigen::VectorXd& qswUpward) {
+    std::ofstream f(path);
+    if (!f.is_open()) return false;
+    f << std::fixed << std::setprecision(4);
+    for (size_t i = 0; i < positions.size(); ++i) {
+        f << timestep << " "
+          << positions[i].center.x << " "
+          << positions[i].center.y << " "
+          << positions[i].center.z << " "
+          << tumrtNoSolar[i] << " "
+          << tumrtFinal[i] << " "
+          << qlwSurfaces[i] << " "
+          << qlwSky[i] << " "
+          << qswSurfaces[i] << " "
+          << qswSky[i] << " "
+          << qswDirect[i] << " "
+          << qswGround[i] << " "
+          << qswElevatedDown[i] << " "
+          << qswVertical[i] << " "
+          << qswUpward[i] << "\n";
+    }
+    return true;
+}
+
+static long long hashGridKey(int ix, int iy) {
+    return (static_cast<long long>(ix) << 32)
+         ^ static_cast<unsigned int>(iy);
+}
+
+struct CellLocator2D {
+    double minX = 0.0;
+    double minY = 0.0;
+    double binSize = 1.0;
+    std::vector<Point3> centroids;
+    std::vector<std::array<double, 4>> bboxes;
+    std::unordered_map<long long, std::vector<int>> bins;
+};
+
+static bool pointInPolygonXY(const std::vector<Point3>& points,
+                             const std::vector<int>& cell,
+                             double x,
+                             double y) {
+    bool inside = false;
+    const size_t n = cell.size();
+    if (n < 3) return false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const Point3& pi = points[cell[i]];
+        const Point3& pj = points[cell[j]];
+        const bool crosses = ((pi.y > y) != (pj.y > y));
+        if (!crosses) continue;
+        const double denom = pj.y - pi.y;
+        if (std::abs(denom) < 1e-12) continue;
+        const double xCross = pi.x + (y - pi.y) * (pj.x - pi.x) / denom;
+        if (x < xCross) inside = !inside;
+    }
+    return inside;
+}
+
+static CellLocator2D buildCellLocator2D(const VtkMeshData& mesh) {
+    CellLocator2D loc;
+    if (mesh.cells.empty() || mesh.points.empty()) return loc;
+
+    double minX = std::numeric_limits<double>::infinity();
+    double minY = std::numeric_limits<double>::infinity();
+    double maxX = -std::numeric_limits<double>::infinity();
+    double maxY = -std::numeric_limits<double>::infinity();
+    for (const auto& p : mesh.points) {
+        minX = std::min(minX, p.x);
+        minY = std::min(minY, p.y);
+        maxX = std::max(maxX, p.x);
+        maxY = std::max(maxY, p.y);
+    }
+
+    loc.minX = minX;
+    loc.minY = minY;
+    const double domainArea = std::max(1e-6, (maxX - minX) * (maxY - minY));
+    loc.binSize = std::max(0.25, std::sqrt(domainArea / std::max<size_t>(1, mesh.cells.size())));
+    loc.centroids.resize(mesh.cells.size());
+    loc.bboxes.resize(mesh.cells.size());
+
+    for (size_t ci = 0; ci < mesh.cells.size(); ++ci) {
+        const auto& cell = mesh.cells[ci];
+        double cx = 0.0, cy = 0.0, cz = 0.0;
+        double bx0 = std::numeric_limits<double>::infinity();
+        double by0 = std::numeric_limits<double>::infinity();
+        double bx1 = -std::numeric_limits<double>::infinity();
+        double by1 = -std::numeric_limits<double>::infinity();
+        for (int pid : cell) {
+            const auto& p = mesh.points[pid];
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
+            bx0 = std::min(bx0, p.x);
+            by0 = std::min(by0, p.y);
+            bx1 = std::max(bx1, p.x);
+            by1 = std::max(by1, p.y);
+        }
+        const double invN = cell.empty() ? 0.0 : 1.0 / static_cast<double>(cell.size());
+        loc.centroids[ci] = {cx * invN, cy * invN, cz * invN};
+        loc.bboxes[ci] = {bx0, by0, bx1, by1};
+
+        const int ix0 = static_cast<int>(std::floor((bx0 - loc.minX) / loc.binSize));
+        const int iy0 = static_cast<int>(std::floor((by0 - loc.minY) / loc.binSize));
+        const int ix1 = static_cast<int>(std::floor((bx1 - loc.minX) / loc.binSize));
+        const int iy1 = static_cast<int>(std::floor((by1 - loc.minY) / loc.binSize));
+        for (int ix = ix0; ix <= ix1; ++ix) {
+            for (int iy = iy0; iy <= iy1; ++iy) {
+                loc.bins[hashGridKey(ix, iy)].push_back(static_cast<int>(ci));
+            }
+        }
+    }
+    return loc;
+}
+
+static std::vector<Vec3> remapCellVectorsToPoints2D(const VtkMeshData& srcMesh,
+                                                    const std::vector<Vec3>& cellVectors,
+                                                    const std::vector<Point3>& dstPoints) {
+    std::vector<Vec3> out(dstPoints.size(), Vec3::Zero());
+    if (srcMesh.cells.empty() || cellVectors.size() != srcMesh.cells.size()) return out;
+
+    const CellLocator2D loc = buildCellLocator2D(srcMesh);
+    for (size_t i = 0; i < dstPoints.size(); ++i) {
+        const double x = dstPoints[i].x;
+        const double y = dstPoints[i].y;
+        const int ix = static_cast<int>(std::floor((x - loc.minX) / loc.binSize));
+        const int iy = static_cast<int>(std::floor((y - loc.minY) / loc.binSize));
+
+        int bestCell = -1;
+        double bestInsideD2 = std::numeric_limits<double>::infinity();
+        for (int rx = -1; rx <= 1; ++rx) {
+            for (int ry = -1; ry <= 1; ++ry) {
+                auto it = loc.bins.find(hashGridKey(ix + rx, iy + ry));
+                if (it == loc.bins.end()) continue;
+                for (int ci : it->second) {
+                    const auto& bb = loc.bboxes[ci];
+                    if (x < bb[0] - 1e-9 || x > bb[2] + 1e-9 ||
+                        y < bb[1] - 1e-9 || y > bb[3] + 1e-9) {
+                        continue;
+                    }
+                    if (!pointInPolygonXY(srcMesh.points, srcMesh.cells[ci], x, y)) continue;
+                    const double dx = loc.centroids[ci].x - x;
+                    const double dy = loc.centroids[ci].y - y;
+                    const double d2 = dx * dx + dy * dy;
+                    if (d2 < bestInsideD2) {
+                        bestInsideD2 = d2;
+                        bestCell = ci;
+                    }
+                }
+            }
+        }
+
+        if (bestCell < 0) {
+            double bestD2 = std::numeric_limits<double>::infinity();
+            for (size_t ci = 0; ci < loc.centroids.size(); ++ci) {
+                const double dx = loc.centroids[ci].x - x;
+                const double dy = loc.centroids[ci].y - y;
+                const double d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    bestCell = static_cast<int>(ci);
+                }
+            }
+        }
+
+        if (bestCell >= 0) out[i] = cellVectors[bestCell];
+    }
+    return out;
+}
+
+static Eigen::VectorXd remapQrswMagnitudesToPoints(const VtkMeshData& meshQrsw,
+                                                   const std::vector<Point3>& dstPoints) {
+    auto itQCell = meshQrsw.cellVectors.find("qrsw");
+    auto itQPoint = meshQrsw.pointVectors.find("qrsw");
+    std::vector<Vec3> qrswOnDst;
+    if (itQPoint != meshQrsw.pointVectors.end() &&
+        meshQrsw.points.size() == dstPoints.size()) {
+        qrswOnDst = itQPoint->second;
+    } else if (itQCell != meshQrsw.cellVectors.end() && !meshQrsw.cells.empty()) {
+        qrswOnDst = remapCellVectorsToPoints2D(meshQrsw, itQCell->second, dstPoints);
+    } else if (itQPoint != meshQrsw.pointVectors.end()) {
+        qrswOnDst.resize(dstPoints.size(), Vec3::Zero());
+        for (size_t i = 0; i < dstPoints.size(); ++i) {
+            double bestD2 = std::numeric_limits<double>::infinity();
+            size_t best = 0;
+            for (size_t j = 0; j < meshQrsw.points.size(); ++j) {
+                double dx = meshQrsw.points[j].x - dstPoints[i].x;
+                double dy = meshQrsw.points[j].y - dstPoints[i].y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    best = j;
+                }
+            }
+            if (best < itQPoint->second.size()) qrswOnDst[i] = itQPoint->second[best];
+        }
+    }
+    return vectorMagnitudes(qrswOnDst);
+}
+
+static bool computeDenseSurfaceOutputs(const std::string& casePath,
+                                       const std::string& outDir,
+                                       int timestep,
+                                       const std::vector<PedestrianPosition>& sparsePositions,
+                                       const Eigen::VectorXd& sparseTumrtAvg,
+                                       UtciSolver& utciSolver,
+                                       bool debugWriteQrsw) {
+    const std::string surfaceDir = casePath + "/postProcessing/surfaces/" + std::to_string(timestep);
+    const std::string airDir = casePath + "/postProcessing/surfacesPedestrianAir/" + std::to_string(timestep);
+    const std::string radDir = casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(timestep);
+    const std::string meshPath = firstExistingPath({
+        surfaceDir + "/T_pedestrian.vtk",
+        airDir + "/T_pedestrian.vtk"
+    });
+    const std::string qrswPath = firstExistingPath({
+        surfaceDir + "/qrsw_pedestrian.vtk",
+        radDir + "/qrsw_pedestrian.vtk"
+    });
+    const std::string uPath = firstExistingPath({
+        surfaceDir + "/U_pedestrian.vtk",
+        airDir + "/U_pedestrian.vtk"
+    });
+    const std::string wPath = firstExistingPath({
+        surfaceDir + "/w_pedestrian.vtk",
+        airDir + "/w_pedestrian.vtk"
+    });
+
+    VtkMeshData meshT, meshQrsw, meshU, meshW;
+    if (meshPath.empty() || !readLegacyVtkMesh(meshPath, meshT)) {
+        std::cout << "  Dense Stage 2 skipped for t=" << timestep
+                  << " (missing dense T_pedestrian.vtk)\n";
+        return false;
+    }
+    if (qrswPath.empty() || uPath.empty() || wPath.empty() ||
+        !readLegacyVtkMesh(qrswPath, meshQrsw) ||
+        !readLegacyVtkMesh(uPath, meshU) ||
+        !readLegacyVtkMesh(wPath, meshW)) {
+        std::cout << "  Dense Stage 2 skipped for t=" << timestep
+                  << " (missing dense qrsw/U/w fields)\n";
+        return false;
+    }
+
+    auto itT = meshT.pointScalars.find("T");
+    auto itW = meshW.pointScalars.find("w");
+    auto itU = meshU.pointVectors.find("U");
+    auto itQ = meshQrsw.pointVectors.find("qrsw");
+    auto itQCell = meshQrsw.cellVectors.find("qrsw");
+    if (itT == meshT.pointScalars.end() || itW == meshW.pointScalars.end() ||
+        itU == meshU.pointVectors.end() || itQ == meshQrsw.pointVectors.end()) {
+        std::cout << "  Dense Stage 2 skipped for t=" << timestep
+                  << " (expected T/U/w/qrsw arrays not found)\n";
+        return false;
+    }
+
+    const size_t n = meshT.points.size();
+    if (itT->second.size() != static_cast<int>(n) ||
+        itW->second.size() != static_cast<int>(n) ||
+        itU->second.size() != n) {
+        std::cout << "  Dense Stage 2 skipped for t=" << timestep
+                  << " (dense T/U/w arrays do not align with T mesh)\n";
+        return false;
+    }
+
+    const auto sparseField = buildUniformGridField(sparsePositions, sparseTumrtAvg);
+    Eigen::VectorXd denseTumrtAvg = Eigen::VectorXd::Zero(n);
+    for (size_t i = 0; i < n; ++i) {
+        denseTumrtAvg[i] = interpolateSparseTumrt(
+            sparseField, sparsePositions, sparseTumrtAvg,
+            meshT.points[i].x, meshT.points[i].y
+        );
+    }
+
+    std::vector<Vec3> qrswOnAirMesh;
+    if (meshQrsw.points.size() == n && itQ != meshQrsw.pointVectors.end()) {
+        qrswOnAirMesh = itQ->second;
+    } else if (itQ != meshQrsw.pointVectors.end()) {
+        qrswOnAirMesh.resize(n, Vec3::Zero());
+        for (size_t i = 0; i < n; ++i) {
+            double bestD2 = std::numeric_limits<double>::infinity();
+            size_t best = 0;
+            for (size_t j = 0; j < meshQrsw.points.size(); ++j) {
+                double dx = meshQrsw.points[j].x - meshT.points[i].x;
+                double dy = meshQrsw.points[j].y - meshT.points[i].y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    best = j;
+                }
+            }
+            if (best < itQ->second.size()) qrswOnAirMesh[i] = itQ->second[best];
+        }
+    } else if (itQCell != meshQrsw.cellVectors.end() && !meshQrsw.cells.empty()) {
+        qrswOnAirMesh = remapCellVectorsToPoints2D(meshQrsw, itQCell->second, meshT.points);
+    }
+
+    Eigen::VectorXd qrswNorm = vectorMagnitudes(qrswOnAirMesh);
+    Eigen::VectorXd denseTmrt = denseTumrtAvg;
+    for (size_t i = 0; i < n; ++i) {
+        double beta = 0.0;
+        Vec3 sunPosVector = -qrswOnAirMesh[i];
+        if (sunPosVector.norm() > 0.0 && sunPosVector.z() > 0.0) {
+            double cosPhi = sunPosVector.z() / sunPosVector.norm();
+            cosPhi = std::max(-1.0, std::min(1.0, cosPhi));
+            beta = 90.0 - std::acos(cosPhi) * 180.0 / M_PI;
+        }
+        double fp = 0.308 * std::cos(beta * (1.0 - (beta * beta) / 48402.0) * M_PI / 180.0);
+        double T4 = std::pow(denseTumrtAvg[i], 4)
+                  + (fp * ABS_SW_PERSON * qrswNorm[i]) / (EPS_LW_PERSON * SIGMA);
+        denseTmrt[i] = std::pow(std::max(0.0, T4), 0.25);
+        if (denseTumrtAvg[i] < 1.0) denseTmrt[i] = 0.0;
+    }
+
+    Eigen::VectorXd denseRH = Eigen::VectorXd::Zero(n);
+    Eigen::VectorXd denseUtci = Eigen::VectorXd::Zero(n);
+    for (size_t i = 0; i < n; ++i) {
+        double airT = itT->second[i];
+        double airw = itW->second[i];
+        double psat = std::exp(77.3450 + 0.0057 * airT - 7235.0 / airT) / std::pow(airT, 8.2);
+        double pv = P_REF * airw / 0.62;
+        denseRH[i] = std::min(100.0, std::max(0.0, pv / psat * 100.0));
+
+        double va = itU->second[i].norm() / 0.667;
+        double Ta_c = airT - 273.15;
+        double Tmrt_c = denseTmrt[i] - 273.15;
+        denseUtci[i] = utciSolver.calculate(Ta_c, va, denseRH[i], Tmrt_c);
+    }
+
+    writeLegacyVtkMesh(outDir + "/Tumrt_surface.vtk", meshT, {{"Tumrt", denseTumrtAvg}});
+    writeLegacyVtkMesh(outDir + "/Tmrt_surface.vtk", meshT, {{"Tmrt", denseTmrt}});
+    writeLegacyVtkMesh(outDir + "/RH_surface.vtk", meshT, {{"RH", denseRH}});
+    if (debugWriteQrsw) {
+        writeLegacyVtkMesh(outDir + "/qrsw_surface.vtk", meshT, {{"qrsw", qrswNorm}});
+    }
+    writeLegacyVtkMesh(outDir + "/UTCI_surface.vtk", meshT, {{"UTCI", denseUtci}, {"Tmrt", denseTmrt}});
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -248,10 +790,36 @@ int main(int argc, char* argv[]) {
     // =========================================================
     // Load surface geometry ONCE (from first timestep)
     // =========================================================
-    std::string firstSurfDir = args.casePath + "/postProcessing/surfaces/"
-                               + std::to_string(timesteps[0]);
+    int geometryTimestep = timesteps[0];
+    std::string firstSurfDir;
+    for (int t : timesteps) {
+        std::string candidate = args.casePath + "/postProcessing/surfaces/" + std::to_string(t);
+        if (!firstExistingPath({
+                candidate + "/Sf_wallSurfaces.raw",
+                candidate + "/Sf_wallAndTreeSurfaces.raw",
+                candidate + "/Sf_skySurfaces.raw"
+            }).empty()) {
+            geometryTimestep = t;
+            firstSurfDir = candidate;
+            break;
+        }
+    }
+    if (firstSurfDir.empty()) {
+        const std::string fallback = args.casePath + "/postProcessing/surfaces/3600";
+        if (!firstExistingPath({
+                fallback + "/Sf_wallSurfaces.raw",
+                fallback + "/Sf_wallAndTreeSurfaces.raw",
+                fallback + "/Sf_skySurfaces.raw"
+            }).empty()) {
+            geometryTimestep = 3600;
+            firstSurfDir = fallback;
+        }
+    }
+    if (firstSurfDir.empty()) {
+        firstSurfDir = args.casePath + "/postProcessing/surfaces/" + std::to_string(timesteps[0]);
+    }
 
-    std::cout << "Loading surface geometry from timestep " << timesteps[0] << "...\n";
+    std::cout << "Loading surface geometry from timestep " << geometryTimestep << "...\n";
 
     // Try discrete-workflow names first, fall back to utci_clement combined name
     auto wallGeo = loadSurfacePatches(firstSurfDir + "/Sf_wallSurfaces.raw");
@@ -295,17 +863,31 @@ int main(int argc, char* argv[]) {
         std::vector<double> vegQr;
         std::vector<double> allQrOut;   // Outgoing LW σT⁴+qr*(1-ε)/ε (utci_clement format)
         std::vector<double> allQsOut;   // Outgoing SW
+        Eigen::VectorXd sparseQrswFromSurface;
     };
     std::vector<TimestepScalars> tsData(timesteps.size());
+    std::vector<Point3> pedCenters(positions.size());
+    for (size_t i = 0; i < positions.size(); ++i) pedCenters[i] = positions[i].center;
     for (size_t tIdx = 0; tIdx < timesteps.size(); ++tIdx) {
         int t = timesteps[tIdx];
         std::string surfDir = args.casePath + "/postProcessing/surfaces/" + std::to_string(t);
+        std::string radDir = args.casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(t);
         tsData[tIdx].wallTemps = loadScalarField(surfDir + "/T_wallSurfaces.raw");
         tsData[tIdx].vegTemps  = loadScalarField(surfDir + "/T_vegSurfaces.raw");
         tsData[tIdx].vegQr     = loadScalarField(surfDir + "/qr_vegSurfaces.raw");
         // utci_clement: combined outgoing LW radiation (replaces T+qr)
         tsData[tIdx].allQrOut  = loadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw");
         tsData[tIdx].allQsOut  = loadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw");
+        const std::string qrswPath = firstExistingPath({
+            surfDir + "/qrsw_pedestrian.vtk",
+            radDir + "/qrsw_pedestrian.vtk"
+        });
+        if (!qrswPath.empty()) {
+            VtkMeshData meshQrsw;
+            if (readLegacyVtkMesh(qrswPath, meshQrsw)) {
+                tsData[tIdx].sparseQrswFromSurface = remapQrswMagnitudesToPoints(meshQrsw, pedCenters);
+            }
+        }
         if (tsData[tIdx].wallTemps.empty() && tsData[tIdx].allQrOut.empty()) {
             std::cerr << "  Warning: no wall temps or qrOut for t=" << t << "\n";
         }
@@ -327,13 +909,31 @@ int main(int argc, char* argv[]) {
     auto probeTAll = loadProbeScalarAll(probeDir + "/T");
     auto probeWAll = loadProbeScalarAll(probeDir + "/w");
     auto probeUAll = loadProbeVelocityMagAll(probeDir + "/U");
+    auto probeQrswAll = loadQrswProbeData(args.casePath);
+    auto probePoints = loadProbePoints(probeDir + "/T");
     std::cout << "  Probe T rows: " << probeTAll.size()
               << "  U rows: " << probeUAll.size() << "\n";
     if (probeTAll.empty())
         std::cout << "  Warning: no probe T – using ambient temperature for UTCI\n";
     if (probeUAll.empty())
         std::cout << "  Warning: no probe U – using reference wind speed for UTCI\n";
+    if (probeQrswAll.empty())
+        std::cout << "  Warning: no probe qrsw data – using dense qrsw surface sampling fallback before binary shadow\n";
+    else
+        std::cout << "  Probe qrsw rows: " << probeQrswAll.size() << "\n";
     static const std::vector<double> emptyVec;
+
+    std::vector<int> probeIndexForPos(positions.size(), -1);
+    if (!probePoints.empty()) {
+        std::unordered_map<std::string, int> probePointIndex;
+        for (size_t i = 0; i < probePoints.size(); ++i) {
+            probePointIndex[probeKey(probePoints[i])] = static_cast<int>(i);
+        }
+        for (size_t i = 0; i < positions.size(); ++i) {
+            auto it = probePointIndex.find(probeKey(positions[i].center));
+            if (it != probePointIndex.end()) probeIndexForPos[i] = it->second;
+        }
+    }
 
     // =========================================================
     // Create output directories once (mkdir -p style)
@@ -406,8 +1006,30 @@ int main(int argc, char* argv[]) {
     // Accumulators: allTmrt/allUtci/allRH[tIdx][pedIdx]
     size_t nT = timesteps.size();
     std::vector<Eigen::VectorXd> allTmrt(nT, Eigen::VectorXd::Zero(nPos));
+    std::vector<Eigen::VectorXd> allTumrtAvg(nT, Eigen::VectorXd::Zero(nPos));
     std::vector<Eigen::VectorXd> allUtci(nT, Eigen::VectorXd::Zero(nPos));
     std::vector<Eigen::VectorXd> allRH  (nT, Eigen::VectorXd::Zero(nPos));
+    std::vector<Eigen::VectorXd> allTumrtNoSolar(nT, Eigen::VectorXd::Zero(nPos));
+    std::vector<Eigen::VectorXd> allQlwSurfaces;
+    std::vector<Eigen::VectorXd> allQlwSky;
+    std::vector<Eigen::VectorXd> allQswSurfaces;
+    std::vector<Eigen::VectorXd> allQswSky;
+    std::vector<Eigen::VectorXd> allQswDirect;
+    std::vector<Eigen::VectorXd> allQswGround;
+    std::vector<Eigen::VectorXd> allQswElevatedDown;
+    std::vector<Eigen::VectorXd> allQswVertical;
+    std::vector<Eigen::VectorXd> allQswUpward;
+    if (args.writeDebugTerms) {
+        allQlwSurfaces.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQlwSky.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswSurfaces.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswSky.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswDirect.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswGround.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswElevatedDown.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswVertical.assign(nT, Eigen::VectorXd::Zero(nPos));
+        allQswUpward.assign(nT, Eigen::VectorXd::Zero(nPos));
+    }
 
     auto totalT0 = std::chrono::steady_clock::now();
 
@@ -485,6 +1107,27 @@ int main(int argc, char* argv[]) {
             Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchRH   = Eigen::VectorXd::Zero(bN);
+            Eigen::VectorXd batchTumrtNoSolar = Eigen::VectorXd::Zero(bN);
+            Eigen::VectorXd batchQlwSurfaces;
+            Eigen::VectorXd batchQlwSky;
+            Eigen::VectorXd batchQswSurfaces;
+            Eigen::VectorXd batchQswSky;
+            Eigen::VectorXd batchQswDirect;
+            Eigen::VectorXd batchQswGround;
+            Eigen::VectorXd batchQswElevatedDown;
+            Eigen::VectorXd batchQswVertical;
+            Eigen::VectorXd batchQswUpward;
+            if (args.writeDebugTerms) {
+                batchQlwSurfaces = Eigen::VectorXd::Zero(bN);
+                batchQlwSky = Eigen::VectorXd::Zero(bN);
+                batchQswSurfaces = Eigen::VectorXd::Zero(bN);
+                batchQswSky = Eigen::VectorXd::Zero(bN);
+                batchQswDirect = Eigen::VectorXd::Zero(bN);
+                batchQswGround = Eigen::VectorXd::Zero(bN);
+                batchQswElevatedDown = Eigen::VectorXd::Zero(bN);
+                batchQswVertical = Eigen::VectorXd::Zero(bN);
+                batchQswUpward = Eigen::VectorXd::Zero(bN);
+            }
 
             // Pick probe data row for this radiation timestep
             double tDouble = static_cast<double>(t);
@@ -509,6 +1152,13 @@ int main(int argc, char* argv[]) {
                     for (auto& r : probeUAll) { double d=std::abs(r.first-tDouble); if(d<bd){bd=d;best=&r.second;} }
                     return *best;
                 }();
+            const std::vector<double>& probeQrsw = probeQrswAll.empty() ? emptyVec
+                : [&]() -> const std::vector<double>& {
+                    const std::vector<double>* best = &probeQrswAll.front().second;
+                    double bd = std::abs(probeQrswAll.front().first - tDouble);
+                    for (auto& r : probeQrswAll) { double d=std::abs(r.first-tDouble); if(d<bd){bd=d;best=&r.second;} }
+                    return *best;
+                }();
 
             // Sun direction and IDN for this timestep
             const double sinBeta  = meteo.sunDir.z();
@@ -527,41 +1177,66 @@ int main(int argc, char* argv[]) {
                 size_t pedIdx = bStart + bi;
 
                 // --- Tmrt (LW + diffuse SW) ---
-                Eigen::VectorXd TmrtBody = tmrtSolver.compute(
+                TmrtBreakdown tmrtDetail = tmrtSolver.computeDetailed(
                     allSurfaces, skyGeo, batchVF[bi], meteo, args.useSkyViewFactors
                 );
-                double TumrtAvg = tmrtSolver.computeAreaWeightedAverage(
-                    TmrtBody, positions[pedIdx].areaVectors
+                double TumrtNoSolar = tmrtSolver.computeAreaWeightedAverage(
+                    tmrtDetail.Tmrt, positions[pedIdx].areaVectors
                 );
+                double TumrtAvg = TumrtNoSolar;
+                batchTumrtNoSolar[bi] = TumrtNoSolar;
+                if (args.writeDebugTerms) {
+                    batchQlwSurfaces[bi] = areaWeightedAverage(tmrtDetail.qlwSurfaces, positions[pedIdx].areaVectors);
+                    batchQlwSky[bi] = areaWeightedAverage(tmrtDetail.qlwSky, positions[pedIdx].areaVectors);
+                    batchQswSurfaces[bi] = areaWeightedAverage(tmrtDetail.qswSurfaces, positions[pedIdx].areaVectors);
+                    batchQswSky[bi] = areaWeightedAverage(tmrtDetail.qswSky, positions[pedIdx].areaVectors);
+                    batchQswGround[bi] = areaWeightedAverage(tmrtDetail.qswGround, positions[pedIdx].areaVectors);
+                    batchQswElevatedDown[bi] = areaWeightedAverage(tmrtDetail.qswElevatedDown, positions[pedIdx].areaVectors);
+                    batchQswVertical[bi] = areaWeightedAverage(tmrtDetail.qswVertical, positions[pedIdx].areaVectors);
+                    batchQswUpward[bi] = areaWeightedAverage(tmrtDetail.qswUpward, positions[pedIdx].areaVectors);
+                }
 
-                // --- Direct solar component (shadow test) ---
-                // Ray must be < R_MAG_MAX so the raycaster doesn't skip it.
-                if (hasSolar) {
+                // --- Direct solar component ---
+                int probeIdx = (pedIdx < probeIndexForPos.size() && probeIndexForPos[pedIdx] >= 0)
+                    ? probeIndexForPos[pedIdx]
+                    : positions[pedIdx].originalIndex;
+                double localQrsw = (probeIdx >= 0 && probeIdx < static_cast<int>(probeQrsw.size()))
+                    ? probeQrsw[probeIdx] : -1.0;
+                if (localQrsw < 0.0 && pedIdx < static_cast<size_t>(sc.sparseQrswFromSurface.size())) {
+                    localQrsw = sc.sparseQrswFromSurface[pedIdx];
+                }
+                if (localQrsw >= 0.0) {
+                    if (args.writeDebugTerms) batchQswDirect[bi] = fp_solar * localQrsw;
+                    double T4 = std::pow(TumrtAvg, 4)
+                              + fp_solar * ABS_SW_PERSON * localQrsw
+                                / (EPS_LW_PERSON * SIGMA);
+                    TumrtAvg = std::pow(std::max(0.0, T4), 0.25);
+                } else if (hasSolar) {
                     Vec3 pedPos = positions[pedIdx].center.toVec3();
                     Vec3 target = pedPos + meteo.sunDir * (R_MAG_MAX * 0.9);
                     if (!raycaster.isBlocked(pedPos, target)) {
-                        // fp_solar * Idn gives effective irradiance on person body
+                        if (args.writeDebugTerms) batchQswDirect[bi] = fp_solar * meteo.Idn;
                         double T4 = std::pow(TumrtAvg, 4)
                                     + fp_solar * ABS_SW_PERSON * meteo.Idn
                                       / (EPS_LW_PERSON * SIGMA);
                         TumrtAvg = std::pow(std::max(0.0, T4), 0.25);
                     }
                 }
+                allTumrtAvg[tIdx][pedIdx] = TumrtAvg;
                 batchTmrt[bi] = TumrtAvg;
 
                 // --- Per-position UTCI inputs ---
-                int origIdx = positions[pedIdx].originalIndex;
-                double Ta_K = (origIdx < (int)probeT.size()) ? probeT[origIdx] : meteo.Ta;
+                double Ta_K = (probeIdx < static_cast<int>(probeT.size())) ? probeT[probeIdx] : meteo.Ta;
                 if (Ta_K < 200.0) Ta_K = meteo.Ta;  // guard against bad probe values
                 double Ta_c = Ta_K - 273.15;
                 // Convert pedestrian-height CFD wind speed to 10 m reference height.
                 // Factor 0.667 ≈ u(z_ped)/u(10m) for a log profile with z0≈0.1 m, z_ped=2 m
                 // (same convention as urbanMicroclimateFoam / utci_clement).
-                double va   = (origIdx < (int)probeU.size()) ? probeU[origIdx] / 0.667 : meteo.va;
+                double va   = (probeIdx < static_cast<int>(probeU.size())) ? probeU[probeIdx] / 0.667 : meteo.va;
                 va = std::max(0.5, std::min(17.0, va));  // UTCI polynomial valid range
 
                 // RH from specific humidity (original Python formula)
-                double w   = (origIdx < (int)probeW.size()) ? probeW[origIdx] : 0.01;
+                double w   = (probeIdx < static_cast<int>(probeW.size())) ? probeW[probeIdx] : 0.01;
                 double psat = std::exp(77.345 + 0.0057*Ta_K - 7235.0/Ta_K)
                               / std::pow(Ta_K, 8.2);
                 double pv   = P_REF * w / (EPSILON_H2O + w);
@@ -580,6 +1255,18 @@ int main(int argc, char* argv[]) {
                 allTmrt[tIdx][bStart + bi] = batchTmrt[bi];
                 allUtci[tIdx][bStart + bi] = batchUtci[bi];
                 allRH  [tIdx][bStart + bi] = batchRH[bi];
+                allTumrtNoSolar[tIdx][bStart + bi] = batchTumrtNoSolar[bi];
+                if (args.writeDebugTerms) {
+                    allQlwSurfaces[tIdx][bStart + bi] = batchQlwSurfaces[bi];
+                    allQlwSky[tIdx][bStart + bi] = batchQlwSky[bi];
+                    allQswSurfaces[tIdx][bStart + bi] = batchQswSurfaces[bi];
+                    allQswSky[tIdx][bStart + bi] = batchQswSky[bi];
+                    allQswDirect[tIdx][bStart + bi] = batchQswDirect[bi];
+                    allQswGround[tIdx][bStart + bi] = batchQswGround[bi];
+                    allQswElevatedDown[tIdx][bStart + bi] = batchQswElevatedDown[bi];
+                    allQswVertical[tIdx][bStart + bi] = batchQswVertical[bi];
+                    allQswUpward[tIdx][bStart + bi] = batchQswUpward[bi];
+                }
             }
         }
 
@@ -602,6 +1289,16 @@ int main(int argc, char* argv[]) {
 
         // Tmrt_pedestrian.vtk  (Kelvin) — point cloud
         writeVtkPolyData(outDir + "/Tmrt_pedestrian.vtk", positions, allTmrt[tIdx], "Tmrt");
+        // Match Clement: TumrtAvg is the sparse pre-solar field used for dense interpolation.
+        writeTumrtAvg(outDir + "/TumrtAvg", positions, t, allTumrtNoSolar[tIdx], false);
+        if (args.writeDebugTerms) {
+            writeTumrtTerms(outDir + "/TumrtAvg_terms", positions, t,
+                            allTumrtNoSolar[tIdx], allTumrtAvg[tIdx],
+                            allQlwSurfaces[tIdx], allQlwSky[tIdx],
+                            allQswSurfaces[tIdx], allQswSky[tIdx], allQswDirect[tIdx],
+                            allQswGround[tIdx], allQswElevatedDown[tIdx],
+                            allQswVertical[tIdx], allQswUpward[tIdx]);
+        }
 
         // RH_pedestrian.vtk — point cloud
         writeVtkPolyData(outDir + "/RH_pedestrian.vtk", positions, allRH[tIdx], "RH");
@@ -612,9 +1309,9 @@ int main(int argc, char* argv[]) {
             Eigen::VectorXd TmrtC = allTmrt[tIdx].array() - 273.15;
             writeVtkMultiScalar(outDir + "/UTCI.vtk", positions,
                 { {"Tmrt", TmrtC}, {"UTCI", allUtci[tIdx]} });
-            // UTCI_surface.vtk is written by run_utci.py after interpolation
-            // onto the dense CFD pedestrian surface mesh (cubic griddata).
         }
+        computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, allTumrtNoSolar[tIdx],
+                                   utciSolver, args.writeDebugQrswSurface);
 
         // Print stats
         double tMin  = allTmrt[tIdx].minCoeff();
