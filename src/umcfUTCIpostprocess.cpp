@@ -1283,6 +1283,8 @@ int main(int argc, char* argv[]) {
 
     // Write VTK output and print stats per timestep
     std::cout << "=== Writing VTK output and per-timestep stats ===\n";
+    std::vector<std::string> timestepSummaries(nT);
+    #pragma omp parallel for schedule(dynamic)
     for (size_t tIdx = 0; tIdx < nT; ++tIdx) {
         int t = timesteps[tIdx];
         std::string outDir = args.casePath + "/" + args.outputDir + "/" + std::to_string(t);
@@ -1317,16 +1319,21 @@ int main(int argc, char* argv[]) {
         double tMin  = allTmrt[tIdx].minCoeff();
         double tMax  = allTmrt[tIdx].maxCoeff();
         double tMean = allTmrt[tIdx].mean();
-        std::cout << "  t=" << t
-                  << "  Tmrt[K]: min=" << std::setprecision(1) << tMin
-                  << " max=" << tMax << " mean=" << tMean;
+        std::ostringstream summary;
+        summary << std::fixed << std::setprecision(1)
+                << "  t=" << t
+                << "  Tmrt[K]: min=" << tMin
+                << " max=" << tMax << " mean=" << tMean;
         if (args.computeUtci) {
             double uMin  = allUtci[tIdx].minCoeff();
             double uMax  = allUtci[tIdx].maxCoeff();
             double uMean = allUtci[tIdx].mean();
-            std::cout << "  UTCI[°C]: min=" << uMin << " max=" << uMax << " mean=" << uMean;
+            summary << "  UTCI[°C]: min=" << uMin << " max=" << uMax << " mean=" << uMean;
         }
-        std::cout << "\n";
+        timestepSummaries[tIdx] = summary.str();
+    }
+    for (const auto& summary : timestepSummaries) {
+        std::cout << summary << "\n";
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
