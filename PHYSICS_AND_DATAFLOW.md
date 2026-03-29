@@ -12,13 +12,15 @@
 
 The human body is approximated as **5 planar segments** placed at a single representative point (center at pedestrian height):
 
-| Segment | Offset from center | Area vector [m²] | Faces toward |
-|---------|-------------------|-------------------|--------------|
-| Front   | −0.2 m in x       | (−0.68, 0, 0)     | −X           |
-| Back    | +0.2 m in x       | (+0.68, 0, 0)     | +X           |
-| Left    | −0.2 m in y       | (0, −0.68, 0)     | −Y           |
-| Right   | +0.2 m in y       | (0, +0.68, 0)     | +Y           |
-| Top     | centre z          | (0, 0, +0.16)     | +Z           |
+| Segment | Body point (relative to center) | Area vector [m²] | Faces toward |
+|---------|--------------------------------|-------------------|--------------|
+| Front   | (−0.2, 0, −1.0)                | (−0.68, 0, 0)     | −X           |
+| Back    | (+0.2, 0, −1.0)                | (+0.68, 0, 0)     | +X           |
+| Left    | (0, −0.2, −1.0)                | (0, −0.68, 0)     | −Y           |
+| Right   | (0, +0.2, −1.0)                | (0, +0.68, 0)     | +Y           |
+| Top     | (0, 0, 0)                      | (0, 0, +0.16)     | +Z           |
+
+Side segments are placed 1.0 m below the pedestrian center (torso level); the top segment is at the center (head level). The center itself is placed at `PED_Z = 2.0 m` above the ground surface.
 
 Total projected area ≈ 2.88 m².  Radiation is computed independently for each segment.
 
@@ -38,7 +40,7 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 
 **Implementation details:**
 - Only patches within `R_MAG_MAX = 100 m` of the pedestrian are considered
-- Pairs where the body segment does not face the surface (`nᵢ · r < 0`) are skipped
+- Pairs where the body segment does not face the surface (`nᵢ · r ≥ 0`) are skipped
 - Each candidate pair is tested for ray occlusion against the STL BVH; blocked pairs contribute zero
 - Results stored as sparse `(patch_index, float32_value)` pairs per segment
 - Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
@@ -67,7 +69,7 @@ QrOut = σ T⁴ + qr (1 − ε) / ε        ε_surf = 0.9
   σ    = 5.67 × 10⁻⁸ W m⁻² K⁻⁴
 ```
 
-Outgoing SW (solar reflection) `qsOut` is computed analogously by `calculateqrsw`.
+`calcWallRadOut` also computes the outgoing SW (solar reflection) flux `qsOut` for each patch. `calculateqrsw` computes the direct solar volume field `qrsw` used later for the per-position solar addition.
 
 ### 4. Sky Temperature
 
@@ -221,18 +223,28 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
                            │
          ▼  Stage 1  (re-run whenever CFD fields change)
 ┌─────────────────────────────────────────────────────────────────────┐
-│  OpenFOAM radiation preprocessing        run_utci.py --vegetation   │
+│  OpenFOAM radiation preprocessing                        run_utci.py│
 │                                                                     │
-│  calculateqrsw  →  qrsw  (direct solar volume field)               │
-│  calcSf         →  Sf_wallAndTreeSurfaces.raw  (geometry, t_start) │
-│  calcWallRadOut →  qrOut, qsOut  per timestep in vegetation/        │
-│  postProcess    →  postProcessing/surfaces/<t>/                     │
-│                      Sf_wallAndTreeSurfaces.raw  (face area vectors)│
-│                      qrOut_wallAndTreeSurfaces.raw                  │
-│                      qsOut_wallAndTreeSurfaces.raw                  │
-│                      Sf_skySurfaces.raw                             │
-│                      qrOut_skySurfaces.raw                          │
-│  postProcess    →  postProcessing/probes/air/<t0>/{T, U, w}        │
+│  Step 1: calculateqrsw  →  qrsw volume field in vegetation/<t>/    │
+│  Step 2: calcSf         →  face area vectors (first timestep only) │
+│  Step 3: calcWallRadOut →  qrOut, qsOut fields in vegetation/<t>/  │
+│  Step 4: postProcess surfaces                                       │
+│            →  postProcessing/surfaces/<t>/                          │
+│                 Sf_wallAndTreeSurfaces.raw                          │
+│                 qrOut_wallAndTreeSurfaces.raw                       │
+│                 qsOut_wallAndTreeSurfaces.raw                       │
+│                 Sf_skySurfaces.raw                                  │
+│                 qrOut_skySurfaces.raw                               │
+│  Step 5: postProcess surfacesPedestrianAir (T, U, w on ped mesh)   │
+│            →  postProcessing/surfacesPedestrian/<t>/                │
+│                 T_pedestrian.vtk  U_pedestrian.vtk  w_pedestrian.vtk│
+│  Step 6: postProcess surfacesPedestrianRad (qrsw on ped mesh)      │
+│            →  postProcessing/surfaces/<t>/qrsw_pedestrian.vtk      │
+│  Step 7: postProcess probes (T, U, w at probe positions)           │
+│            →  postProcessing/probes/air/<t0>/{T, U, w}             │
+│  Step 8: postProcess qrswCuttingPlane + probe sampling             │
+│    (vegetation mode only)                                           │
+│            →  postProcessing/probes/qrsw/qrsw  (per-probe qrsw)   │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
          ▼  Stage 2  (C++ binary, re-run per new meteorology)
@@ -269,10 +281,14 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  Write per timestep t:                                              │
-│    UTCI/<t>/Tmrt_pedestrian.vtk    (point cloud, Kelvin)           │
-│    UTCI/<t>/UTCI.vtk               (Tmrt[°C] + UTCI[°C])          │
-│    UTCI/<t>/UTCI_surface.vtk       (interpolated onto CFD surface) │
-│    UTCI/<t>/RH_pedestrian.vtk                                      │
+│    UTCI/<t>/Tmrt_pedestrian.vtk    (point cloud, Tmrt [K])         │
+│    UTCI/<t>/RH_pedestrian.vtk      (point cloud, RH [%])           │
+│    UTCI/<t>/UTCI.vtk               (point cloud, Tmrt[°C]+UTCI[°C])│
+│    UTCI/<t>/Tumrt_surface.vtk      (dense mesh, pre-solar Tmrt)    │
+│    UTCI/<t>/Tmrt_surface.vtk       (dense mesh, final Tmrt)        │
+│    UTCI/<t>/RH_surface.vtk         (dense mesh, RH [%])            │
+│    UTCI/<t>/UTCI_surface.vtk       (dense mesh, UTCI+Tmrt [°C])    │
+│  Dense surface files require T_pedestrian.vtk from Stage 1.        │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
          ▼  Stage 3
@@ -309,9 +325,10 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 | `src/utciSolver.cpp` | UTCI 165-term polynomial + LUT |
 | `src/pedestrian.cpp` | 5-segment body model |
 | `src/raycaster.cpp` | STL BVH ray intersection |
+| `src/denseStage2.cpp` | Dense surface interpolation and output |
 | `src/caching.cpp` | Binary VF cache (v9 plain / v10 gzip) |
 | `src/io.cpp` | Raw/probe file readers, VTK writers |
 | `src/constants.h` | All physical constants |
-| `openfoam/calculateqrsw/` | OF utility — direct solar volume field |
+| `openfoam/calculateqrsw/` | OF utility — direct solar volume field (qrsw) |
 | `openfoam/calcSf/` | OF utility — surface area vectors |
-| `openfoam/calcWallRadOut/` | OF utility — outgoing LW at patches |
+| `openfoam/calcWallRadOut/` | OF utility — outgoing LW and SW at patches |
