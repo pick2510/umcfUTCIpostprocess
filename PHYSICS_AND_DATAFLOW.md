@@ -126,7 +126,7 @@ fp_solar  = 0.308 cos( β (1 − β²/48402) π/180 )    [β = solar elevation i
 qrsw      = direct solar irradiance reaching the pedestrian [W/m²]
 ```
 
-`fp_solar` is the projected-area factor for a standing person (Fiala et al. 2012 / Bröde et al. 2012, UTCI standard).
+`fp_solar` is the projected-area factor for a standing person (Fiala et al. 2012 / Bröde et al. 2012, UTCI standard). `β` is derived from the CFD `sunPosVector` field: `sin β = sunDir.z`, clamped to [0, 1].
 
 `qrsw` is resolved in priority order:
 1. **Probe data** — CFD `qrsw` values sampled at pedestrian positions by `calculateqrsw` (Stage 1)
@@ -184,12 +184,14 @@ va_ref = v_CFD / 0.667
 ```
 pv   = P_ref × w / (ε_H₂O + w)          [Pa]   (urbanMicroclimateFoam convention)
 psat = exp(77.345 + 0.0057 Ta_K − 7235/Ta_K) / Ta_K^8.2   [Pa]
-RH   = pv / psat × 100 %
+RH   = clamp( pv / psat × 100,  0, 100 )   [%]
 Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 
   P_ref   = 101325 Pa
   ε_H₂O  = 0.621945  (ratio of molar masses M_water/M_dryair)
 ```
+
+`qrsw` is stored as a 3-D vector field in OpenFOAM/VTK (solar irradiance direction × magnitude). The scalar irradiance used in the solar addition is its magnitude: `|qrsw|`.
 
 ---
 
@@ -256,8 +258,9 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │    skyGeo     ← Sf_skySurfaces.raw          (5 boundary patches)    │
 │    STL BVH    ← wallAndTreeSurfaces.stl      (ray occlusion)        │
 │    meteo[t]   ← Tambient, cc, Idif, Idn, sunDir, va                 │
-│    probeT/U/w ← per-position per-timestep rows (indexed by          │
-│                 original probe file order, not post-filter index)   │
+│    probeT/U/w/qrsw ← per-position rows; probe points matched to     │
+│                 pedestrian positions by xyz coordinate hash (mm      │
+│                 precision); falls back to original probe file index  │
 │                                                                     │
 │  Batch loop (500 pos / batch, OpenMP):                              │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -288,7 +291,8 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │    UTCI/<t>/Tmrt_surface.vtk       (dense mesh, final Tmrt)        │
 │    UTCI/<t>/RH_surface.vtk         (dense mesh, RH [%])            │
 │    UTCI/<t>/UTCI_surface.vtk       (dense mesh, UTCI+Tmrt [°C])    │
-│  Dense surface files require T_pedestrian.vtk from Stage 1.        │
+│  Dense surface files require T_pedestrian.vtk from Stage 1;         │
+│  if absent they are silently skipped.                               │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
          ▼  Stage 3

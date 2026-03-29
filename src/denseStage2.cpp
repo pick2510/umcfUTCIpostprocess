@@ -484,7 +484,7 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         double airT = itT->second[i];
         double airw = itW->second[i];
         double psat = std::exp(77.3450 + 0.0057 * airT - 7235.0 / airT) / std::pow(airT, 8.2);
-        double pv = P_REF * airw / 0.62;
+        double pv = P_REF * airw / (EPSILON_H2O + airw);
         denseRH[i] = std::min(100.0, std::max(0.0, pv / psat * 100.0));
 
         double va = itU->second[i].norm() / 0.667;
