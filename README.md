@@ -64,6 +64,8 @@ python3 run_utci.py --case /path/to/openfoam/case
 | `--force-recompute` | off | Recompute view factors even if cache exists |
 | `--skip-utci` | off | Compute Tmrt only, skip UTCI |
 | `--no-vegetation` | off | Use `air` region instead of `vegetation` for radiation fields |
+| `--write-debug-terms` | off | Write per-timestep LW/SW breakdown VTK files (qlwSurfaces, qlwSky, qswGround, qswVertical, …) |
+| `--write-debug-qrsw` | off | Write `qrsw_surface.vtk` debug file per timestep |
 
 **Terrain options** (used when `--mode terrain` or auto-detected)
 

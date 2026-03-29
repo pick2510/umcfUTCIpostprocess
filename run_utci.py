@@ -441,7 +441,7 @@ def stage0(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STAGE 1 – OpenFOAM postprocessing (utci_clement workflow)
+# STAGE 1 – OpenFOAM postprocessing
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _qrsw_cutting_plane_dict():
@@ -605,7 +605,7 @@ def stage1(args):
 
 def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
     """Resample C++ UTCI/Tmrt point-cloud results onto the dense CFD pedestrian
-    surface mesh using cubic interpolation (same approach as utci_clement).
+    surface mesh using cubic interpolation.
 
     Reads:  postProcessing/surfacesPedestrian/<t_start>/T_pedestrian.vtk  (CFD mesh)
             <output_dir>/<t>/UTCI.vtk                                     (probe point cloud)
@@ -758,7 +758,7 @@ def stage3(args):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='UTCI orchestrator (utci_clement workflow + C++ calcTmrt)',
+        description='UTCI orchestrator (4-stage pipeline + C++ calcTmrt)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     p.add_argument('--case',       required=True,  help='OpenFOAM case directory')

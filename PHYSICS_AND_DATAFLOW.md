@@ -42,15 +42,18 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 - Each candidate pair is tested for ray occlusion against the STL BVH; blocked pairs contribute zero
 - Results stored as sparse `(patch_index, float32_value)` pairs per segment
 - Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
-- Cache format: version 3 (plain binary) or version 4 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
+- Cache format: version 9 (plain binary) or version 10 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
 
-**Sky fraction** (complement approach):
-```
-Fsky = max(0,  1 − min(Fijsum, 1))
+**Sky view factors** (explicit geometry):
 
-  Fijsum = Σ Fij   (sum over all wall/veg surfaces)
+Sky patches (`Sf_skySurfaces.raw`) are treated as a separate geometry set. The same differential formula applies, but with `enforceRangeLimit = false` so sky patches can be arbitrarily far away:
+
 ```
-This avoids the unphysical normalisation that arises when sky-boundary patches (domain sides) are included in the sum.
+FijSky = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)   (no distance cap)
+FijsumSky = Σ FijSky
+```
+
+Ray occlusion is tested for sky rays with the same BVH but without the `R_MAG_MAX` cutoff.
 
 ### 3. Outgoing Surface Radiation
 
@@ -81,11 +84,19 @@ Tsky = ( 9.365574×10⁻⁶ (1−cc) Ta⁶  +  Ta⁴ cc ec )^0.25
 ### 5. Incident Radiation per Segment
 
 ```
-qin_LW = Σₘ QrOut[m] × Fij[m]  +  σ Tsky⁴ × Fsky
-qin_SW = Σₘ qsOut[m] × Fij[m]  +  Idif × Fsky
+qin_LW_surf = Σₘ QrOut[m] × Fij[m]
+qin_SW_surf = Σₘ qsOut[m] × Fij[m]
+
+qin_LW_sky  = σ Tsky⁴ × FijsumSky
+qin_SW_sky  = Idif × FijsumSky
+
+total_vf = Fijsum + FijsumSky
+
+qin_LW = (qin_LW_surf + qin_LW_sky) / total_vf
+qin_SW = (qin_SW_surf + qin_SW_sky) / total_vf
 ```
 
-If `Fijsum > 1` (numerical artefact from very close patches), both wall contributions are normalised by `Fijsum`.
+Normalising by `total_vf` ensures the weighted-average irradiance is in W/m² regardless of how many patches are visible. This matches the reference implementation.
 
 ### 6. Mean Radiant Temperature (Tmrt)
 
@@ -104,16 +115,23 @@ Area-weighted average over all segments:
 Tmrt_avg = Σ(Tmrt_n × |Aₙ|) / Σ|Aₙ|
 ```
 
-**Direct solar addition** (if position is unshaded — shadow ray test against STL):
+**Direct solar addition:**
 
 ```
-T⁴_final = Tmrt_avg⁴  +  fp_solar × α_sw × Idn / (σ ε_p)
+T⁴_final = Tmrt_avg⁴  +  fp_solar × α_sw × qrsw / (σ ε_p)
 
 fp_solar  = 0.308 cos( β (1 − β²/48402) π/180 )    [β = solar elevation in °]
-Idn       = direct normal irradiance [W/m²]
+qrsw      = direct solar irradiance reaching the pedestrian [W/m²]
 ```
 
-`fp_solar` is the projected-area factor for a standing person. Source: Fiala et al. (2012) / Bröde et al. (2012), as used in the UTCI standard.
+`fp_solar` is the projected-area factor for a standing person (Fiala et al. 2012 / Bröde et al. 2012, UTCI standard).
+
+`qrsw` is resolved in priority order:
+1. **Probe data** — CFD `qrsw` values sampled at pedestrian positions by `calculateqrsw` (Stage 1)
+2. **Dense surface VTK** — `qrsw_pedestrian.vtk` interpolated from surface mesh (fallback)
+3. **Binary shadow ray** — if both above are absent, fires a ray in the sun direction; if unblocked, uses `Idn` (direct normal irradiance); if blocked, contributes zero
+
+When `Idn = 0` or solar elevation ≤ 0° the solar term is skipped entirely.
 
 ### 7. UTCI
 
@@ -233,15 +251,18 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │ For each position p:                                          │  │
 │  │   Load UTCI/pos/<originalIndex>.bin  OR  compute + cache:    │  │
-│  │     Fij[5][sparse]  ←  geometric formula + ray test          │  │
-│  │     Fijsum[5],  Fsky[5] = 1 − min(Fijsum, 1)               │  │
+│  │     Fij[5][sparse]   ←  geometric formula + ray test         │  │
+│  │     FijsumSky[5]     ←  explicit sky geometry, no range cap  │  │
+│  │     Fijsum[5] = Σ Fij                                        │  │
 │  │                                                              │  │
 │  │ For each timestep t:                                         │  │
 │  │   qrOut[m], qsOut[m]  ←  .raw files for this t              │  │
-│  │   qin_LW, qin_SW  per segment  ← weighted sum + sky         │  │
+│  │   qin_LW, qin_SW  per segment                               │  │
+│  │     = (surf contribution + sky contribution) / (Fijsum+FijsumSky)│ │
 │  │   Tmrt[5]  ←  (ε_p qin_LW + α_sw qin_SW) / (σ ε_p) ^0.25  │  │
-│  │   Tmrt_avg  ←  area-weighted mean                           │  │
-│  │   if unshaded:  add fp_solar × Idn  via solar ray test      │  │
+│  │   Tmrt_avg (pre-solar)  ←  area-weighted mean               │  │
+│  │   qrsw  ←  probe data  OR  dense VTK  OR  shadow ray → Idn  │  │
+│  │   if qrsw > 0:  add fp_solar × qrsw to Tmrt⁴               │  │
 │  │   va_ref  ←  v_CFD / 0.667  (2 m → 10 m log profile)       │  │
 │  │   pv  ←  P_ref × w / (ε_H₂O + w)                          │  │
 │  │   UTCI  ←  165-term polynomial(Ta, va_ref, Tmrt_avg, Pa)    │  │
@@ -288,7 +309,7 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 | `src/utciSolver.cpp` | UTCI 165-term polynomial + LUT |
 | `src/pedestrian.cpp` | 5-segment body model |
 | `src/raycaster.cpp` | STL BVH ray intersection |
-| `src/caching.cpp` | Binary VF cache (v3 plain / v4 gzip) |
+| `src/caching.cpp` | Binary VF cache (v9 plain / v10 gzip) |
 | `src/io.cpp` | Raw/probe file readers, VTK writers |
 | `src/constants.h` | All physical constants |
 | `openfoam/calculateqrsw/` | OF utility — direct solar volume field |

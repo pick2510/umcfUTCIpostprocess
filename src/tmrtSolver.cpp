@@ -51,7 +51,7 @@ TmrtBreakdown TmrtSolver::computeDetailed(
     }
     
     // Precompute outgoing LW per surface.
-    // utci_clement format: qrOut is already σT⁴ + qr*(1-ε)/ε (use directly).
+    // reference format: qrOut is already σT⁴ + qr*(1-ε)/ε (use directly).
     // Legacy format: qrOut==0, compute from temperature and qr separately.
     std::vector<double> QrOut(surfaces.size());
     for (size_t i = 0; i < surfaces.size(); ++i) {
@@ -89,7 +89,7 @@ TmrtBreakdown TmrtSolver::computeDetailed(
             }
         }
 
-        // Clement normalization: add sky radiation weighted by explicit FijsumSky,
+        // Normalization: add sky radiation weighted by explicit FijsumSky,
         // then divide both LW and SW by (Fijsum + FijsumSky) so the total sums to 1.
         double qin_lw_sky = sigmaTsky4 * vf.FijsumSky[n];
         double qin_sw_sky = meteo.Idif * vf.FijsumSky[n];

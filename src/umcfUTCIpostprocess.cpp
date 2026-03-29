@@ -66,7 +66,7 @@ struct TimestepScalars {
     std::vector<double> wallTemps;
     std::vector<double> vegTemps;
     std::vector<double> vegQr;
-    std::vector<double> allQrOut;   // Outgoing LW σT⁴+qr*(1-ε)/ε (utci_clement format)
+    std::vector<double> allQrOut;   // Outgoing LW σT⁴+qr*(1-ε)/ε (reference format)
     std::vector<double> allQsOut;   // Outgoing SW
     Eigen::VectorXd sparseQrswFromSurface;
 };
@@ -752,7 +752,7 @@ int main(int argc, char* argv[]) {
 
     logInfo("Loading surface geometry from timestep " + std::to_string(geometryTimestep) + "...");
 
-    // Try discrete-workflow names first, fall back to utci_clement combined name
+    // Try discrete-workflow names first, fall back to combined name
     auto wallGeo = loadSurfacePatches(firstSurfDir + "/Sf_wallSurfaces.raw");
     if (wallGeo.empty())
         wallGeo = loadSurfacePatches(firstSurfDir + "/Sf_wallAndTreeSurfaces.raw");
@@ -800,7 +800,7 @@ int main(int argc, char* argv[]) {
         tsData[tIdx].wallTemps = loadScalarField(surfDir + "/T_wallSurfaces.raw");
         tsData[tIdx].vegTemps  = loadScalarField(surfDir + "/T_vegSurfaces.raw");
         tsData[tIdx].vegQr     = loadScalarField(surfDir + "/qr_vegSurfaces.raw");
-        // utci_clement: combined outgoing LW radiation (replaces T+qr)
+        // combined outgoing LW radiation (reference format, replaces T+qr)
         tsData[tIdx].allQrOut  = loadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw");
         tsData[tIdx].allQsOut  = loadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw");
         const std::string qrswPath = firstExistingPath({
@@ -943,7 +943,7 @@ int main(int argc, char* argv[]) {
 
         // Tmrt_pedestrian.vtk  (Kelvin) — point cloud
         writeVtkPolyData(outDir + "/Tmrt_pedestrian.vtk", positions, sparseResults.tmrt[tIdx], "Tmrt");
-        // Match Clement: TumrtAvg is the sparse pre-solar field used for dense interpolation.
+        // TumrtAvg is the sparse pre-solar field used for dense interpolation.
         writeTumrtAvg(outDir + "/TumrtAvg", positions, t, sparseResults.tumrtNoSolar[tIdx], false);
         if (args.writeDebugTerms) {
             writeTumrtTerms(outDir + "/TumrtAvg_terms", positions, t,

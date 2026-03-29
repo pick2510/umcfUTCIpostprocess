@@ -130,7 +130,7 @@ struct GridMesh {
         double inv = 1.0/len;
         double d[3] = {dir[0]*inv, dir[1]*inv, dir[2]*inv};
 
-        // Match the Clement workflow: trim each ray to the 3%..97% segment.
+        // Trim each ray to the 3%..97% segment to avoid self-intersection.
         double startOffset = len * 0.03;
         double s[3] = {
             p1[0] + d[0] * startOffset,

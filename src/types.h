@@ -34,7 +34,7 @@ struct SurfacePatch {
     Vec3 areaVector;
     double temperature;
     double qr;          // Net LW radiation flux [W/m²]
-    double qrOut;       // Outgoing LW radiation flux σT⁴+qr*(1-ε)/ε [W/m²] (utci_clement format)
+    double qrOut;       // Outgoing LW radiation flux σT⁴+qr*(1-ε)/ε [W/m²] (reference format)
     double qsOut;       // Outgoing SW radiation flux [W/m²]
     double area;        // |areaVector|
 };
