@@ -48,6 +48,7 @@ set(SOURCES
     src/pedestrian.cpp
     src/io.cpp
     src/caching.cpp
+    src/denseStage2.cpp
 )
 
 add_executable(umcfUTCIpostprocess ${SOURCES})

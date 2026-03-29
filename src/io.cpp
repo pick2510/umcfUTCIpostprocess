@@ -1,6 +1,7 @@
 #include "io.h"
 #include "constants.h"
 #include "pedestrian.h"
+#include "logging.h"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -51,7 +52,7 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
     
     std::ifstream file(probeLocsPath);
     if (!file.is_open()) {
-        std::cerr << "Error: Cannot open probe_locs: " << probeLocsPath << std::endl;
+        logError("Cannot open probe_locs: " + probeLocsPath);
         return positions;
     }
     
@@ -92,7 +93,7 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
         }
     }
     
-    std::cout << "  Loaded " << positions.size() << " pedestrian positions" << std::endl;
+    logInfo("  Loaded " + std::to_string(positions.size()) + " pedestrian positions");
     return positions;
 }
 
@@ -253,23 +254,22 @@ std::vector<MeteoData> loadMeteoData(const std::string& casePath,
     auto sunVecs    = parseSunPosVectorFile(casePath + "/constant/sunPosVector");
 
     if (tambient.empty()) {
-        std::cerr << "Warning: Could not read Tambient from "
-                  << casePath << "/0/air/Tambient\n";
+        logWarn("Could not read Tambient from " + casePath + "/0/air/Tambient");
     }
     if (cloudCover.empty()) {
-        std::cout << "  No cloudCover file found – assuming clear sky\n";
+        logInfo("  No cloudCover file found – assuming clear sky");
     }
     if (idif.empty()) {
-        std::cout << "  No Idif file found – diffuse irradiance set to 0\n";
+        logInfo("  No Idif file found – diffuse irradiance set to 0");
     }
     if (idn.empty()) {
-        std::cout << "  No IDN file found – direct normal irradiance set to 0\n";
+        logInfo("  No IDN file found – direct normal irradiance set to 0");
     }
     if (sunVecs.empty()) {
-        std::cout << "  No sunPosVector file found – direct solar disabled\n";
+        logInfo("  No sunPosVector file found – direct solar disabled");
     }
     if (wambient.empty()) {
-        std::cout << "  No wambient file found – assuming RH=50%\n";
+        logInfo("  No wambient file found – assuming RH=50%");
     }
 
     // Try to read reference wind speed from 0/air/U internalField
@@ -292,7 +292,7 @@ std::vector<MeteoData> loadMeteoData(const std::string& casePath,
             }
         }
         if (va_ref > 0.01)
-            std::cout << "  Reference wind speed from 0/air/U: " << va_ref << " m/s\n";
+            logInfo("  Reference wind speed from 0/air/U: " + std::to_string(va_ref) + " m/s");
     }
 
     std::vector<MeteoData> result(timesteps.size());
@@ -324,7 +324,7 @@ bool writeTumrtAvg(const std::string& path,
     auto mode = append ? (std::ios::out | std::ios::app) : std::ios::out;
     std::ofstream file(path, mode);
     if (!file.is_open()) {
-        std::cerr << "Error: Cannot write TumrtAvg: " << path << std::endl;
+        logError("Cannot write TumrtAvg: " + path);
         return false;
     }
     
@@ -445,7 +445,7 @@ bool writeVtkPolyData(const std::string& path,
                        const std::string& arrayName) {
     std::ofstream f(path);
     if (!f.is_open()) {
-        std::cerr << "Error: Cannot write VTK: " << path << "\n";
+        logError("Cannot write VTK: " + path);
         return false;
     }
     size_t N = positions.size();
@@ -477,7 +477,7 @@ bool writeVtkMultiScalar(const std::string& path,
                           const std::vector<std::pair<std::string, Eigen::VectorXd>>& arrays) {
     std::ofstream f(path);
     if (!f.is_open()) {
-        std::cerr << "Error: Cannot write VTK: " << path << "\n";
+        logError("Cannot write VTK: " + path);
         return false;
     }
     size_t N = positions.size();
@@ -546,7 +546,7 @@ bool writeVtkStructuredSurface(const std::string& path,
 
     std::ofstream f(path);
     if (!f.is_open()) {
-        std::cerr << "Error: Cannot write VTK surface: " << path << "\n";
+        logError("Cannot write VTK surface: " + path);
         return false;
     }
 
@@ -636,7 +636,7 @@ bool readLegacyVtkMesh(const std::string& path, VtkMeshData& mesh) {
     } else if (line.find("DATASET STRUCTURED_GRID") != std::string::npos) {
         mesh.datasetType = VtkDatasetType::STRUCTURED_GRID;
     } else {
-        std::cerr << "Unsupported VTK dataset in " << path << ": " << line << "\n";
+        logError("Unsupported VTK dataset in " + path + ": " + line);
         return false;
     }
 
@@ -801,7 +801,7 @@ bool writeLegacyVtkMesh(const std::string& path,
                         const std::vector<std::pair<std::string, Eigen::VectorXd>>& pointScalars) {
     std::ofstream f(path);
     if (!f.is_open()) {
-        std::cerr << "Error: Cannot write VTK: " << path << "\n";
+        logError("Cannot write VTK: " + path);
         return false;
     }
 
@@ -842,7 +842,7 @@ bool writeLegacyVtkMesh(const std::string& path,
     f << std::setprecision(4);
     for (const auto& [name, vals] : pointScalars) {
         if (static_cast<size_t>(vals.size()) != mesh.points.size()) {
-            std::cerr << "Warning: skipping VTK array " << name << " due to size mismatch\n";
+            logWarn("skipping VTK array " + name + " due to size mismatch");
             continue;
         }
         f << "SCALARS " << name << " float 1\n"

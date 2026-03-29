@@ -1,4 +1,5 @@
 #include "raycaster.h"
+#include "logging.h"
 #include "constants.h"
 #include <iostream>
 #include <fstream>
@@ -227,18 +228,20 @@ void Raycaster::setNumThreads(int) { /* thread-safe; no action needed */ }
 
 bool Raycaster::loadGeometry(const std::string& stlPath) {
     if (stlPath.empty() || !Impl::fileExists(stlPath)) {
-        std::cout << "  Warning: Could not load wall geometry: " << stlPath << std::endl;
+        logWarn("Could not load wall geometry: " + stlPath);
         return false;
     }
     pImpl->wallMesh.build(stlPath);
     pImpl->wallsLoaded = !pImpl->wallMesh.empty();
     if (pImpl->wallsLoaded) {
-        std::cout << "  Loaded wall geometry: " << stlPath
-                  << " (" << pImpl->wallMesh.tris.size() << " triangles, grid "
-                  << pImpl->wallMesh.nx << "x" << pImpl->wallMesh.ny
-                  << "x" << pImpl->wallMesh.nz << ")\n";
+        logInfo("  Loaded wall geometry: " + stlPath
+                + " (" + std::to_string(pImpl->wallMesh.tris.size())
+                + " triangles, grid "
+                + std::to_string(pImpl->wallMesh.nx) + "x"
+                + std::to_string(pImpl->wallMesh.ny) + "x"
+                + std::to_string(pImpl->wallMesh.nz) + ")");
     } else {
-        std::cout << "  Warning: Could not load wall geometry: " << stlPath << std::endl;
+        logWarn("Could not load wall geometry: " + stlPath);
     }
     return pImpl->wallsLoaded;
 }
@@ -248,7 +251,7 @@ void Raycaster::loadVegetation(const std::string& stlPath) {
     pImpl->vegMesh.build(stlPath);
     pImpl->vegLoaded = !pImpl->vegMesh.empty();
     if (pImpl->vegLoaded) {
-        std::cout << "  Loaded vegetation geometry: " << stlPath << std::endl;
+        logInfo("  Loaded vegetation geometry: " + stlPath);
     }
 }
 
