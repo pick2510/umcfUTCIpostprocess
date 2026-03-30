@@ -10,4 +10,5 @@ EXE_LIBS = \
     -lmeshTools \
     -ltriSurface \
     -lsurfMesh \
-    -ldistributed
+    -ldistributed \
+    -lradiationModels
