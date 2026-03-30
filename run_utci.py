@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib.tri as mtri
 import numpy as np
@@ -363,6 +364,40 @@ def _run_required(cmd, case=None, region=None, time_range=None, use_case=True):
     return result
 
 
+def _run_required_per_timestep(cmd, case, region, timesteps, max_parallel, use_case=True):
+    """Run a required OpenFOAM command independently for each timestep.
+
+    Uses a thread pool because the work is external subprocess execution.
+    Raises SystemExit on the first failed timestep after all launched jobs finish.
+    """
+    if not timesteps:
+        return
+
+    max_parallel = max(1, min(int(max_parallel), len(timesteps)))
+    if max_parallel == 1:
+        for t in timesteps:
+            _run_required(cmd, case=case, region=region, time_range=str(t), use_case=use_case)
+        return
+
+    print(f'  Running {cmd} for {len(timesteps)} timestep(s) with up to {max_parallel} concurrent jobs')
+    failures = []
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        future_map = {
+            pool.submit(_run, cmd, case, region, str(t), use_case): t
+            for t in timesteps
+        }
+        for fut in as_completed(future_map):
+            t = future_map[fut]
+            result = fut.result()
+            if result.returncode != 0:
+                failures.append((t, result.returncode))
+
+    if failures:
+        t, code = sorted(failures)[0]
+        print(f'  [FATAL] Aborting because required command failed: {cmd} at timestep {t} (code {code})')
+        sys.exit(code)
+
+
 def _available(binary):
     r = subprocess.run(
         ['bash', '-lc', f'source {OF_DIR}/etc/bashrc && command -v {binary}'],
@@ -620,6 +655,8 @@ def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
 def stage1(args):
     print('\n=== Stage 1: OpenFOAM postprocessing ===')
     time_range = f'{args.t_start}:{args.t_end}'
+    timesteps = list(range(args.t_start, args.t_end + 1, args.t_step))
+    of_parallel = max(1, min(6, args.threads, len(timesteps)))
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
 
@@ -632,7 +669,7 @@ def stage1(args):
 
     # Step 1: Direct solar radiation volume field
     print(f'  calculateqrsw ({region}) ...')
-    _run_required('calculateqrsw', args.case, region=region, time_range=time_range)
+    _run_required_per_timestep('calculateqrsw', args.case, region, timesteps, of_parallel)
 
     # Step 2: Surface area vectors (first timestep only)
     print(f'  calcSf ({region}) ...')
@@ -640,7 +677,7 @@ def stage1(args):
 
     # Step 3: Outgoing wall radiation
     print(f'  calcWallRadOut ({region}) ...')
-    _run_required('calcWallRadOut', args.case, region=region, time_range=time_range)
+    _run_required_per_timestep('calcWallRadOut', args.case, region, timesteps, of_parallel)
 
     # Step 4: Extract Sf, qrOut, qsOut at wall + sky patches → raw files
     wall_patches = list(args.wall_patches)
@@ -651,7 +688,7 @@ def stage1(args):
     with open(os.path.join(sys_region, 'surfaces'), 'w') as f:
         f.write(_surfaces_patch_dict(wall_patches, args.sky_patches))
     print(f'  postProcess: Sf, qrOut, qsOut at patches ({region}) ...')
-    _run_required('postProcess -func surfaces', args.case, region=region, time_range=time_range)
+    _run_required_per_timestep('postProcess -func surfaces', args.case, region, timesteps, of_parallel)
 
     # Step 5: Extract dense pedestrian-surface fields used by C++ Stage 2
     ped_vtk = os.path.join(args.case, 'postProcessing', 'surfacesPedestrian',
@@ -667,7 +704,10 @@ def stage1(args):
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian T, U, w ({ped_mode}, air) ...')
     _run_required('postProcess -func surfacesPedestrianAir',
-                  args.case, region='air', time_range=time_range)
+                  args.case, region='air', time_range=str(args.t_start))
+    if len(timesteps) > 1:
+        _run_required_per_timestep('postProcess -func surfacesPedestrianAir',
+                                   args.case, 'air', timesteps[1:], of_parallel)
 
     rad_region = 'vegetation' if args.vegetation else 'air'
     sys_rad = os.path.join(args.case, 'system', rad_region)
@@ -676,8 +716,8 @@ def stage1(args):
         f.write(_pedestrian_surface_dict(fields=('qrsw',),
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian qrsw ({ped_mode}, {rad_region}) ...')
-    _run_required('postProcess -func surfacesPedestrianRad',
-                  args.case, region=rad_region, time_range=time_range)
+    _run_required_per_timestep('postProcess -func surfacesPedestrianRad',
+                               args.case, rad_region, timesteps, of_parallel)
 
     # Step 6: Extract T, U, w at pedestrian positions (air region, probes)
     print('  postProcess: probes T, U, w (air) ...')
@@ -691,8 +731,8 @@ def stage1(args):
         os.makedirs(sys_veg, exist_ok=True)
         with open(os.path.join(sys_veg, 'qrswCuttingPlane'), 'w') as f:
             f.write(_qrsw_cutting_plane_dict())
-        _run_required('postProcess -func qrswCuttingPlane',
-                      args.case, region='vegetation', time_range=time_range)
+        _run_required_per_timestep('postProcess -func qrswCuttingPlane',
+                                   args.case, 'vegetation', timesteps, of_parallel)
         _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
 
 
