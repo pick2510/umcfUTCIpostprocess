@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
 
 import matplotlib.tri as mtri
@@ -288,9 +289,40 @@ def _run(cmd, case=None, region=None, time_range=None, use_case=True):
         full += f' -region {region}'
     if time_range:
         full += f' -time {time_range}'
+    log_path = None
+    if case:
+        log_dir = os.path.join(case, 'postProcessing', 'run_utci_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        safe_cmd = ''.join(c if c.isalnum() else '_' for c in cmd).strip('_') or 'command'
+        safe_region = region or 'default'
+        safe_time = (time_range or 'notime').replace(':', '_')
+        log_path = os.path.join(log_dir, f'{safe_cmd}__{safe_region}__{safe_time}.log')
+    print(f'  RUN: {cmd}')
+    print(f'       shell: {full}')
+    if log_path:
+        print(f'       log  : {log_path}')
+    t0 = time.time()
     result = subprocess.run(['bash', '-c', full], capture_output=True, text=True)
+    elapsed = time.time() - t0
+    stdout_tail = (result.stdout or '').strip()[-4000:]
+    stderr_tail = (result.stderr or '').strip()[-4000:]
+    if log_path:
+        with open(log_path, 'w') as f:
+            f.write(f'command: {cmd}\n')
+            f.write(f'shell: {full}\n')
+            if case:
+                f.write(f'case: {case}\n')
+            if region:
+                f.write(f'region: {region}\n')
+            if time_range:
+                f.write(f'time: {time_range}\n')
+            f.write(f'returncode: {result.returncode}\n')
+            f.write(f'elapsed_seconds: {elapsed:.6f}\n')
+            f.write('\n=== STDOUT ===\n')
+            f.write(result.stdout or '')
+            f.write('\n=== STDERR ===\n')
+            f.write(result.stderr or '')
     if result.returncode != 0:
-        stderr_tail = (result.stderr or '').strip()[-4000:]
         print('  [ERROR] OpenFOAM command failed')
         print(f'          command : {cmd}')
         if case:
@@ -300,13 +332,26 @@ def _run(cmd, case=None, region=None, time_range=None, use_case=True):
         if time_range:
             print(f'          time    : {time_range}')
         print(f'          code    : {result.returncode}')
+        print(f'          elapsed : {elapsed:.2f}s')
+        if stdout_tail:
+            print('          stdout tail:')
+            for line in stdout_tail.splitlines():
+                print(f'            {line}')
         if stderr_tail:
             print('          stderr tail:')
             for line in stderr_tail.splitlines():
                 print(f'            {line}')
         print('          Stage 1 may continue, but later steps can silently reuse stale outputs.')
     else:
-        print(f'  OK: {cmd}')
+        print(f'  OK: {cmd} ({elapsed:.2f}s)')
+        if stdout_tail:
+            print('      stdout tail:')
+            for line in stdout_tail.splitlines()[-20:]:
+                print(f'        {line}')
+        if stderr_tail:
+            print('      stderr tail:')
+            for line in stderr_tail.splitlines()[-20:]:
+                print(f'        {line}')
     return result
 
 
