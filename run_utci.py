@@ -382,18 +382,46 @@ def _compile_if_missing(binary, src_dir):
 # STAGE 0 – Write system files
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _detect_terrain(vtk_path):
+def _projected_mesh_area_xy(mesh):
+    """Projected x-y area of a surface mesh."""
+    mesh = mesh.triangulate()
+    if mesh.n_cells == 0:
+        return 0.0
+    pts = mesh.points
+    tris = mesh.faces.reshape(-1, 4)[:, 1:]
+    a = pts[tris[:, 0], :2]
+    b = pts[tris[:, 1], :2]
+    c = pts[tris[:, 2], :2]
+    twice_area = (
+        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+        - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    )
+    return float(0.5 * np.abs(twice_area).sum())
+
+
+def _detect_terrain(vtk_path, bbox=None):
     """Return True if vtk_path looks like a terrain domain.
 
     Criteria (either triggers terrain mode):
       - VTK has no points (cutting plane at z=PED_Z missed the domain entirely)
       - std(z) of mesh points > 0.5 m (sloped terrain)
+      - projected x-y coverage of the flat cutting plane is too small
+        relative to the STL bbox area (typical when a terrain-following
+        pedestrian surface is needed instead of a flat z=PED_Z plane)
     """
     mesh = pv.read(vtk_path)
     if mesh.n_points == 0:
         return True
     z = mesh.points[:, 2]
-    return float(np.std(z)) > 0.5
+    if float(np.std(z)) > 0.5:
+        return True
+    if bbox is not None:
+        bbox_area = max(0.0, (bbox[1] - bbox[0]) * (bbox[3] - bbox[2]))
+        if bbox_area > 0.0:
+            coverage = _projected_mesh_area_xy(mesh) / bbox_area
+            if coverage < 0.2:
+                return True
+    return False
 
 
 def _stage0_generate_positions(args):
@@ -452,12 +480,13 @@ def _stage0_generate_positions(args):
         return None, 'auto'
 
     # Step 2: inspect result
-    if not _detect_terrain(vtk_path):
+    if not _detect_terrain(vtk_path, bbox=bbox):
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
                                  z_offset=0.0, bbox=bbox), 'flat'
 
     # Step 3: re-run as terrain
-    print('  Auto-detected terrain domain (z-spread > 0.5 m or empty cutting plane) '
+    print('  Auto-detected terrain domain (z-spread > 0.5 m, low flat-plane coverage, '
+          'or empty cutting plane) '
           '— switching to terrain mode')
     terrain_patches = list(args.terrain_patches)
     with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
@@ -874,6 +903,18 @@ def parse_args():
     return p.parse_args()
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    whole = int(round(seconds))
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f'{h:d}h {m:02d}m {s:02d}s'
+    if m:
+        return f'{m:d}m {s:02d}s'
+    return f'{seconds:.2f}s'
+
+
 def main():
     args = parse_args()
     args.case = os.path.abspath(args.case)
@@ -886,12 +927,23 @@ def main():
     print(f'UTCI method: {args.utci_method}' + (f' ({args.lut_path})' if args.lut_path else ''))
 
     stage_map = {0: stage0, 1: stage1, 2: stage2, 3: stage3}
+    stage_timings = {}
+    total_start = time.perf_counter()
     for s in sorted(args.stages):
         if s not in stage_map:
             print(f'[ERROR] Unknown stage {s}')
             sys.exit(1)
+        stage_start = time.perf_counter()
         stage_map[s](args)
+        elapsed = time.perf_counter() - stage_start
+        stage_timings[s] = elapsed
+        print(f'=== Stage {s} done in {_format_elapsed(elapsed)} ===')
 
+    total_elapsed = time.perf_counter() - total_start
+    print('\n=== Timing Summary ===')
+    for s in sorted(stage_timings):
+        print(f'  Stage {s}: {_format_elapsed(stage_timings[s])}')
+    print(f'  Total:   {_format_elapsed(total_elapsed)}')
     print('\nDone.')
 
 
