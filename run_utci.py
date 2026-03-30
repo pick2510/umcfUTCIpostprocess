@@ -288,9 +288,31 @@ def _run(cmd, case=None, region=None, time_range=None, use_case=True):
         full += f' -time {time_range}'
     result = subprocess.run(['bash', '-c', full], capture_output=True, text=True)
     if result.returncode != 0:
-        print(f'  [WARN] {cmd!r} returned {result.returncode}:\n{result.stderr[-600:]}')
+        stderr_tail = (result.stderr or '').strip()[-4000:]
+        print('  [ERROR] OpenFOAM command failed')
+        print(f'          command : {cmd}')
+        if case:
+            print(f'          case    : {case}')
+        if region:
+            print(f'          region  : {region}')
+        if time_range:
+            print(f'          time    : {time_range}')
+        print(f'          code    : {result.returncode}')
+        if stderr_tail:
+            print('          stderr tail:')
+            for line in stderr_tail.splitlines():
+                print(f'            {line}')
+        print('          Stage 1 may continue, but later steps can silently reuse stale outputs.')
     else:
         print(f'  OK: {cmd}')
+    return result
+
+
+def _run_required(cmd, case=None, region=None, time_range=None, use_case=True):
+    result = _run(cmd, case=case, region=region, time_range=time_range, use_case=use_case)
+    if result.returncode != 0:
+        print(f'  [FATAL] Aborting because required command failed: {cmd}')
+        sys.exit(result.returncode)
     return result
 
 
@@ -534,15 +556,15 @@ def stage1(args):
 
     # Step 1: Direct solar radiation volume field
     print(f'  calculateqrsw ({region}) ...')
-    _run('calculateqrsw', args.case, region=region, time_range=time_range)
+    _run_required('calculateqrsw', args.case, region=region, time_range=time_range)
 
     # Step 2: Surface area vectors (first timestep only)
     print(f'  calcSf ({region}) ...')
-    _run('calcSf', args.case, region=region, time_range=str(args.t_start))
+    _run_required('calcSf', args.case, region=region, time_range=str(args.t_start))
 
     # Step 3: Outgoing wall radiation
     print(f'  calcWallRadOut ({region}) ...')
-    _run('calcWallRadOut', args.case, region=region, time_range=time_range)
+    _run_required('calcWallRadOut', args.case, region=region, time_range=time_range)
 
     # Step 4: Extract Sf, qrOut, qsOut at wall + sky patches → raw files
     wall_patches = list(args.wall_patches)
@@ -553,7 +575,7 @@ def stage1(args):
     with open(os.path.join(sys_region, 'surfaces'), 'w') as f:
         f.write(_surfaces_patch_dict(wall_patches, args.sky_patches))
     print(f'  postProcess: Sf, qrOut, qsOut at patches ({region}) ...')
-    _run('postProcess -func surfaces', args.case, region=region, time_range=time_range)
+    _run_required('postProcess -func surfaces', args.case, region=region, time_range=time_range)
 
     # Step 5: Extract dense pedestrian-surface fields used by C++ Stage 2
     ped_vtk = os.path.join(args.case, 'postProcessing', 'surfacesPedestrian',
@@ -568,8 +590,8 @@ def stage1(args):
         f.write(_pedestrian_surface_dict(fields=('T', 'U', 'w'),
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian T, U, w ({ped_mode}, air) ...')
-    _run('postProcess -func surfacesPedestrianAir',
-         args.case, region='air', time_range=time_range)
+    _run_required('postProcess -func surfacesPedestrianAir',
+                  args.case, region='air', time_range=time_range)
 
     rad_region = 'vegetation' if args.vegetation else 'air'
     sys_rad = os.path.join(args.case, 'system', rad_region)
@@ -578,12 +600,12 @@ def stage1(args):
         f.write(_pedestrian_surface_dict(fields=('qrsw',),
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian qrsw ({ped_mode}, {rad_region}) ...')
-    _run('postProcess -func surfacesPedestrianRad',
-         args.case, region=rad_region, time_range=time_range)
+    _run_required('postProcess -func surfacesPedestrianRad',
+                  args.case, region=rad_region, time_range=time_range)
 
     # Step 6: Extract T, U, w at pedestrian positions (air region, probes)
     print('  postProcess: probes T, U, w (air) ...')
-    _run('postProcess -func probes', args.case, region='air', time_range=time_range)
+    _run_required('postProcess -func probes', args.case, region='air', time_range=time_range)
 
     # Step 7: Sample qrsw magnitude at probe positions from a z=2 m cutting plane.
     # This provides direct-solar irradiance including canopy attenuation.
@@ -593,8 +615,8 @@ def stage1(args):
         os.makedirs(sys_veg, exist_ok=True)
         with open(os.path.join(sys_veg, 'qrswCuttingPlane'), 'w') as f:
             f.write(_qrsw_cutting_plane_dict())
-        _run('postProcess -func qrswCuttingPlane',
-             args.case, region='vegetation', time_range=time_range)
+        _run_required('postProcess -func qrswCuttingPlane',
+                      args.case, region='vegetation', time_range=time_range)
         _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
 
 
