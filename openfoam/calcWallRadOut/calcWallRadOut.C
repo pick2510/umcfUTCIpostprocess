@@ -149,7 +149,15 @@ int main(int argc, char *argv[])
                 const scalarField A = qsp.albedo();
                 
                 qrOuti = sigma*pow4(Ti) + qri*(1-E)/E;
-                qsOuti = qsi*A/(1-A);
+                qsOuti = scalar(0);
+                forAll(qsOuti, faceI)
+                {
+                    const scalar denom = 1 - A[faceI];
+                    if (denom > 1e-6)
+                    {
+                        qsOuti[faceI] = qsi[faceI]*A[faceI]/denom;
+                    }
+                }
             }
         }
         

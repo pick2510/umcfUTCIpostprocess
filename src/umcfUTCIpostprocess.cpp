@@ -173,6 +173,22 @@ void printUsage(const char* progName) {
 
 CommandLineArgs parseArgs(int argc, char* argv[]) {
     CommandLineArgs args;
+    auto parseIntArg = [&](const std::string& flag, const char* value) -> int {
+        try {
+            return std::stoi(value);
+        } catch (const std::exception&) {
+            logError("Invalid integer for " + flag + ": " + value);
+            std::exit(1);
+        }
+    };
+    auto parseDoubleArg = [&](const std::string& flag, const char* value) -> double {
+        try {
+            return std::stod(value);
+        } catch (const std::exception&) {
+            logError("Invalid number for " + flag + ": " + value);
+            std::exit(1);
+        }
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -180,11 +196,11 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
         if (arg == "--case" && i + 1 < argc) {
             args.casePath = argv[++i];
         } else if (arg == "--start" && i + 1 < argc) {
-            args.tStart = std::stoi(argv[++i]);
+            args.tStart = parseIntArg(arg, argv[++i]);
         } else if (arg == "--end" && i + 1 < argc) {
-            args.tEnd = std::stoi(argv[++i]);
+            args.tEnd = parseIntArg(arg, argv[++i]);
         } else if (arg == "--step" && i + 1 < argc) {
-            args.tStep = std::stoi(argv[++i]);
+            args.tStep = parseIntArg(arg, argv[++i]);
         } else if (arg == "--output-dir" && i + 1 < argc) {
             args.outputDir = argv[++i];
         } else if (arg == "--skip-utci") {
@@ -199,19 +215,19 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
         } else if (arg == "--force-recompute") {
             args.forceRecompute = true;
         } else if (arg == "--max-positions" && i + 1 < argc) {
-            args.maxPositions = std::stoi(argv[++i]);
+            args.maxPositions = parseIntArg(arg, argv[++i]);
         } else if (arg == "--batch-size" && i + 1 < argc) {
-            args.batchSize = std::stoi(argv[++i]);
+            args.batchSize = parseIntArg(arg, argv[++i]);
         } else if (arg == "--filter-radius" && i + 1 < argc) {
-            args.filterRadius = std::stod(argv[++i]);
+            args.filterRadius = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "--filter-cx" && i + 1 < argc) {
-            args.filterCenterX = std::stod(argv[++i]);
+            args.filterCenterX = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "--filter-cy" && i + 1 < argc) {
-            args.filterCenterY = std::stod(argv[++i]);
+            args.filterCenterY = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "-j" && i + 1 < argc) {
-            args.nThreads = std::stoi(argv[++i]);
+            args.nThreads = parseIntArg(arg, argv[++i]);
         } else if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'j') {
-            args.nThreads = std::stoi(arg.substr(2));
+            args.nThreads = parseIntArg("-j", arg.substr(2).c_str());
         } else if (arg == "--compress-cache") {
             args.compressCache = true;
         } else if (arg == "--no-compress-cache") {

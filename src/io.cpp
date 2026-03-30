@@ -58,6 +58,7 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
     
     std::string line;
     bool inList = false;
+    size_t skippedLines = 0;
     
     while (std::getline(file, line)) {
         line = trim(line);
@@ -87,12 +88,15 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
                     pos.originalIndex = static_cast<int>(positions.size());
                     positions.push_back(pos);
                 } catch (...) {
-                    // Skip invalid lines
+                    ++skippedLines;
                 }
             }
         }
     }
     
+    if (skippedLines > 0) {
+        logWarn("  Skipped " + std::to_string(skippedLines) + " invalid probe_locs entries");
+    }
     logInfo("  Loaded " + std::to_string(positions.size()) + " pedestrian positions");
     return positions;
 }
@@ -335,7 +339,11 @@ bool writeTumrtAvg(const std::string& path,
         file << timestep << " " << pos.x << " " << pos.y << " " << pos.z 
              << " " << TumrtAvg[i] << "\n";
     }
-    
+
+    if (file.fail()) {
+        logError("Failed while writing TumrtAvg: " + path);
+        return false;
+    }
     return true;
 }
 
@@ -848,6 +856,10 @@ bool writeLegacyVtkMesh(const std::string& path,
         f << "SCALARS " << name << " float 1\n"
           << "LOOKUP_TABLE default\n";
         for (int i = 0; i < vals.size(); ++i) f << vals[i] << "\n";
+    }
+    if (f.fail()) {
+        logError("Failed while writing VTK: " + path);
+        return false;
     }
     return true;
 }

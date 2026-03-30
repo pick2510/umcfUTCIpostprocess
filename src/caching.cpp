@@ -3,6 +3,7 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -55,6 +56,9 @@ static void writeSparseSegments(Stream& f,
     const std::array<std::vector<std::pair<int,double>>, 5>& segs)
 {
     for (int n = 0; n < 5; ++n) {
+        if (segs[n].size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return;
+        }
         int sz = static_cast<int>(segs[n].size());
         f.write(reinterpret_cast<const char*>(&sz), sizeof(int));
         for (const auto& [idx, val] : segs[n]) {
@@ -72,6 +76,7 @@ static bool readSparseSegments(Stream& f,
     for (int n = 0; n < 5; ++n) {
         int sz = 0;
         if (!f.read(reinterpret_cast<char*>(&sz), sizeof(int))) return false;
+        if (sz < 0) return false;
         segs[n].resize(sz);
         for (auto& [idx, val] : segs[n]) {
             float fval = 0.0f;

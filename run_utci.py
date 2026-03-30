@@ -51,7 +51,9 @@ sys.stdout.reconfigure(line_buffering=True)
 # DEFAULTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-OF_DIR         = '/home/strebdom/OpenFOAM-8'
+OF_DIR         = os.environ.get('WM_PROJECT_DIR') or (
+    os.path.dirname(os.environ['FOAM_ETC']) if 'FOAM_ETC' in os.environ else '/home/strebdom/OpenFOAM-8'
+)
 UTCI_UTIL      = os.path.join(os.path.dirname(__file__), 'openfoam')
 CALC_TMRT_BIN  = os.path.join(os.path.dirname(__file__), 'build', 'umcfUTCIpostprocess')
 
