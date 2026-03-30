@@ -61,6 +61,9 @@ python3 run_utci.py --case /path/to/openfoam/case
 | `--ped-grid-dy M` | `3.0` | Pedestrian grid y-spacing [m] |
 | `--output-dir DIR` | `UTCI` | Output directory (relative to `--case`) |
 | `--utci-method` | `poly` | UTCI method: `poly` (165-term polynomial) or `lut` (lookup table) |
+| `--wall-patches NAME …` | `buildings roofs street ground` | OpenFOAM patch names for wall/roof surfaces |
+| `--sky-patches NAME …` | `west east north south top` | OpenFOAM patch names for sky boundaries |
+| `--bbox-padding M` | *(none)* | Clip probe grid to STL bounding box + padding [m] |
 | `--force-recompute` | off | Recompute view factors even if cache exists |
 | `--skip-utci` | off | Compute Tmrt only, skip UTCI |
 | `--no-vegetation` | off | Use `air` region instead of `vegetation` for radiation fields |
@@ -89,9 +92,22 @@ python3 run_utci.py --case /data/hill_case \
     --mode terrain --terrain-patches ground street \
     --ped-grid-dx 5 --ped-grid-dy 5
 
-# Compressed view-factor cache (requires zlib at build time)
-python3 run_utci.py --case /data/case_01 --compress-cache
+# Clip probe grid to STL bounding box with 5 m padding
+python3 run_utci.py --case /data/case_01 --bbox-padding 5
 ```
+
+### C++ binary flags (Stage 2 direct invocation)
+
+These flags are only available when calling the binary directly, not via `run_utci.py`:
+
+| Flag | Description |
+|------|-------------|
+| `--compress-cache` / `--no-compress-cache` | Force gzip-compressed or plain cache files |
+| `--write-debug-terms` | Write per-timestep LW/SW radiation breakdown VTK files |
+| `--write-debug-qrsw` | Write `qrsw_surface.vtk` debug file per timestep |
+| `--max-positions N` | Cap number of positions (for testing) |
+| `--batch-size N` | View-factor batch size (default 500) |
+| `--filter-radius R` / `--filter-cx X` / `--filter-cy Y` | Spatial filter around a centre point |
 
 ---
 
@@ -104,7 +120,12 @@ Stage 2 writes the following VTK files under `<case>/<output-dir>/<timestep>/`:
 | `UTCI.vtk` | Point cloud: Tmrt [°C], UTCI [°C] per pedestrian position |
 | `Tmrt_pedestrian.vtk` | Point cloud: Tmrt [K] |
 | `RH_pedestrian.vtk` | Point cloud: relative humidity [%] |
-| `UTCI_surface.vtk` | Dense interpolated surface (requires scipy) |
+| `Tumrt_surface.vtk` | Dense surface mesh: pre-solar Tmrt interpolated onto CFD pedestrian mesh |
+| `Tmrt_surface.vtk` | Dense surface mesh: final Tmrt (with solar) |
+| `RH_surface.vtk` | Dense surface mesh: relative humidity [%] |
+| `UTCI_surface.vtk` | Dense surface mesh: UTCI [°C] and Tmrt [°C] |
+
+The dense surface files require a `T_pedestrian.vtk` mesh from Stage 1 (CFD pedestrian surface). If absent they are skipped silently.
 
 Stage 3 copies all per-timestep VTK files to `<output-dir>/results/` with a `_t<NNNNNN>` suffix.
 
@@ -121,9 +142,11 @@ src/                     — C++ sources
   utciSolver.cpp           UTCI 165-term polynomial + LUT
   pedestrian.cpp           5-segment body model
   raycaster.cpp            STL BVH ray intersection
+  denseStage2.cpp          dense surface interpolation and output
   caching.cpp              binary view-factor cache
   io.cpp                   field I/O (raw, VTK, probes, meteo)
   constants.h              physical constants
+  logging.h                logging helpers
 openfoam/                — OpenFOAM utility sources
   calculateqrsw/
   calcSf/

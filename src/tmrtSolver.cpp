@@ -24,16 +24,34 @@ Eigen::VectorXd TmrtSolver::compute(
     const MeteoData& meteo,
     bool useSkyViewFactors)
 {
+    return computeDetailed(surfaces, sky, vf, meteo, useSkyViewFactors).Tmrt;
+}
+
+TmrtBreakdown TmrtSolver::computeDetailed(
+    const std::vector<SurfacePatch>& surfaces,
+    const std::vector<SurfacePatch>& sky,
+    const ViewFactorResult& vf,
+    const MeteoData& meteo,
+    bool useSkyViewFactors)
+{
     const int nBody = 5;
-    Eigen::VectorXd Tmrt(nBody);
-    Tmrt.setZero();
+    TmrtBreakdown out;
+    out.Tmrt = Eigen::VectorXd::Zero(nBody);
+    out.qlwSurfaces = Eigen::VectorXd::Zero(nBody);
+    out.qlwSky = Eigen::VectorXd::Zero(nBody);
+    out.qswSurfaces = Eigen::VectorXd::Zero(nBody);
+    out.qswSky = Eigen::VectorXd::Zero(nBody);
+    out.qswGround = Eigen::VectorXd::Zero(nBody);
+    out.qswElevatedDown = Eigen::VectorXd::Zero(nBody);
+    out.qswVertical = Eigen::VectorXd::Zero(nBody);
+    out.qswUpward = Eigen::VectorXd::Zero(nBody);
     
     if (surfaces.empty()) {
-        return Tmrt;
+        return out;
     }
     
     // Precompute outgoing LW per surface.
-    // utci_clement format: qrOut is already σT⁴ + qr*(1-ε)/ε (use directly).
+    // reference format: qrOut is already σT⁴ + qr*(1-ε)/ε (use directly).
     // Legacy format: qrOut==0, compute from temperature and qr separately.
     std::vector<double> QrOut(surfaces.size());
     for (size_t i = 0; i < surfaces.size(); ++i) {
@@ -51,34 +69,54 @@ Eigen::VectorXd TmrtSolver::compute(
 
     for (int n = 0; n < nBody; ++n) {
         // Split into long-wave (LW) and short-wave (SW) incident radiation
-        double qin_lw = 0.0;
-        double qin_sw = 0.0;
+        double qin_lw_surfaces = 0.0;
+        double qin_sw_surfaces = 0.0;
 
         // LW and SW from wall/veg surfaces
         for (const auto& [m, fij_val] : vf.Fij[n]) {
-            qin_lw += QrOut[m] * fij_val;
-            qin_sw += surfaces[m].qsOut * fij_val;
+            qin_lw_surfaces += QrOut[m] * fij_val;
+            double qsw = surfaces[m].qsOut * fij_val;
+            qin_sw_surfaces += qsw;
+            double areaMag = surfaces[m].areaVector.norm();
+            double nz = (areaMag > 0.0) ? surfaces[m].areaVector.z() / areaMag : 0.0;
+            if (nz < -0.7) {
+                if (surfaces[m].center.z <= 2.5) out.qswGround[n] += qsw;
+                else out.qswElevatedDown[n] += qsw;
+            } else if (nz > 0.7) {
+                out.qswUpward[n] += qsw;
+            } else {
+                out.qswVertical[n] += qsw;
+            }
         }
 
-        // Clement normalization: add sky radiation weighted by explicit FijsumSky,
+        // Normalization: add sky radiation weighted by explicit FijsumSky,
         // then divide both LW and SW by (Fijsum + FijsumSky) so the total sums to 1.
-        qin_lw += sigmaTsky4 * vf.FijsumSky[n];
-        qin_sw += meteo.Idif * vf.FijsumSky[n];
+        double qin_lw_sky = sigmaTsky4 * vf.FijsumSky[n];
+        double qin_sw_sky = meteo.Idif * vf.FijsumSky[n];
         double total_vf = vf.Fijsum[n] + vf.FijsumSky[n];
         if (total_vf > 0.0) {
-            qin_lw /= total_vf;
-            qin_sw /= total_vf;
+            qin_lw_surfaces /= total_vf;
+            qin_sw_surfaces /= total_vf;
+            qin_lw_sky /= total_vf;
+            qin_sw_sky /= total_vf;
         }
         (void)useSkyViewFactors;
 
+        out.qlwSurfaces[n] = qin_lw_surfaces;
+        out.qlwSky[n] = qin_lw_sky;
+        out.qswSurfaces[n] = qin_sw_surfaces;
+        out.qswSky[n] = qin_sw_sky;
+
         // Apply person's absorption coefficients (matching original Python):
         // Tmrt^4 = (eps_pers * qin_lw + abs_sw * qin_sw) / (sigma * eps_pers)
+        double qin_lw = qin_lw_surfaces + qin_lw_sky;
+        double qin_sw = qin_sw_surfaces + qin_sw_sky;
         double Tmrt4 = (EPS_LW_PERSON * qin_lw + ABS_SW_PERSON * qin_sw)
                        / (SIGMA * EPS_LW_PERSON);
-        Tmrt[n] = (Tmrt4 > 0.0) ? std::pow(Tmrt4, 0.25) : meteo.Ta;
+        out.Tmrt[n] = (Tmrt4 > 0.0) ? std::pow(Tmrt4, 0.25) : meteo.Ta;
     }
     
-    return Tmrt;
+    return out;
 }
 
 double TmrtSolver::computeAreaWeightedAverage(

@@ -1,4 +1,5 @@
 #include "utciSolver.h"
+#include "logging.h"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -259,7 +260,7 @@ double UtciSolver::calculatePoly(double Ta_c, double va, double f, double Tmrt_c
 bool UtciSolver::loadLUT(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) {
-        std::cerr << "  [LUT] Cannot open: " << path << "\n";
+        logError("  [LUT] Cannot open: " + path);
         return false;
     }
 
@@ -284,7 +285,7 @@ bool UtciSolver::loadLUT(const std::string& path) {
     }
 
     if (rows.empty()) {
-        std::cerr << "  [LUT] No data rows parsed from " << path << "\n";
+        logError("  [LUT] No data rows parsed from " + path);
         return false;
     }
 
@@ -353,11 +354,11 @@ bool UtciSolver::loadLUT(const std::string& path) {
         }
     }
 
-    std::cout << "  [LUT] Loaded " << rows.size() << " rows  "
-              << "Ta[" << lut_Ta_.front() << ".." << lut_Ta_.back() << "]  "
-              << "TrTa[" << lut_TrTa_.front() << ".." << lut_TrTa_.back() << "]  "
-              << "va[" << lut_va_.front() << ".." << lut_va_.back() << "]  "
-              << "rH[" << lut_rH_.front() << ".." << lut_rH_.back() << "]\n";
+    logInfo("  [LUT] Loaded " + std::to_string(rows.size()) + " rows  "
+            + "Ta[" + std::to_string(lut_Ta_.front()) + ".." + std::to_string(lut_Ta_.back()) + "]  "
+            + "TrTa[" + std::to_string(lut_TrTa_.front()) + ".." + std::to_string(lut_TrTa_.back()) + "]  "
+            + "va[" + std::to_string(lut_va_.front()) + ".." + std::to_string(lut_va_.back()) + "]  "
+            + "rH[" + std::to_string(lut_rH_.front()) + ".." + std::to_string(lut_rH_.back()) + "]");
     return true;
 }
 

@@ -8,12 +8,32 @@
 
 namespace utci {
 
+struct TmrtBreakdown {
+    Eigen::VectorXd Tmrt;
+    Eigen::VectorXd qlwSurfaces;
+    Eigen::VectorXd qlwSky;
+    Eigen::VectorXd qswSurfaces;
+    Eigen::VectorXd qswSky;
+    Eigen::VectorXd qswGround;
+    Eigen::VectorXd qswElevatedDown;
+    Eigen::VectorXd qswVertical;
+    Eigen::VectorXd qswUpward;
+};
+
 class TmrtSolver {
 public:
     TmrtSolver();
     ~TmrtSolver();
     
     Eigen::VectorXd compute(
+        const std::vector<SurfacePatch>& surfaces,
+        const std::vector<SurfacePatch>& sky,
+        const ViewFactorResult& vf,
+        const MeteoData& meteo,
+        bool useSkyViewFactors
+    );
+
+    TmrtBreakdown computeDetailed(
         const std::vector<SurfacePatch>& surfaces,
         const std::vector<SurfacePatch>& sky,
         const ViewFactorResult& vf,

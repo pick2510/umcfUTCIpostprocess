@@ -16,7 +16,7 @@ public:
     bool loadGeometry(const std::string& stlPath);
     void loadVegetation(const std::string& stlPath);
     
-    bool isBlocked(const Vec3& start, const Vec3& end) const;
+    bool isBlocked(const Vec3& start, const Vec3& end, bool enforceRangeLimit = true) const;
 
     bool isValid() const;
     

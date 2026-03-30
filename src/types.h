@@ -5,6 +5,8 @@
 #include <vector>
 #include <array>
 #include <utility>
+#include <string>
+#include <unordered_map>
 
 namespace utci {
 
@@ -32,7 +34,7 @@ struct SurfacePatch {
     Vec3 areaVector;
     double temperature;
     double qr;          // Net LW radiation flux [W/m²]
-    double qrOut;       // Outgoing LW radiation flux σT⁴+qr*(1-ε)/ε [W/m²] (utci_clement format)
+    double qrOut;       // Outgoing LW radiation flux σT⁴+qr*(1-ε)/ε [W/m²] (reference format)
     double qsOut;       // Outgoing SW radiation flux [W/m²]
     double area;        // |areaVector|
 };
@@ -76,6 +78,24 @@ struct UtciResult {
     double va;           // Wind speed at 10m [m/s]
 };
 
+enum class VtkDatasetType {
+    POLYDATA,
+    STRUCTURED_GRID
+};
+
+struct VtkMeshData {
+    VtkDatasetType datasetType = VtkDatasetType::POLYDATA;
+    std::string title = "VTK mesh";
+    int dimX = 0;
+    int dimY = 0;
+    int dimZ = 0;
+    std::vector<Point3> points;
+    std::vector<std::vector<int>> cells;
+    std::unordered_map<std::string, Eigen::VectorXd> cellScalars;
+    std::unordered_map<std::string, std::vector<Vec3>> cellVectors;
+    std::unordered_map<std::string, Eigen::VectorXd> pointScalars;
+    std::unordered_map<std::string, std::vector<Vec3>> pointVectors;
+};
 
 }
 
