@@ -54,6 +54,18 @@ struct DenseInterpPlan {
     bool valid = false;
 };
 
+enum class QrswRemapMode {
+    None,
+    DirectPoint,
+    NearestPoint,
+    CellToPoint
+};
+
+struct QrswRemapPlan {
+    QrswRemapMode mode = QrswRemapMode::None;
+    std::vector<int> indices;
+};
+
 static constexpr double DENSE_INTERP_BBOX_INSET = 1.0;
 
 static long long gridKey(int ix, int iy) {
@@ -76,6 +88,38 @@ static std::string makePlanKey(const std::vector<PedestrianPosition>& sparsePosi
     }
     oss << "|" << densePoints.size() << "|";
     if (!densePoints.empty()) {
+        appendPoint(oss, densePoints.front());
+        oss << "|";
+        appendPoint(oss, densePoints.back());
+    }
+    return oss.str();
+}
+
+static std::string makeQrswPlanKey(const VtkMeshData& meshQrsw,
+                                   bool hasPointQrsw,
+                                   bool hasCellQrsw,
+                                   const std::vector<Point3>& densePoints) {
+    auto appendPoint = [](std::ostringstream& oss, const Point3& p) {
+        oss << std::fixed << std::setprecision(4)
+            << p.x << "," << p.y << "," << p.z;
+    };
+    std::ostringstream oss;
+    oss << static_cast<int>(hasPointQrsw) << "|"
+        << static_cast<int>(hasCellQrsw) << "|"
+        << meshQrsw.points.size() << "|" << meshQrsw.cells.size();
+    if (!meshQrsw.points.empty()) {
+        oss << "|";
+        appendPoint(oss, meshQrsw.points.front());
+        oss << "|";
+        appendPoint(oss, meshQrsw.points.back());
+    }
+    if (!meshQrsw.cells.empty()) {
+        oss << "|" << meshQrsw.cells.front().size()
+            << "|" << meshQrsw.cells.back().size();
+    }
+    oss << "|" << densePoints.size();
+    if (!densePoints.empty()) {
+        oss << "|";
         appendPoint(oss, densePoints.front());
         oss << "|";
         appendPoint(oss, densePoints.back());
@@ -375,6 +419,58 @@ struct CellLocator2D {
 static bool pointInPolygonXY(const std::vector<Point3>& points,
                              const std::vector<int>& cell,
                              double x,
+                             double y);
+
+static int findBestCell2D(const CellLocator2D& loc,
+                          const VtkMeshData& srcMesh,
+                          double x,
+                          double y) {
+    const int ix = static_cast<int>(std::floor((x - loc.minX) / loc.binSize));
+    const int iy = static_cast<int>(std::floor((y - loc.minY) / loc.binSize));
+
+    int bestCell = -1;
+    double bestInsideD2 = std::numeric_limits<double>::infinity();
+    for (int rx = -1; rx <= 1; ++rx) {
+        for (int ry = -1; ry <= 1; ++ry) {
+            auto it = loc.bins.find(hashGridKey(ix + rx, iy + ry));
+            if (it == loc.bins.end()) continue;
+            for (int ci : it->second) {
+                const auto& bb = loc.bboxes[ci];
+                if (x < bb[0] - 1e-9 || x > bb[2] + 1e-9 ||
+                    y < bb[1] - 1e-9 || y > bb[3] + 1e-9) {
+                    continue;
+                }
+                if (!pointInPolygonXY(srcMesh.points, srcMesh.cells[ci], x, y)) continue;
+                const double dx = loc.centroids[ci].x - x;
+                const double dy = loc.centroids[ci].y - y;
+                const double d2 = dx * dx + dy * dy;
+                if (d2 < bestInsideD2) {
+                    bestInsideD2 = d2;
+                    bestCell = ci;
+                }
+            }
+        }
+    }
+
+    if (bestCell < 0) {
+        double bestD2 = std::numeric_limits<double>::infinity();
+        for (size_t ci = 0; ci < loc.centroids.size(); ++ci) {
+            const double dx = loc.centroids[ci].x - x;
+            const double dy = loc.centroids[ci].y - y;
+            const double d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                bestCell = static_cast<int>(ci);
+            }
+        }
+    }
+
+    return bestCell;
+}
+
+static bool pointInPolygonXY(const std::vector<Point3>& points,
+                             const std::vector<int>& cell,
+                             double x,
                              double y) {
     bool inside = false;
     const size_t n = cell.size();
@@ -456,49 +552,70 @@ static std::vector<Vec3> remapCellVectorsToPoints2D(const VtkMeshData& srcMesh,
 
     const CellLocator2D loc = buildCellLocator2D(srcMesh);
     for (size_t i = 0; i < dstPoints.size(); ++i) {
-        const double x = dstPoints[i].x;
-        const double y = dstPoints[i].y;
-        const int ix = static_cast<int>(std::floor((x - loc.minX) / loc.binSize));
-        const int iy = static_cast<int>(std::floor((y - loc.minY) / loc.binSize));
+        const int bestCell = findBestCell2D(loc, srcMesh, dstPoints[i].x, dstPoints[i].y);
+        if (bestCell >= 0) out[i] = cellVectors[bestCell];
+    }
+    return out;
+}
 
-        int bestCell = -1;
-        double bestInsideD2 = std::numeric_limits<double>::infinity();
-        for (int rx = -1; rx <= 1; ++rx) {
-            for (int ry = -1; ry <= 1; ++ry) {
-                auto it = loc.bins.find(hashGridKey(ix + rx, iy + ry));
-                if (it == loc.bins.end()) continue;
-                for (int ci : it->second) {
-                    const auto& bb = loc.bboxes[ci];
-                    if (x < bb[0] - 1e-9 || x > bb[2] + 1e-9 ||
-                        y < bb[1] - 1e-9 || y > bb[3] + 1e-9) {
-                        continue;
-                    }
-                    if (!pointInPolygonXY(srcMesh.points, srcMesh.cells[ci], x, y)) continue;
-                    const double dx = loc.centroids[ci].x - x;
-                    const double dy = loc.centroids[ci].y - y;
-                    const double d2 = dx * dx + dy * dy;
-                    if (d2 < bestInsideD2) {
-                        bestInsideD2 = d2;
-                        bestCell = ci;
-                    }
-                }
-            }
+static QrswRemapPlan buildQrswRemapPlan(const VtkMeshData& meshQrsw,
+                                        bool hasPointQrsw,
+                                        bool hasCellQrsw,
+                                        const std::vector<Point3>& dstPoints) {
+    QrswRemapPlan plan;
+    if (hasPointQrsw && meshQrsw.points.size() == dstPoints.size()) {
+        plan.mode = QrswRemapMode::DirectPoint;
+        return plan;
+    }
+
+    plan.indices.resize(dstPoints.size(), -1);
+    if (hasCellQrsw && !meshQrsw.cells.empty()) {
+        plan.mode = QrswRemapMode::CellToPoint;
+        const CellLocator2D loc = buildCellLocator2D(meshQrsw);
+        for (size_t i = 0; i < dstPoints.size(); ++i) {
+            plan.indices[i] = findBestCell2D(loc, meshQrsw, dstPoints[i].x, dstPoints[i].y);
         }
+        return plan;
+    }
 
-        if (bestCell < 0) {
+    if (hasPointQrsw && !meshQrsw.points.empty()) {
+        plan.mode = QrswRemapMode::NearestPoint;
+        for (size_t i = 0; i < dstPoints.size(); ++i) {
             double bestD2 = std::numeric_limits<double>::infinity();
-            for (size_t ci = 0; ci < loc.centroids.size(); ++ci) {
-                const double dx = loc.centroids[ci].x - x;
-                const double dy = loc.centroids[ci].y - y;
+            int best = -1;
+            for (size_t j = 0; j < meshQrsw.points.size(); ++j) {
+                const double dx = meshQrsw.points[j].x - dstPoints[i].x;
+                const double dy = meshQrsw.points[j].y - dstPoints[i].y;
                 const double d2 = dx * dx + dy * dy;
                 if (d2 < bestD2) {
                     bestD2 = d2;
-                    bestCell = static_cast<int>(ci);
+                    best = static_cast<int>(j);
                 }
             }
+            plan.indices[i] = best;
         }
+    }
 
-        if (bestCell >= 0) out[i] = cellVectors[bestCell];
+    return plan;
+}
+
+static std::vector<Vec3> remapQrswWithPlan(const QrswRemapPlan& plan,
+                                           const std::vector<Vec3>* pointVectors,
+                                           const std::vector<Vec3>* cellVectors,
+                                           size_t dstSize) {
+    if (plan.mode == QrswRemapMode::DirectPoint && pointVectors != nullptr) {
+        return *pointVectors;
+    }
+
+    std::vector<Vec3> out(dstSize, Vec3::Zero());
+    const std::vector<Vec3>* src = nullptr;
+    if (plan.mode == QrswRemapMode::NearestPoint) src = pointVectors;
+    if (plan.mode == QrswRemapMode::CellToPoint) src = cellVectors;
+    if (src == nullptr) return out;
+
+    for (size_t i = 0; i < dstSize && i < plan.indices.size(); ++i) {
+        const int idx = plan.indices[i];
+        if (idx >= 0 && idx < static_cast<int>(src->size())) out[i] = (*src)[idx];
     }
     return out;
 }
@@ -620,28 +737,35 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
     }
     Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtAvg);
 
-    std::vector<Vec3> qrswOnAirMesh;
-    if (meshQrsw.points.size() == n && itQ != meshQrsw.pointVectors.end()) {
-        qrswOnAirMesh = itQ->second;
-    } else if (itQ != meshQrsw.pointVectors.end()) {
-        qrswOnAirMesh.resize(n, Vec3::Zero());
-        for (size_t i = 0; i < n; ++i) {
-            double bestD2 = std::numeric_limits<double>::infinity();
-            size_t best = 0;
-            for (size_t j = 0; j < meshQrsw.points.size(); ++j) {
-                double dx = meshQrsw.points[j].x - meshT.points[i].x;
-                double dy = meshQrsw.points[j].y - meshT.points[i].y;
-                double d2 = dx * dx + dy * dy;
-                if (d2 < bestD2) {
-                    bestD2 = d2;
-                    best = j;
-                }
-            }
-            if (best < itQ->second.size()) qrswOnAirMesh[i] = itQ->second[best];
+    static std::mutex qrswPlanMutex;
+    static std::unordered_map<std::string, std::shared_ptr<const QrswRemapPlan>> qrswPlanCache;
+    const std::string qrswKey = makeQrswPlanKey(
+        meshQrsw,
+        itQ != meshQrsw.pointVectors.end(),
+        itQCell != meshQrsw.cellVectors.end(),
+        meshT.points);
+    std::shared_ptr<const QrswRemapPlan> qrswPlan;
+    {
+        std::lock_guard<std::mutex> lock(qrswPlanMutex);
+        auto it = qrswPlanCache.find(qrswKey);
+        if (it == qrswPlanCache.end()) {
+            it = qrswPlanCache.emplace(
+                qrswKey,
+                std::make_shared<QrswRemapPlan>(buildQrswRemapPlan(
+                    meshQrsw,
+                    itQ != meshQrsw.pointVectors.end(),
+                    itQCell != meshQrsw.cellVectors.end(),
+                    meshT.points))
+            ).first;
         }
-    } else if (itQCell != meshQrsw.cellVectors.end() && !meshQrsw.cells.empty()) {
-        qrswOnAirMesh = remapCellVectorsToPoints2D(meshQrsw, itQCell->second, meshT.points);
+        qrswPlan = it->second;
     }
+
+    std::vector<Vec3> qrswOnAirMesh = remapQrswWithPlan(
+        *qrswPlan,
+        itQ != meshQrsw.pointVectors.end() ? &itQ->second : nullptr,
+        itQCell != meshQrsw.cellVectors.end() ? &itQCell->second : nullptr,
+        n);
 
     Eigen::VectorXd qrswNorm = vectorMagnitudes(qrswOnAirMesh);
     Eigen::VectorXd denseTmrt = denseTumrtAvg;
