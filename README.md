@@ -2,6 +2,8 @@
 
 Post-processing tool for computing the **Universal Thermal Climate Index (UTCI)** from [urbanMicroclimateFoam](https://github.com/pick2510/urbanMicroclimateFoam) CFD simulations. Reads OpenFOAM radiation and flow fields, computes mean radiant temperature (Tmrt) at a pedestrian-level grid via a 5-segment body model and view-factor ray casting, then evaluates UTCI. Output is a set of VTK files per timestep.
 
+Key performance features: OpenMP-parallel view factor computation and timestep processing, SoA float32 view-factor cache (v11 plain / v12 gzip), bulk `strtod` file parser, `computeFast()` hot path with per-timestep surface data hoisted, reusable `DenseInterpPlan` for dense surface interpolation, and thread-cap removal for cached runs.
+
 For physics equations and internal dataflow see [PHYSICS_AND_DATAFLOW.md](PHYSICS_AND_DATAFLOW.md).
 
 ---
@@ -179,7 +181,7 @@ src/
   pedestrian.cpp           5-segment body model
   raycaster.cpp            STL uniform-grid BVH, DDA ray traversal
   denseStage2.cpp          dense surface interpolation and VTK output
-  caching.cpp              binary view-factor cache (v9 plain / v10 gzip)
+  caching.cpp              binary view-factor cache (v11 plain / v12 gzip)
   io.cpp                   raw/VTK/probe file I/O, meteo reader
   constants.h              all physical constants
   logging.h                logging helpers

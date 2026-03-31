@@ -43,9 +43,9 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 - Pairs where the body segment does not face the surface (`nᵢ · r ≥ 0`) are skipped
 - Each candidate pair is tested for ray occlusion against the STL BVH; blocked pairs contribute zero
 - Rays are trimmed to the 3 %–97 % segment of the full body→patch distance to avoid self-intersection artefacts (startOffset = 3 %, tmax = 0.94 × len from the offset origin = 97 % of original length)
-- Results stored as sparse `(patch_index, float32_value)` pairs per segment
+- Results stored as SoA sparse arrays (`std::vector<int> indices` + `std::vector<float> fij`) per segment — float32 values are sufficient precision for UTCI and halve cache size vs float64
 - Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
-- Cache format: version 9 (plain binary) or version 10 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
+- Cache format: version 11 (plain binary) or version 12 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
 
 **Sky view factors** (explicit geometry):
 
@@ -283,6 +283,8 @@ For the **LUT method**, RH is used directly as a table axis; no Pa conversion is
 │    probeT/U/w/qrsw ← per-position rows; probe points matched to     │
 │                 pedestrian positions by xyz coordinate hash (mm      │
 │                 precision); falls back to original probe file index  │
+│    (files parsed with bulk strtod reader: full file into buffer,     │
+│     walked with strtod — no stream or istringstream overhead)        │
 │                                                                     │
 │  Batch loop (500 pos / batch, OpenMP):                              │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -293,7 +295,11 @@ For the **LUT method**, RH is used directly as a table axis; no Pa conversion is
 │  │     Fijsum[5] = Σ Fij                                        │  │
 │  │                                                              │  │
 │  │ For each timestep t:                                         │  │
-│  │   qrOut[m], qsOut[m]  ←  .raw files for this t              │  │
+│  │   SurfaceRadiativeData built once per timestep (hoisted      │  │
+│  │     outside inner position loop): qrOut[m], qsOut[m],        │  │
+│  │     swClass[m] from .raw files for this t                    │  │
+│  │   computeFast() hot path per position (skips breakdown        │  │
+│  │     struct; thread cap removed for cached runs):              │  │
 │  │   qin_LW, qin_SW  per segment                               │  │
 │  │     = (surf contribution + sky contribution) / (Fijsum+FijsumSky)│ │
 │  │   Tmrt[5]  ←  (ε_p qin_LW + α_sw qin_SW) / (σ ε_p) ^0.25  │  │
@@ -310,6 +316,8 @@ For the **LUT method**, RH is used directly as a table axis; no Pa conversion is
 │    UTCI/<t>/RH_pedestrian.vtk      (point cloud, RH [%])           │
 │    UTCI/<t>/UTCI.vtk               (point cloud, Tmrt[°C]+UTCI[°C])│
 │    UTCI/<t>/Tumrt_surface.vtk      (dense mesh, pre-solar Tmrt)    │
+│    (dense output uses DenseInterpPlan: Catmull-Rom stencil +        │
+│     bilinear weights built once and reused across all timesteps)    │
 │    UTCI/<t>/Tmrt_surface.vtk       (dense mesh, final Tmrt)        │
 │    UTCI/<t>/RH_surface.vtk         (dense mesh, RH [%])            │
 │    UTCI/<t>/UTCI_surface.vtk       (dense mesh, UTCI+Tmrt [°C])    │
@@ -352,7 +360,7 @@ For the **LUT method**, RH is used directly as a table axis; no Pa conversion is
 | `src/pedestrian.cpp` | 5-segment body model |
 | `src/raycaster.cpp` | STL BVH ray intersection |
 | `src/denseStage2.cpp` | Dense surface interpolation and output |
-| `src/caching.cpp` | Binary VF cache (v9 plain / v10 gzip) |
+| `src/caching.cpp` | Binary VF cache (v11 plain / v12 gzip) |
 | `src/io.cpp` | Raw/probe file readers, VTK writers |
 | `src/constants.h` | All physical constants |
 | `openfoam/calculateqrsw/` | OF utility — direct solar volume field (qrsw) |
