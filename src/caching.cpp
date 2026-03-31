@@ -14,8 +14,8 @@
 namespace utci {
 
 // Cache version tags
-static constexpr int VERSION_PLAIN      = 9;
-static constexpr int VERSION_COMPRESSED = 10;
+static constexpr int VERSION_PLAIN      = 11;
+static constexpr int VERSION_COMPRESSED = 12;
 
 bool createDirectory(const std::string& path) {
     // Create all intermediate directories (like mkdir -p)
@@ -53,16 +53,17 @@ static bool fileIsGzip(const std::string& path) {
 
 template<typename Stream>
 static void writeSparseSegments(Stream& f,
-    const std::array<std::vector<std::pair<int,double>>, 5>& segs)
+    const std::array<ViewFactorResult::SparseSegment, 5>& segs)
 {
     for (int n = 0; n < 5; ++n) {
-        if (segs[n].size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        if (segs[n].indices.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
             return;
         }
-        int sz = static_cast<int>(segs[n].size());
+        int sz = static_cast<int>(segs[n].indices.size());
         f.write(reinterpret_cast<const char*>(&sz), sizeof(int));
-        for (const auto& [idx, val] : segs[n]) {
-            float fval = static_cast<float>(val);
+        for (int i = 0; i < sz; ++i) {
+            const int idx = segs[n].indices[i];
+            const float fval = segs[n].fij[i];
             f.write(reinterpret_cast<const char*>(&idx),  sizeof(int));
             f.write(reinterpret_cast<const char*>(&fval), sizeof(float));
         }
@@ -71,18 +72,21 @@ static void writeSparseSegments(Stream& f,
 
 template<typename Stream>
 static bool readSparseSegments(Stream& f,
-    std::array<std::vector<std::pair<int,double>>, 5>& segs)
+    std::array<ViewFactorResult::SparseSegment, 5>& segs)
 {
     for (int n = 0; n < 5; ++n) {
         int sz = 0;
         if (!f.read(reinterpret_cast<char*>(&sz), sizeof(int))) return false;
         if (sz < 0) return false;
-        segs[n].resize(sz);
-        for (auto& [idx, val] : segs[n]) {
+        segs[n].indices.resize(sz);
+        segs[n].fij.resize(sz);
+        for (int i = 0; i < sz; ++i) {
+            int idx = 0;
             float fval = 0.0f;
-            if (!f.read(reinterpret_cast<char*>(&idx),  sizeof(int)))   return false;
+            if (!f.read(reinterpret_cast<char*>(&idx), sizeof(int)))   return false;
             if (!f.read(reinterpret_cast<char*>(&fval), sizeof(float))) return false;
-            val = static_cast<double>(fval);
+            segs[n].indices[i] = idx;
+            segs[n].fij[i] = fval;
         }
     }
     return true;

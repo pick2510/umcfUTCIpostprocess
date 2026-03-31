@@ -111,6 +111,50 @@ struct SparseStage2Context {
     UtciSolver& utciSolver;
 };
 
+static SurfaceRadiativeData buildSurfaceRadiativeData(const SparseStage2Context& ctx,
+                                                      const TimestepScalars& sc) {
+    SurfaceRadiativeData surfaceData;
+    const size_t nSurf = ctx.allGeo.size();
+    surfaceData.qrOut.resize(nSurf);
+    surfaceData.qsOut.resize(nSurf);
+    surfaceData.swClass.resize(nSurf);
+
+    for (size_t i = 0; i < nSurf; ++i) {
+        const auto& geom = ctx.allGeo[i];
+        if (!sc.allQrOut.empty() && i < sc.allQrOut.size()) {
+            surfaceData.qrOut[i] = sc.allQrOut[i];
+        } else {
+            double temperature = geom.temperature;
+            double qr = geom.qr;
+            if (i < ctx.wallGeo.size()) {
+                if (i < sc.wallTemps.size()) temperature = sc.wallTemps[i];
+            } else {
+                const size_t vegIdx = i - ctx.wallGeo.size();
+                if (vegIdx < sc.vegTemps.size()) temperature = sc.vegTemps[vegIdx];
+                if (vegIdx < sc.vegQr.size()) qr = sc.vegQr[vegIdx];
+            }
+            surfaceData.qrOut[i] = SIGMA * std::pow(temperature, 4)
+                                 + qr * (1.0 - EPS_SURF) / EPS_SURF;
+        }
+
+        surfaceData.qsOut[i] = (i < sc.allQsOut.size()) ? sc.allQsOut[i] : geom.qsOut;
+
+        double areaMag = geom.areaVector.norm();
+        double nz = (areaMag > 0.0) ? geom.areaVector.z() / areaMag : 0.0;
+        if (nz < -0.7) {
+            surfaceData.swClass[i] = (geom.center.z <= 2.5)
+                ? SurfaceSwClass::Ground
+                : SurfaceSwClass::ElevatedDown;
+        } else if (nz > 0.7) {
+            surfaceData.swClass[i] = SurfaceSwClass::Upward;
+        } else {
+            surfaceData.swClass[i] = SurfaceSwClass::Vertical;
+        }
+    }
+
+    return surfaceData;
+}
+
 void utci::logInfo(const std::string& message) {
     std::cout << message << "\n";
 }
@@ -476,54 +520,15 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             logSummary(out.str());
         }
 
+        const int timestepThreads = std::max(1, std::min({ctx.args.nThreads > 0 ? ctx.args.nThreads : 1,
+                                                          8,
+                                                          static_cast<int>(ctx.timesteps.size())}));
+        #pragma omp parallel for schedule(dynamic) num_threads(timestepThreads)
         for (size_t tIdx = 0; tIdx < ctx.timesteps.size(); ++tIdx) {
             int t = ctx.timesteps[tIdx];
             const auto& sc = ctx.tsData[tIdx];
             const MeteoData& meteo = ctx.meteoData[tIdx];
-
-            std::vector<SurfacePatch> allSurfaces = ctx.allGeo;
-            if (!sc.allQrOut.empty()) {
-                for (size_t i = 0; i < allSurfaces.size() && i < sc.allQrOut.size(); ++i) {
-                    allSurfaces[i].qrOut = sc.allQrOut[i];
-                }
-            } else {
-                for (size_t i = 0; i < ctx.wallGeo.size() && i < sc.wallTemps.size(); ++i) {
-                    allSurfaces[i].temperature = sc.wallTemps[i];
-                }
-                for (size_t i = 0; i < ctx.vegGeo.size(); ++i) {
-                    size_t idx = ctx.wallGeo.size() + i;
-                    if (i < sc.vegTemps.size()) allSurfaces[idx].temperature = sc.vegTemps[i];
-                    if (i < sc.vegQr.size()) allSurfaces[idx].qr = sc.vegQr[i];
-                }
-            }
-            for (size_t i = 0; i < allSurfaces.size() && i < sc.allQsOut.size(); ++i) {
-                allSurfaces[i].qsOut = sc.allQsOut[i];
-            }
-
-            SurfaceRadiativeData surfaceData;
-            surfaceData.qrOut.resize(allSurfaces.size());
-            surfaceData.qsOut.resize(allSurfaces.size());
-            surfaceData.swClass.resize(allSurfaces.size());
-            for (size_t i = 0; i < allSurfaces.size(); ++i) {
-                if (allSurfaces[i].qrOut > 0.0) {
-                    surfaceData.qrOut[i] = allSurfaces[i].qrOut;
-                } else {
-                    surfaceData.qrOut[i] = SIGMA * std::pow(allSurfaces[i].temperature, 4)
-                                         + allSurfaces[i].qr * (1.0 - EPS_SURF) / EPS_SURF;
-                }
-                surfaceData.qsOut[i] = allSurfaces[i].qsOut;
-                double areaMag = allSurfaces[i].areaVector.norm();
-                double nz = (areaMag > 0.0) ? allSurfaces[i].areaVector.z() / areaMag : 0.0;
-                if (nz < -0.7) {
-                    surfaceData.swClass[i] = (allSurfaces[i].center.z <= 2.5)
-                        ? SurfaceSwClass::Ground
-                        : SurfaceSwClass::ElevatedDown;
-                } else if (nz > 0.7) {
-                    surfaceData.swClass[i] = SurfaceSwClass::Upward;
-                } else {
-                    surfaceData.swClass[i] = SurfaceSwClass::Vertical;
-                }
-            }
+            SurfaceRadiativeData surfaceData = buildSurfaceRadiativeData(ctx, sc);
 
             Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);
@@ -564,13 +569,22 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                 fp_solar = 0.308 * std::cos(betaDeg * (1.0 - betaDeg * betaDeg / 48402.0) * M_PI / 180.0);
             }
 
-            #pragma omp parallel for schedule(dynamic)
             for (size_t bi = 0; bi < bN; ++bi) {
                 size_t pedIdx = bStart + bi;
-                TmrtBreakdown tmrtDetail = ctx.tmrtSolver.computeDetailed(surfaceData, batchVF[bi], meteo);
-                double TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
-                    tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
-                );
+                std::array<double, 5> tmrtFast{};
+                TmrtBreakdown tmrtDetail;
+                double TumrtNoSolar = 0.0;
+                if (ctx.args.writeDebugTerms) {
+                    tmrtDetail = ctx.tmrtSolver.computeDetailed(surfaceData, batchVF[bi], meteo);
+                    TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
+                        tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
+                    );
+                } else {
+                    tmrtFast = ctx.tmrtSolver.computeFast(surfaceData, batchVF[bi], meteo);
+                    TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
+                        tmrtFast, ctx.positions[pedIdx].areaVectors
+                    );
+                }
                 double TumrtAvg = TumrtNoSolar;
                 batchTumrtNoSolar[bi] = TumrtNoSolar;
                 if (ctx.args.writeDebugTerms) {

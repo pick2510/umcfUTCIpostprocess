@@ -116,7 +116,8 @@ ViewFactorResult ViewFactorCalculator::compute(
 
             double Fij_val = computePatchFij(i_n, Ai_n, ni, j_m, nj, AjMag, true);
             if (Fij_val <= 0.0) continue;
-            result.Fij[n].emplace_back(m, Fij_val);
+            result.Fij[n].indices.push_back(m);
+            result.Fij[n].fij.push_back(static_cast<float>(Fij_val));
             result.Fijsum[n] += Fij_val;
         }
 
@@ -137,7 +138,8 @@ ViewFactorResult ViewFactorCalculator::compute(
                 Vec3 nj = surfSky.areaVector / AjSkyMag;
                 double FijSky_val = computePatchFij(i_n, Ai_n, ni, j_sky, nj, AjSkyMag, false);
                 if (FijSky_val <= 0.0) continue;
-                result.FijSky[n].emplace_back(m, FijSky_val);
+                result.FijSky[n].indices.push_back(m);
+                result.FijSky[n].fij.push_back(static_cast<float>(FijSky_val));
                 result.FijsumSky[n] += FijSky_val;
             }
         }

@@ -51,6 +51,12 @@ public:
         const ViewFactorResult& vf,
         const MeteoData& meteo
     );
+
+    std::array<double, 5> computeFast(
+        const SurfaceRadiativeData& surfaceData,
+        const ViewFactorResult& vf,
+        const MeteoData& meteo
+    );
     
     double computeAreaWeightedAverage(
         const std::array<double, 5>& Tmrt,

@@ -48,13 +48,60 @@ Eigen::VectorXd TmrtSolver::compute(
             surfaceData.swClass[i] = SurfaceSwClass::Vertical;
         }
     }
-    TmrtBreakdown detail = computeDetailed(surfaceData, vf, meteo);
+    std::array<double, 5> detail = computeFast(surfaceData, vf, meteo);
     Eigen::VectorXd tmrt(5);
-    for (int i = 0; i < 5; ++i) tmrt[i] = detail.Tmrt[i];
+    for (int i = 0; i < 5; ++i) tmrt[i] = detail[i];
     (void)surfaces;
     (void)sky;
     (void)useSkyViewFactors;
     return tmrt;
+}
+
+std::array<double, 5> TmrtSolver::computeFast(
+    const SurfaceRadiativeData& surfaceData,
+    const ViewFactorResult& vf,
+    const MeteoData& meteo)
+{
+    std::array<double, 5> out{};
+
+    if (surfaceData.qrOut.empty()) {
+        return out;
+    }
+
+    const double Tsky = computeSkyTemperature(meteo.Ta, meteo.cc);
+    const double sigmaTsky4 = SIGMA * std::pow(Tsky, 4);
+
+    for (int n = 0; n < 5; ++n) {
+        double qin_lw_surfaces = 0.0;
+        double qin_sw_surfaces = 0.0;
+
+        const auto& seg = vf.Fij[n];
+        const size_t segSize = seg.indices.size();
+        for (size_t k = 0; k < segSize; ++k) {
+            const int m = seg.indices[k];
+            const double fij_val = static_cast<double>(seg.fij[k]);
+            qin_lw_surfaces += surfaceData.qrOut[m] * fij_val;
+            qin_sw_surfaces += surfaceData.qsOut[m] * fij_val;
+        }
+
+        double qin_lw_sky = sigmaTsky4 * vf.FijsumSky[n];
+        double qin_sw_sky = meteo.Idif * vf.FijsumSky[n];
+        double total_vf = vf.Fijsum[n] + vf.FijsumSky[n];
+        if (total_vf > 0.0) {
+            qin_lw_surfaces /= total_vf;
+            qin_sw_surfaces /= total_vf;
+            qin_lw_sky /= total_vf;
+            qin_sw_sky /= total_vf;
+        }
+
+        const double qin_lw = qin_lw_surfaces + qin_lw_sky;
+        const double qin_sw = qin_sw_surfaces + qin_sw_sky;
+        const double Tmrt4 = (EPS_LW_PERSON * qin_lw + ABS_SW_PERSON * qin_sw)
+                           / (SIGMA * EPS_LW_PERSON);
+        out[n] = (Tmrt4 > 0.0) ? std::pow(Tmrt4, 0.25) : meteo.Ta;
+    }
+
+    return out;
 }
 
 TmrtBreakdown TmrtSolver::computeDetailed(
@@ -79,7 +126,11 @@ TmrtBreakdown TmrtSolver::computeDetailed(
         double qin_sw_surfaces = 0.0;
 
         // LW and SW from wall/veg surfaces
-        for (const auto& [m, fij_val] : vf.Fij[n]) {
+        const auto& seg = vf.Fij[n];
+        const size_t segSize = seg.indices.size();
+        for (size_t k = 0; k < segSize; ++k) {
+            const int m = seg.indices[k];
+            const double fij_val = static_cast<double>(seg.fij[k]);
             qin_lw_surfaces += surfaceData.qrOut[m] * fij_val;
             double qsw = surfaceData.qsOut[m] * fij_val;
             qin_sw_surfaces += qsw;
