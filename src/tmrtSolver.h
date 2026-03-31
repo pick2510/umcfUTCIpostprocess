@@ -8,6 +8,19 @@
 
 namespace utci {
 
+enum class SurfaceSwClass {
+    Ground,
+    ElevatedDown,
+    Vertical,
+    Upward
+};
+
+struct SurfaceRadiativeData {
+    std::vector<double> qrOut;
+    std::vector<double> qsOut;
+    std::vector<SurfaceSwClass> swClass;
+};
+
 struct TmrtBreakdown {
     Eigen::VectorXd Tmrt;
     Eigen::VectorXd qlwSurfaces;
@@ -35,6 +48,7 @@ public:
 
     TmrtBreakdown computeDetailed(
         const std::vector<SurfacePatch>& surfaces,
+        const SurfaceRadiativeData& surfaceData,
         const std::vector<SurfacePatch>& sky,
         const ViewFactorResult& vf,
         const MeteoData& meteo,

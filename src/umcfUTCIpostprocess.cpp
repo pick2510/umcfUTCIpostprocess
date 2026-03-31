@@ -467,6 +467,31 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                 allSurfaces[i].qsOut = sc.allQsOut[i];
             }
 
+            SurfaceRadiativeData surfaceData;
+            surfaceData.qrOut.resize(allSurfaces.size());
+            surfaceData.qsOut.resize(allSurfaces.size());
+            surfaceData.swClass.resize(allSurfaces.size());
+            for (size_t i = 0; i < allSurfaces.size(); ++i) {
+                if (allSurfaces[i].qrOut > 0.0) {
+                    surfaceData.qrOut[i] = allSurfaces[i].qrOut;
+                } else {
+                    surfaceData.qrOut[i] = SIGMA * std::pow(allSurfaces[i].temperature, 4)
+                                         + allSurfaces[i].qr * (1.0 - EPS_SURF) / EPS_SURF;
+                }
+                surfaceData.qsOut[i] = allSurfaces[i].qsOut;
+                double areaMag = allSurfaces[i].areaVector.norm();
+                double nz = (areaMag > 0.0) ? allSurfaces[i].areaVector.z() / areaMag : 0.0;
+                if (nz < -0.7) {
+                    surfaceData.swClass[i] = (allSurfaces[i].center.z <= 2.5)
+                        ? SurfaceSwClass::Ground
+                        : SurfaceSwClass::ElevatedDown;
+                } else if (nz > 0.7) {
+                    surfaceData.swClass[i] = SurfaceSwClass::Upward;
+                } else {
+                    surfaceData.swClass[i] = SurfaceSwClass::Vertical;
+                }
+            }
+
             Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchRH = Eigen::VectorXd::Zero(bN);
@@ -510,7 +535,7 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             for (size_t bi = 0; bi < bN; ++bi) {
                 size_t pedIdx = bStart + bi;
                 TmrtBreakdown tmrtDetail = ctx.tmrtSolver.computeDetailed(
-                    allSurfaces, ctx.skyGeo, batchVF[bi], meteo, ctx.args.useSkyViewFactors
+                    allSurfaces, surfaceData, ctx.skyGeo, batchVF[bi], meteo, ctx.args.useSkyViewFactors
                 );
                 double TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
                     tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
