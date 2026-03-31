@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <unordered_map>
 
 namespace utci {
@@ -603,18 +604,21 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
     }
 
     static std::mutex interpPlanMutex;
-    static std::unordered_map<std::string, DenseInterpPlan> interpPlanCache;
+    static std::unordered_map<std::string, std::shared_ptr<const DenseInterpPlan>> interpPlanCache;
     const std::string interpKey = makePlanKey(sparsePositions, meshT.points);
-    DenseInterpPlan interpPlan;
+    std::shared_ptr<const DenseInterpPlan> interpPlan;
     {
         std::lock_guard<std::mutex> lock(interpPlanMutex);
         auto it = interpPlanCache.find(interpKey);
         if (it == interpPlanCache.end()) {
-            it = interpPlanCache.emplace(interpKey, buildDenseInterpPlan(sparsePositions, meshT.points)).first;
+            it = interpPlanCache.emplace(
+                interpKey,
+                std::make_shared<DenseInterpPlan>(buildDenseInterpPlan(sparsePositions, meshT.points))
+            ).first;
         }
         interpPlan = it->second;
     }
-    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(interpPlan, sparseTumrtAvg);
+    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtAvg);
 
     std::vector<Vec3> qrswOnAirMesh;
     if (meshQrsw.points.size() == n && itQ != meshQrsw.pointVectors.end()) {
