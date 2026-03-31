@@ -852,6 +852,7 @@ def stage2(args):
     cmd += ['--utci-method', args.utci_method]
     if args.lut_path:
         cmd += ['--lut-path', args.lut_path]
+    cmd += ['--dense-interp-clamp', args.dense_interp_clamp]
 
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
@@ -923,6 +924,9 @@ def parse_args():
                    help='UTCI calculation method: poly=165-term polynomial, lut=lookup table')
     p.add_argument('--lut-path', default='', dest='lut_path',
                    help='Path to utci_offset.Dat LUT file (default: auto-resolved near binary)')
+    p.add_argument('--dense-interp-clamp', default='none', choices=['none', 'local-range'],
+                   dest='dense_interp_clamp',
+                   help='Clamp dense interpolation output to the local 4x4 stencil range')
 
     # pedestrian grid spacing (flat and terrain)
     p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',

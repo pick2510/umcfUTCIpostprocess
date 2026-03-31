@@ -60,6 +60,7 @@ struct CommandLineArgs {
     // Optional debug outputs from the investigation phase
     bool writeDebugTerms = false;
     bool writeDebugQrswSurface = false;
+    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::None;
 };
 
 struct TimestepScalars {
@@ -211,6 +212,7 @@ void printUsage(const char* progName) {
     logInfo("  --no-compress-cache    Write uncompressed cache files");
     logInfo("  --write-debug-terms    Write TumrtAvg_terms debug output");
     logInfo("  --write-debug-qrsw     Write qrsw_surface.vtk debug output");
+    logInfo("  --dense-interp-clamp <m> Dense interpolation clamp: none (default) or local-range");
     logInfo("  -j <N>                 Number of threads (default: 1)");
     logInfo("  --help                 Show this message");
 }
@@ -280,6 +282,16 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.writeDebugTerms = true;
         } else if (arg == "--write-debug-qrsw") {
             args.writeDebugQrswSurface = true;
+        } else if (arg == "--dense-interp-clamp" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "none") {
+                args.denseInterpClamp = DenseInterpClampMode::None;
+            } else if (mode == "local-range") {
+                args.denseInterpClamp = DenseInterpClampMode::LocalRange;
+            } else {
+                logError("Unknown --dense-interp-clamp: " + mode + " (use none or local-range)");
+                std::exit(1);
+            }
         } else if (arg == "--help") {
             printUsage(argv[0]);
             exit(0);
@@ -1108,7 +1120,7 @@ int main(int argc, char* argv[]) {
                 { {"Tmrt", TmrtC}, {"UTCI", sparseResults.utci[tIdx]} });
         }
         computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, sparseResults.tumrtNoSolar[tIdx],
-                                   utciSolver, args.writeDebugQrswSurface);
+                                   utciSolver, args.writeDebugQrswSurface, args.denseInterpClamp);
 
         // Print stats
         double tMin  = sparseResults.tmrt[tIdx].minCoeff();

@@ -9,6 +9,11 @@ namespace utci {
 
 class UtciSolver;
 
+enum class DenseInterpClampMode {
+    None,
+    LocalRange
+};
+
 std::string probeKey(const Point3& p);
 
 std::string firstExistingPath(const std::vector<std::string>& paths);
@@ -22,7 +27,8 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 const std::vector<PedestrianPosition>& sparsePositions,
                                 const Eigen::VectorXd& sparseTumrtAvg,
                                 UtciSolver& utciSolver,
-                                bool debugWriteQrsw);
+                                bool debugWriteQrsw,
+                                DenseInterpClampMode clampMode);
 
 }
 

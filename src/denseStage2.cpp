@@ -42,8 +42,7 @@ struct DenseInterpPointPlan {
     bool useNearest = true;
     int nearestSparseIndex = -1;
     std::array<int, 16> stencil{};
-    double tx = 0.0;
-    double ty = 0.0;
+    std::array<double, 16> weights{};
 };
 
 struct DenseInterpPlan {
@@ -125,6 +124,15 @@ static std::string makeQrswPlanKey(const VtkMeshData& meshQrsw,
         appendPoint(oss, densePoints.back());
     }
     return oss.str();
+}
+
+static std::array<double, 4> cubicWeights1D(double t) {
+    return {
+        -0.5 * t + t * t - 0.5 * t * t * t,
+         1.0 - 2.5 * t * t + 1.5 * t * t * t,
+         0.5 * t + 2.0 * t * t - 1.5 * t * t * t,
+        -0.5 * t * t + 0.5 * t * t * t
+    };
 }
 
 static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition>& positions,
@@ -225,8 +233,16 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
         double x1 = plan.xs[ix1];
         double y0 = plan.ys[iy0];
         double y1 = plan.ys[iy1];
-        pointPlan.tx = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0;
-        pointPlan.ty = (y1 > y0) ? (y - y0) / (y1 - y0) : 0.0;
+        const double tx = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0;
+        const double ty = (y1 > y0) ? (y - y0) / (y1 - y0) : 0.0;
+        const auto wx = cubicWeights1D(tx);
+        const auto wy = cubicWeights1D(ty);
+        pos = 0;
+        for (int ry = 0; ry < 4; ++ry) {
+            for (int rx = 0; rx < 4; ++rx, ++pos) {
+                pointPlan.weights[pos] = wy[ry] * wx[rx];
+            }
+        }
         pointPlan.useNearest = false;
         plan.pointPlans[i] = pointPlan;
     }
@@ -364,7 +380,8 @@ static double interpolateSparseTumrt(const UniformGridField& field,
 }
 
 static Eigen::VectorXd interpolateSparseTumrtWithPlan(const DenseInterpPlan& plan,
-                                                      const Eigen::VectorXd& values) {
+                                                      const Eigen::VectorXd& values,
+                                                      DenseInterpClampMode clampMode) {
     Eigen::VectorXd out(plan.pointPlans.size());
     for (size_t i = 0; i < plan.pointPlans.size(); ++i) {
         const auto& pp = plan.pointPlans[i];
@@ -373,17 +390,21 @@ static Eigen::VectorXd interpolateSparseTumrtWithPlan(const DenseInterpPlan& pla
                 ? values[pp.nearestSparseIndex] : 0.0;
             continue;
         }
-        double rowVals[4];
-        for (int ry = 0; ry < 4; ++ry) {
-            const int base = ry * 4;
-            rowVals[ry] = cubicInterpolate1D(
-                values[pp.stencil[base + 0]],
-                values[pp.stencil[base + 1]],
-                values[pp.stencil[base + 2]],
-                values[pp.stencil[base + 3]],
-                pp.tx);
+        double interp = 0.0;
+        double localMin = std::numeric_limits<double>::infinity();
+        double localMax = -std::numeric_limits<double>::infinity();
+        for (int k = 0; k < 16; ++k) {
+            const double v = values[pp.stencil[k]];
+            interp += pp.weights[k] * v;
+            if (clampMode == DenseInterpClampMode::LocalRange) {
+                localMin = std::min(localMin, v);
+                localMax = std::max(localMax, v);
+            }
         }
-        out[i] = cubicInterpolate1D(rowVals[0], rowVals[1], rowVals[2], rowVals[3], pp.ty);
+        if (clampMode == DenseInterpClampMode::LocalRange) {
+            interp = std::max(localMin, std::min(localMax, interp));
+        }
+        out[i] = interp;
     }
     return out;
 }
@@ -662,7 +683,8 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 const std::vector<PedestrianPosition>& sparsePositions,
                                 const Eigen::VectorXd& sparseTumrtAvg,
                                 UtciSolver& utciSolver,
-                                bool debugWriteQrsw) {
+                                bool debugWriteQrsw,
+                                DenseInterpClampMode clampMode) {
     const std::string surfaceDir = casePath + "/postProcessing/surfaces/" + std::to_string(timestep);
     const std::string airDir = casePath + "/postProcessing/surfacesPedestrianAir/" + std::to_string(timestep);
     const std::string radDir = casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(timestep);
@@ -735,7 +757,7 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         }
         interpPlan = it->second;
     }
-    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtAvg);
+    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtAvg, clampMode);
 
     static std::mutex qrswPlanMutex;
     static std::unordered_map<std::string, std::shared_ptr<const QrswRemapPlan>> qrswPlanCache;
