@@ -283,6 +283,18 @@ static double areaWeightedAverage(const Eigen::VectorXd& values,
     return sumArea > 0.0 ? sum / sumArea : 0.0;
 }
 
+static double areaWeightedAverage(const std::array<double, 5>& values,
+                                  const std::array<Vec3, 5>& areaVectors) {
+    double sum = 0.0;
+    double sumArea = 0.0;
+    for (int i = 0; i < static_cast<int>(areaVectors.size()); ++i) {
+        const double area = areaVectors[i].norm();
+        sum += values[i] * area;
+        sumArea += area;
+    }
+    return sumArea > 0.0 ? sum / sumArea : 0.0;
+}
+
 template <typename T>
 static const std::vector<T>& selectNearestProbeRow(
         const std::vector<std::pair<double, std::vector<T>>>& rows,
@@ -408,6 +420,9 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
 
         std::vector<ViewFactorResult> batchVF(bN);
         std::atomic<size_t> vfDone{0};
+        std::atomic<long long> vfLoadNs{0};
+        std::atomic<long long> vfComputeNs{0};
+        std::atomic<long long> vfSaveNs{0};
         size_t vfInterval = std::max(size_t(1), bN / 10);
         auto vfT0 = std::chrono::steady_clock::now();
 
@@ -417,13 +432,22 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             std::string cachePath = ctx.cache.getCachePath(ctx.positions[pedIdx].originalIndex);
             bool loaded = false;
             if (!ctx.args.forceRecompute) {
+                auto tLoad0 = std::chrono::steady_clock::now();
                 loaded = ctx.cache.load(cachePath, batchVF[bi]);
+                auto tLoad1 = std::chrono::steady_clock::now();
+                vfLoadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tLoad1 - tLoad0).count();
             }
             if (!loaded) {
+                auto tCompute0 = std::chrono::steady_clock::now();
                 batchVF[bi] = ctx.vfCalc.compute(
                     ctx.positions[pedIdx], ctx.allGeo, ctx.skyGeo, ctx.args.useSkyViewFactors
                 );
+                auto tCompute1 = std::chrono::steady_clock::now();
+                vfComputeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tCompute1 - tCompute0).count();
+                auto tSave0 = std::chrono::steady_clock::now();
                 ctx.cache.save(cachePath, batchVF[bi]);
+                auto tSave1 = std::chrono::steady_clock::now();
+                vfSaveNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tSave1 - tSave0).count();
             }
             size_t cur = ++vfDone;
             if (cur % vfInterval == 0 || cur == bN) {
@@ -441,6 +465,15 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                     << " FijsumSky=" << batchVF[i].FijsumSky.transpose();
                 logDetail(out.str());
             }
+        }
+
+        {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(2)
+                << "  VF timing: load=" << (vfLoadNs.load() / 1e9) << "s"
+                << " compute=" << (vfComputeNs.load() / 1e9) << "s"
+                << " save=" << (vfSaveNs.load() / 1e9) << "s";
+            logSummary(out.str());
         }
 
         for (size_t tIdx = 0; tIdx < ctx.timesteps.size(); ++tIdx) {
@@ -534,9 +567,7 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             #pragma omp parallel for schedule(dynamic)
             for (size_t bi = 0; bi < bN; ++bi) {
                 size_t pedIdx = bStart + bi;
-                TmrtBreakdown tmrtDetail = ctx.tmrtSolver.computeDetailed(
-                    allSurfaces, surfaceData, ctx.skyGeo, batchVF[bi], meteo, ctx.args.useSkyViewFactors
-                );
+                TmrtBreakdown tmrtDetail = ctx.tmrtSolver.computeDetailed(surfaceData, batchVF[bi], meteo);
                 double TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
                     tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
                 );
@@ -834,16 +865,27 @@ int main(int argc, char* argv[]) {
     std::vector<TimestepScalars> tsData(timesteps.size());
     std::vector<Point3> pedCenters(positions.size());
     for (size_t i = 0; i < positions.size(); ++i) pedCenters[i] = positions[i].center;
+    const int preloadThreads = std::max(1, std::min({args.nThreads > 0 ? args.nThreads : 1,
+                                                     6,
+                                                     static_cast<int>(timesteps.size())}));
+    #pragma omp parallel for schedule(dynamic) num_threads(preloadThreads)
     for (size_t tIdx = 0; tIdx < timesteps.size(); ++tIdx) {
         int t = timesteps[tIdx];
         std::string surfDir = args.casePath + "/postProcessing/surfaces/" + std::to_string(t);
         std::string radDir = args.casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(t);
-        tsData[tIdx].wallTemps = loadScalarField(surfDir + "/T_wallSurfaces.raw");
-        tsData[tIdx].vegTemps  = loadScalarField(surfDir + "/T_vegSurfaces.raw");
-        tsData[tIdx].vegQr     = loadScalarField(surfDir + "/qr_vegSurfaces.raw");
+        auto timedLoadScalarField = [&](const std::string& path, double& secs) {
+            auto t0 = std::chrono::steady_clock::now();
+            auto values = loadScalarField(path);
+            secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            return values;
+        };
+        double tWallSecs = 0.0, tVegSecs = 0.0, qrVegSecs = 0.0, qrOutSecs = 0.0, qsOutSecs = 0.0;
+        tsData[tIdx].wallTemps = timedLoadScalarField(surfDir + "/T_wallSurfaces.raw", tWallSecs);
+        tsData[tIdx].vegTemps  = timedLoadScalarField(surfDir + "/T_vegSurfaces.raw", tVegSecs);
+        tsData[tIdx].vegQr     = timedLoadScalarField(surfDir + "/qr_vegSurfaces.raw", qrVegSecs);
         // combined outgoing LW radiation (reference format, replaces T+qr)
-        tsData[tIdx].allQrOut  = loadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw");
-        tsData[tIdx].allQsOut  = loadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw");
+        tsData[tIdx].allQrOut  = timedLoadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw", qrOutSecs);
+        tsData[tIdx].allQsOut  = timedLoadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw", qsOutSecs);
         const std::string qrswPath = firstExistingPath({
             surfDir + "/qrsw_pedestrian.vtk",
             radDir + "/qrsw_pedestrian.vtk"
@@ -855,8 +897,18 @@ int main(int argc, char* argv[]) {
             }
         }
         if (tsData[tIdx].wallTemps.empty() && tsData[tIdx].allQrOut.empty()) {
+            #pragma omp critical
             logWarn("no wall temps or qrOut for t=" + std::to_string(t));
         }
+        std::ostringstream out;
+        out << "t=" << t
+            << " T_wall count=" << tsData[tIdx].wallTemps.size() << " time=" << std::fixed << std::setprecision(3) << tWallSecs << "s"
+            << " T_veg count=" << tsData[tIdx].vegTemps.size() << " time=" << tVegSecs << "s"
+            << " qr_veg count=" << tsData[tIdx].vegQr.size() << " time=" << qrVegSecs << "s"
+            << " qrOut count=" << tsData[tIdx].allQrOut.size() << " time=" << qrOutSecs << "s"
+            << " qsOut count=" << tsData[tIdx].allQsOut.size() << " time=" << qsOutSecs << "s";
+        #pragma omp critical
+        logDetail(out.str());
     }
     logInfo("Scalars loaded.");
 
