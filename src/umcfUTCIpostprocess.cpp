@@ -339,6 +339,36 @@ static double areaWeightedAverage(const std::array<double, 5>& values,
     return sumArea > 0.0 ? sum / sumArea : 0.0;
 }
 
+static void removeIfExists(const std::string& path) {
+    if (std::ifstream(path).good()) {
+        std::remove(path.c_str());
+    }
+}
+
+static void cleanStage2Outputs(const std::string& outDir,
+                               bool writeDebugTerms,
+                               bool writeDebugQrswSurface) {
+    static const std::vector<std::string> baseFiles = {
+        "Tmrt_pedestrian.vtk",
+        "TumrtAvg",
+        "RH_pedestrian.vtk",
+        "UTCI.vtk",
+        "Tumrt_surface.vtk",
+        "Tmrt_surface.vtk",
+        "RH_surface.vtk",
+        "UTCI_surface.vtk"
+    };
+    for (const auto& name : baseFiles) {
+        removeIfExists(outDir + "/" + name);
+    }
+    if (writeDebugTerms) {
+        removeIfExists(outDir + "/TumrtAvg_terms");
+    }
+    if (writeDebugQrswSurface) {
+        removeIfExists(outDir + "/qrsw_surface.vtk");
+    }
+}
+
 template <typename T>
 static const std::vector<T>& selectNearestProbeRow(
         const std::vector<std::pair<double, std::vector<T>>>& rows,
@@ -520,9 +550,14 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             logSummary(out.str());
         }
 
-        const int timestepThreads = std::max(1, std::min({ctx.args.nThreads > 0 ? ctx.args.nThreads : 1,
-                                                          8,
-                                                          static_cast<int>(ctx.timesteps.size())}));
+        const int timestepThreads = std::max(
+            1,
+            std::min(
+                (!ctx.args.forceRecompute && ctx.args.nThreads > 0) ? ctx.args.nThreads
+                                                                    : std::min(ctx.args.nThreads > 0 ? ctx.args.nThreads : 1, 8),
+                static_cast<int>(ctx.timesteps.size())
+            )
+        );
         #pragma omp parallel for schedule(dynamic) num_threads(timestepThreads)
         for (size_t tIdx = 0; tIdx < ctx.timesteps.size(); ++tIdx) {
             int t = ctx.timesteps[tIdx];
@@ -987,6 +1022,7 @@ int main(int argc, char* argv[]) {
             if (!createDirectory(outDir)) {
                 logWarn("could not create " + outDir + ": " + std::strerror(errno));
             }
+            cleanStage2Outputs(outDir, args.writeDebugTerms, args.writeDebugQrswSurface);
         }
     }
 

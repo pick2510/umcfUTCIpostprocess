@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <unordered_map>
 
 namespace utci {
@@ -35,11 +37,157 @@ struct UniformGridField {
     bool valid = false;
 };
 
+struct DenseInterpPointPlan {
+    bool useNearest = true;
+    int nearestSparseIndex = -1;
+    std::array<int, 16> stencil{};
+    double tx = 0.0;
+    double ty = 0.0;
+};
+
+struct DenseInterpPlan {
+    std::vector<double> xs;
+    std::vector<double> ys;
+    std::unordered_map<long long, int> sparseIndexByCell;
+    std::vector<DenseInterpPointPlan> pointPlans;
+    bool valid = false;
+};
+
 static constexpr double DENSE_INTERP_BBOX_INSET = 1.0;
 
 static long long gridKey(int ix, int iy) {
     return (static_cast<long long>(ix) << 32) ^
            static_cast<unsigned int>(iy);
+}
+
+static std::string makePlanKey(const std::vector<PedestrianPosition>& sparsePositions,
+                               const std::vector<Point3>& densePoints) {
+    auto appendPoint = [](std::ostringstream& oss, const Point3& p) {
+        oss << std::fixed << std::setprecision(4)
+            << p.x << "," << p.y << "," << p.z;
+    };
+    std::ostringstream oss;
+    oss << sparsePositions.size() << "|";
+    if (!sparsePositions.empty()) {
+        appendPoint(oss, sparsePositions.front().center);
+        oss << "|";
+        appendPoint(oss, sparsePositions.back().center);
+    }
+    oss << "|" << densePoints.size() << "|";
+    if (!densePoints.empty()) {
+        appendPoint(oss, densePoints.front());
+        oss << "|";
+        appendPoint(oss, densePoints.back());
+    }
+    return oss.str();
+}
+
+static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition>& positions,
+                                            const std::vector<Point3>& densePoints) {
+    DenseInterpPlan plan;
+    plan.xs.reserve(positions.size());
+    plan.ys.reserve(positions.size());
+    for (const auto& p : positions) {
+        plan.xs.push_back(p.center.x);
+        plan.ys.push_back(p.center.y);
+    }
+    auto dedupe = [](std::vector<double>& coords) {
+        std::sort(coords.begin(), coords.end());
+        coords.erase(std::unique(coords.begin(), coords.end(),
+            [](double a, double b) { return std::abs(a - b) < 1e-4; }),
+            coords.end());
+    };
+    dedupe(plan.xs);
+    dedupe(plan.ys);
+    if (plan.xs.size() < 2 || plan.ys.size() < 2) return plan;
+
+    for (size_t i = 0; i < positions.size(); ++i) {
+        auto xit = std::lower_bound(plan.xs.begin(), plan.xs.end(), positions[i].center.x - 1e-4);
+        auto yit = std::lower_bound(plan.ys.begin(), plan.ys.end(), positions[i].center.y - 1e-4);
+        if (xit == plan.xs.end() || yit == plan.ys.end()) continue;
+        int ix = static_cast<int>(xit - plan.xs.begin());
+        int iy = static_cast<int>(yit - plan.ys.begin());
+        plan.sparseIndexByCell[gridKey(ix, iy)] = static_cast<int>(i);
+    }
+
+    plan.pointPlans.resize(densePoints.size());
+    for (size_t i = 0; i < densePoints.size(); ++i) {
+        const double x = densePoints[i].x;
+        const double y = densePoints[i].y;
+        DenseInterpPointPlan pointPlan;
+
+        double bestD2 = std::numeric_limits<double>::infinity();
+        for (size_t j = 0; j < positions.size(); ++j) {
+            double dx = positions[j].center.x - x;
+            double dy = positions[j].center.y - y;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                pointPlan.nearestSparseIndex = static_cast<int>(j);
+            }
+        }
+
+        if (x < plan.xs.front() || x > plan.xs.back() || y < plan.ys.front() || y > plan.ys.back() ||
+            x < plan.xs.front() + DENSE_INTERP_BBOX_INSET || x > plan.xs.back() - DENSE_INTERP_BBOX_INSET ||
+            y < plan.ys.front() + DENSE_INTERP_BBOX_INSET || y > plan.ys.back() - DENSE_INTERP_BBOX_INSET) {
+            plan.pointPlans[i] = pointPlan;
+            continue;
+        }
+
+        auto xhi = std::lower_bound(plan.xs.begin(), plan.xs.end(), x);
+        auto yhi = std::lower_bound(plan.ys.begin(), plan.ys.end(), y);
+        if (xhi == plan.xs.begin() || yhi == plan.ys.begin() ||
+            xhi == plan.xs.end() || yhi == plan.ys.end()) {
+            plan.pointPlans[i] = pointPlan;
+            continue;
+        }
+
+        int ix1 = static_cast<int>(xhi - plan.xs.begin());
+        int iy1 = static_cast<int>(yhi - plan.ys.begin());
+        int ix0 = ix1 - 1;
+        int iy0 = iy1 - 1;
+        int ixm1 = ix0 - 1;
+        int ix2 = ix1 + 1;
+        int iym1 = iy0 - 1;
+        int iy2 = iy1 + 1;
+        if (ixm1 < 0 || iym1 < 0 ||
+            ix2 >= static_cast<int>(plan.xs.size()) ||
+            iy2 >= static_cast<int>(plan.ys.size())) {
+            plan.pointPlans[i] = pointPlan;
+            continue;
+        }
+
+        const int yIdx[4] = {iym1, iy0, iy1, iy2};
+        const int xIdx[4] = {ixm1, ix0, ix1, ix2};
+        bool stencilOk = true;
+        int pos = 0;
+        for (int ry = 0; ry < 4 && stencilOk; ++ry) {
+            for (int rx = 0; rx < 4; ++rx, ++pos) {
+                auto it = plan.sparseIndexByCell.find(gridKey(xIdx[rx], yIdx[ry]));
+                if (it == plan.sparseIndexByCell.end()) {
+                    stencilOk = false;
+                    break;
+                }
+                pointPlan.stencil[pos] = it->second;
+            }
+        }
+        if (!stencilOk) {
+            plan.pointPlans[i] = pointPlan;
+            continue;
+        }
+
+        double x0 = plan.xs[ix0];
+        double x1 = plan.xs[ix1];
+        double y0 = plan.ys[iy0];
+        double y1 = plan.ys[iy1];
+        pointPlan.tx = (x1 > x0) ? (x - x0) / (x1 - x0) : 0.0;
+        pointPlan.ty = (y1 > y0) ? (y - y0) / (y1 - y0) : 0.0;
+        pointPlan.useNearest = false;
+        plan.pointPlans[i] = pointPlan;
+    }
+
+    plan.valid = true;
+    return plan;
 }
 
 static UniformGridField buildUniformGridField(const std::vector<PedestrianPosition>& positions,
@@ -168,6 +316,31 @@ static double interpolateSparseTumrt(const UniformGridField& field,
         rowVals[ry] = cubicInterpolate1D(samples[0], samples[1], samples[2], samples[3], tx);
     }
     return cubicInterpolate1D(rowVals[0], rowVals[1], rowVals[2], rowVals[3], ty);
+}
+
+static Eigen::VectorXd interpolateSparseTumrtWithPlan(const DenseInterpPlan& plan,
+                                                      const Eigen::VectorXd& values) {
+    Eigen::VectorXd out(plan.pointPlans.size());
+    for (size_t i = 0; i < plan.pointPlans.size(); ++i) {
+        const auto& pp = plan.pointPlans[i];
+        if (pp.useNearest) {
+            out[i] = (pp.nearestSparseIndex >= 0 && pp.nearestSparseIndex < values.size())
+                ? values[pp.nearestSparseIndex] : 0.0;
+            continue;
+        }
+        double rowVals[4];
+        for (int ry = 0; ry < 4; ++ry) {
+            const int base = ry * 4;
+            rowVals[ry] = cubicInterpolate1D(
+                values[pp.stencil[base + 0]],
+                values[pp.stencil[base + 1]],
+                values[pp.stencil[base + 2]],
+                values[pp.stencil[base + 3]],
+                pp.tx);
+        }
+        out[i] = cubicInterpolate1D(rowVals[0], rowVals[1], rowVals[2], rowVals[3], pp.ty);
+    }
+    return out;
 }
 
 static Eigen::VectorXd vectorMagnitudes(const std::vector<Vec3>& vecs) {
@@ -429,14 +602,19 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         return false;
     }
 
-    const auto sparseField = buildUniformGridField(sparsePositions, sparseTumrtAvg);
-    Eigen::VectorXd denseTumrtAvg = Eigen::VectorXd::Zero(n);
-    for (size_t i = 0; i < n; ++i) {
-        denseTumrtAvg[i] = interpolateSparseTumrt(
-            sparseField, sparsePositions, sparseTumrtAvg,
-            meshT.points[i].x, meshT.points[i].y
-        );
+    static std::mutex interpPlanMutex;
+    static std::unordered_map<std::string, DenseInterpPlan> interpPlanCache;
+    const std::string interpKey = makePlanKey(sparsePositions, meshT.points);
+    DenseInterpPlan interpPlan;
+    {
+        std::lock_guard<std::mutex> lock(interpPlanMutex);
+        auto it = interpPlanCache.find(interpKey);
+        if (it == interpPlanCache.end()) {
+            it = interpPlanCache.emplace(interpKey, buildDenseInterpPlan(sparsePositions, meshT.points)).first;
+        }
+        interpPlan = it->second;
     }
+    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(interpPlan, sparseTumrtAvg);
 
     std::vector<Vec3> qrswOnAirMesh;
     if (meshQrsw.points.size() == n && itQ != meshQrsw.pointVectors.end()) {
