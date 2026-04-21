@@ -32,7 +32,14 @@ Description
 
 \*---------------------------------------------------------------------------*/
 
-#include "fvCFD.H"
+#include "argList.H"
+#include "timeSelector.H"
+#include "Time.H"
+#include "fvMesh.H"
+#include "volFields.H"
+#include "surfaceFields.H"
+
+using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -43,12 +50,25 @@ int main(int argc, char *argv[])
     #include "setRootCase.H"
     #include "createTime.H"
     instantList timeDirs = timeSelector::select0(runTime, args);
-    #include "createNamedMesh.H"
+    const word regionName =
+        args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    Info<< "Create mesh " << regionName << " for time = "
+        << runTime.name() << nl << endl;
+    fvMesh mesh
+    (
+        IOobject
+        (
+            regionName,
+            runTime.name(),
+            runTime,
+            IOobject::MUST_READ
+        )
+    );
 
     forAll(timeDirs, timeI)
     {
         runTime.setTime(timeDirs[timeI], timeI);
-        Info<< "Time = " << runTime.timeName() << endl;
+        Info<< "Time = " << runTime.name() << endl;
         mesh.readUpdate();
 
         volVectorField Sf
@@ -56,7 +76,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "Sf",
-                runTime.timeName(),
+                runTime.name(),
                 mesh
             ),
             mesh,

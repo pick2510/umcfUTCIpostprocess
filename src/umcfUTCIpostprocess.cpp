@@ -60,7 +60,9 @@ struct CommandLineArgs {
     // Optional debug outputs from the investigation phase
     bool writeDebugTerms = false;
     bool writeDebugQrswSurface = false;
-    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::None;
+    DenseTumrtInterpMode denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+    int denseTumrtSmoothPasses = 0;
+    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::LocalRange;
 };
 
 struct TimestepScalars {
@@ -212,6 +214,8 @@ void printUsage(const char* progName) {
     logInfo("  --no-compress-cache    Write uncompressed cache files");
     logInfo("  --write-debug-terms    Write TumrtAvg_terms debug output");
     logInfo("  --write-debug-qrsw     Write qrsw_surface.vtk debug output");
+    logInfo("  --dense-tumrt-interp <m> Dense Tumrt interpolation: cubic (default) or idw");
+    logInfo("  --dense-tumrt-smooth-passes <N> Smooth sparse Tumrt before dense interpolation (default 0)");
     logInfo("  --dense-interp-clamp <m> Dense interpolation clamp: none (default) or local-range");
     logInfo("  -j <N>                 Number of threads (default: 1)");
     logInfo("  --help                 Show this message");
@@ -282,6 +286,22 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.writeDebugTerms = true;
         } else if (arg == "--write-debug-qrsw") {
             args.writeDebugQrswSurface = true;
+        } else if (arg == "--dense-tumrt-interp" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "cubic") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+            } else if (mode == "idw") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Idw;
+            } else {
+                logError("Unknown --dense-tumrt-interp: " + mode + " (use cubic or idw)");
+                std::exit(1);
+            }
+        } else if (arg == "--dense-tumrt-smooth-passes" && i + 1 < argc) {
+            args.denseTumrtSmoothPasses = parseIntArg(arg, argv[++i]);
+            if (args.denseTumrtSmoothPasses < 0) {
+                logError("--dense-tumrt-smooth-passes must be >= 0");
+                std::exit(1);
+            }
         } else if (arg == "--dense-interp-clamp" && i + 1 < argc) {
             const std::string mode = argv[++i];
             if (mode == "none") {
@@ -842,7 +862,12 @@ int main(int argc, char* argv[]) {
     // =========================================================
     // Load STL geometry for ray occlusion
     // =========================================================
-    std::string wallTreeStl = args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl";
+    std::string wallTreeStl = firstExistingPath({
+        args.casePath + "/constant/triSurface/wallAndTreesurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl",
+        args.casePath + "/constant/triSurface/walls.stl"
+    });
     Raycaster raycaster;
     raycaster.setNumThreads(args.nThreads);
     logInfo("Loading STL geometry...");
@@ -850,6 +875,7 @@ int main(int argc, char* argv[]) {
         logError("could not load " + wallTreeStl);
         return 1;
     }
+    raycaster.loadVegetation(args.casePath + "/constant/triSurface/air_to_vegetation.stl");
 
     // =========================================================
     // Load surface geometry ONCE (from first timestep)
@@ -1120,7 +1146,8 @@ int main(int argc, char* argv[]) {
                 { {"Tmrt", TmrtC}, {"UTCI", sparseResults.utci[tIdx]} });
         }
         computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, sparseResults.tumrtNoSolar[tIdx],
-                                   utciSolver, args.writeDebugQrswSurface, args.denseInterpClamp);
+                                   utciSolver, args.writeDebugQrswSurface, args.denseTumrtInterp,
+                                   args.denseTumrtSmoothPasses, args.denseInterpClamp);
 
         // Print stats
         double tMin  = sparseResults.tmrt[tIdx].minCoeff();

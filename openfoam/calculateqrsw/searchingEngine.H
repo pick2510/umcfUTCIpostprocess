@@ -38,8 +38,6 @@ forAll(qrb, patchI)
 
 //globalIndex globalNumbering(nCoarseFaces);
 
-Random rndGen(653213);
-
 // Determine mesh bounding boxes:
 List<treeBoundBox> meshBb
 (
@@ -67,7 +65,7 @@ labelHashSet includePatches;
 forAll(patches, patchI)
 {
     const polyPatch& pp = patches[patchI];
-    if (!pp.coupled() && !isA<cyclicAMIPolyPatch>(pp))
+    if (!pp.coupled())
     {
         includePatches.insert(patchI);
     }
@@ -99,4 +97,3 @@ distributedTriSurfaceMesh surfacesMesh
 triSurfaceToAgglom.resize(surfacesMesh.size());
 
 surfacesMesh.setField(triSurfaceToAgglom);
-
