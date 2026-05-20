@@ -550,6 +550,10 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
 
     auto totalT0 = std::chrono::steady_clock::now();
 
+    std::vector<SurfaceRadiativeData> surfDataPerTs(nT);
+    for (size_t tIdx = 0; tIdx < nT; ++tIdx)
+        surfDataPerTs[tIdx] = buildSurfaceRadiativeData(ctx, ctx.tsData[tIdx]);
+
     for (size_t batchIdx = 0; batchIdx < nBatches; ++batchIdx) {
         size_t bStart = batchIdx * batchSz;
         size_t bEnd   = std::min(bStart + batchSz, nPos);
@@ -636,7 +640,7 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             int t = ctx.timesteps[tIdx];
             const auto& sc = ctx.tsData[tIdx];
             const MeteoData& meteo = ctx.meteoData[tIdx];
-            SurfaceRadiativeData surfaceData = buildSurfaceRadiativeData(ctx, sc);
+            const SurfaceRadiativeData& surfaceData = surfDataPerTs[tIdx];
 
             Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);

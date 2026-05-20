@@ -105,8 +105,8 @@ ViewFactorResult ViewFactorCalculator::compute(
     const double R2 = R_MAG_MAX * R_MAG_MAX;
     Vec3 pedCenter = ped.center.toVec3();
 
-    std::vector<int> nearSurf;
-    nearSurf.reserve(4096);
+    static thread_local std::vector<int> nearSurf;
+    nearSurf.clear();
     for (int m = 0; m < nSurf; ++m) {
         if (surfaces[m].area < 1e-10) continue;
         double dx = pedCenter.x() - surfaces[m].center.x;
@@ -117,9 +117,9 @@ ViewFactorResult ViewFactorCalculator::compute(
     }
 
     // Sky patches have no range limit (sky dome can be far away) — include all valid ones
-    std::vector<int> nearSky;
+    static thread_local std::vector<int> nearSky;
+    nearSky.clear();
     if (useSky && nSky > 0) {
-        nearSky.reserve(nSky);
         for (int m = 0; m < nSky; ++m) {
             if (sky[m].area >= 1e-10)
                 nearSky.push_back(m);

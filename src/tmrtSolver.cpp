@@ -155,6 +155,10 @@ TmrtBreakdown TmrtSolver::computeDetailed(
             qin_sw_surfaces /= total_vf;
             qin_lw_sky /= total_vf;
             qin_sw_sky /= total_vf;
+            out.qswGround[n]       /= total_vf;
+            out.qswElevatedDown[n] /= total_vf;
+            out.qswUpward[n]       /= total_vf;
+            out.qswVertical[n]     /= total_vf;
         }
         out.qlwSurfaces[n] = qin_lw_surfaces;
         out.qlwSky[n] = qin_lw_sky;
