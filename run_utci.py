@@ -234,7 +234,7 @@ def _stl_bbox(stl_path, padding=0.0):
             b[2] - padding, b[3] + padding)
 
 
-def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
+def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None, fill_radius=-1.0):
     """
     Build a regular dx/dy grid of pedestrian positions from a surface VTK.
 
@@ -318,19 +318,23 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
         gx_c = np.round(centers[:, 0] / dx) * dx
         gy_c = np.round(centers[:, 1] / dy) * dy
         occ_xy = np.unique(np.column_stack([gx_c, gy_c]), axis=0)
-        # NN-fill: add empty dx/dy cells within fill_radius of any occupied bin.
-        # fill_radius adapts to the coarsest mesh region (2× 95th-pct NN gap).
-        if _HAVE_SCIPY and len(occ_xy) > 1:
+        # NN-fill: add empty dx/dy cells within the fill radius of any occupied bin.
+        #   fill_radius <  0 → adaptive: 2× 95th-pct NN gap among occupied bins
+        #   fill_radius == 0 → disabled (return occupied bins only)
+        #   fill_radius >  0 → explicit radius [m]
+        if fill_radius != 0.0 and _HAVE_SCIPY and len(occ_xy) > 1:
             occ_tree = _cKDTree(occ_xy)
-            d_occ, _ = occ_tree.query(occ_xy, k=2)  # k=2: skip self (d[:,0]==0)
-            fill_radius = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0,
-                              max(dx, dy) * 2)
+            if fill_radius < 0:
+                d_occ, _ = occ_tree.query(occ_xy, k=2)
+                r = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0, max(dx, dy) * 2)
+            else:
+                r = fill_radius
             gxg, gyg = np.meshgrid(xs, ys)
             all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
             d_all, _ = occ_tree.query(all_xy)
             positions = sorted(
                 (float(x), float(y), z)
-                for (x, y), d in zip(all_xy, d_all) if d <= fill_radius
+                for (x, y), d in zip(all_xy, d_all) if d <= r
             )
         else:
             positions = sorted({(float(x), float(y), z) for x, y in zip(gx_c, gy_c)})
@@ -363,17 +367,21 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
         gxg, gyg = np.meshgrid(xs, ys)
         all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
 
-        # NN-fill: add empty dx/dy cells within fill_radius of any occupied bin.
-        # fill_radius adapts to the coarsest mesh region (2× 95th-pct NN gap).
-        if _HAVE_SCIPY and len(occ_xy) > 1:
+        # NN-fill: add empty dx/dy cells within the fill radius of any occupied bin.
+        #   fill_radius <  0 → adaptive: 2× 95th-pct NN gap among occupied bins
+        #   fill_radius == 0 → disabled (return occupied bins only)
+        #   fill_radius >  0 → explicit radius [m]
+        if fill_radius != 0.0 and _HAVE_SCIPY and len(occ_xy) > 1:
             occ_tree = _cKDTree(occ_xy)
-            d_occ, _ = occ_tree.query(occ_xy, k=2)
-            fill_radius = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0,
-                              max(dx, dy) * 2)
+            if fill_radius < 0:
+                d_occ, _ = occ_tree.query(occ_xy, k=2)
+                r = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0, max(dx, dy) * 2)
+            else:
+                r = fill_radius
             d_all, nn_idx = occ_tree.query(all_xy)
             positions = sorted(
                 (float(x), float(y), float(occ_z[i]) + z_offset)
-                for (x, y), d, i in zip(all_xy, d_all, nn_idx) if d <= fill_radius
+                for (x, y), d, i in zip(all_xy, d_all, nn_idx) if d <= r
             )
         else:
             positions = sorted(
@@ -706,7 +714,8 @@ def _stage0_generate_positions(args):
         if r.returncode != 0 or vtk_path is None:
             return None, 'flat'
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=0.0, bbox=bbox), 'flat'
+                                 z_offset=0.0, bbox=bbox,
+                                 fill_radius=args.ped_grid_fill_radius), 'flat'
 
     # ── forced terrain ───────────────────────────────────────────────────────
     if args.mode == 'terrain':
@@ -719,7 +728,8 @@ def _stage0_generate_positions(args):
         if r.returncode != 0 or vtk_path is None:
             return None, 'terrain'
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=PED_Z, bbox=bbox), 'terrain'
+                                 z_offset=PED_Z, bbox=bbox,
+                                 fill_radius=args.ped_grid_fill_radius), 'terrain'
 
     # ── auto-detect (default) ─────────────────────────────────────────────────
     # Step 1: always try flat (cuttingPlane at PED_Z) first
@@ -735,7 +745,8 @@ def _stage0_generate_positions(args):
     # Step 2: inspect result
     if not _detect_terrain(vtk_path, bbox=bbox):
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=0.0, bbox=bbox), 'flat'
+                                 z_offset=0.0, bbox=bbox,
+                                 fill_radius=args.ped_grid_fill_radius), 'flat'
 
     # Step 3: re-run as terrain
     print('  Auto-detected terrain domain (z-spread > 0.5 m, low flat-plane coverage, '
@@ -750,7 +761,8 @@ def _stage0_generate_positions(args):
     if r.returncode != 0 or vtk_path is None:
         return None, 'terrain'
     return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                             z_offset=PED_Z, bbox=bbox), 'terrain'
+                             z_offset=PED_Z, bbox=bbox,
+                             fill_radius=args.ped_grid_fill_radius), 'terrain'
 
 
 def stage0(args):
@@ -1281,6 +1293,12 @@ def parse_args():
                    help='Pedestrian grid x-spacing [m]')
     p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
                    help='Pedestrian grid y-spacing [m]')
+    p.add_argument('--ped-grid-fill-radius', type=float, default=-1.0,
+                   dest='ped_grid_fill_radius', metavar='M',
+                   help='NN-fill radius for coarse-mesh gaps [m]: '
+                        '-1=adaptive (2× 95th-pct NN gap, default), '
+                        '0=disable (occupied bins only), '
+                        '>0=explicit radius')
     p.add_argument('--bbox-padding', type=float, default=None, dest='bbox_padding',
                    metavar='M',
                    help='Clip probe grid to STL bounding box + M m padding. '
