@@ -15,8 +15,8 @@
 namespace utci {
 
 // Cache version tags
-static constexpr int VERSION_PLAIN      = 11;
-static constexpr int VERSION_COMPRESSED = 12;
+static constexpr int VERSION_PLAIN      = 13;
+static constexpr int VERSION_COMPRESSED = 14;
 
 bool createDirectory(const std::string& path) {
     // Create all intermediate directories (like mkdir -p)

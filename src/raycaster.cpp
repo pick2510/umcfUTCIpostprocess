@@ -180,14 +180,15 @@ struct GridMesh {
         double inv = 1.0/len;
         double d[3] = {dir[0]*inv, dir[1]*inv, dir[2]*inv};
 
-        // Trim each ray to the 3%..97% segment to avoid self-intersection.
-        double startOffset = len * 0.03;
+        // Trim ray ends to avoid self-intersection. Cap at 1 m absolute so that
+        // long sky rays (5000 m) don't skip nearby buildings (3% of 5000 m = 150 m).
+        double offset = std::min(len * 0.03, 1.0);
         double s[3] = {
-            p1[0] + d[0] * startOffset,
-            p1[1] + d[1] * startOffset,
-            p1[2] + d[2] * startOffset
+            p1[0] + d[0] * offset,
+            p1[1] + d[1] * offset,
+            p1[2] + d[2] * offset
         };
-        double tmax = len * 0.94;
+        double tmax = len - offset;
         if (tmax <= 0) return false;
 
         // Starting grid cell
