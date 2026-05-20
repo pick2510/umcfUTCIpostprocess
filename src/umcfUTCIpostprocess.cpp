@@ -383,22 +383,6 @@ static std::vector<SurfacePatch> concat(const std::vector<SurfacePatch>& a,
     return out;
 }
 
-static double medianPositiveSpacing(std::vector<double> vals) {
-    if (vals.size() < 2) return 0.0;
-    std::sort(vals.begin(), vals.end());
-    vals.erase(std::unique(vals.begin(), vals.end(),
-                           [](double a, double b) { return std::abs(a - b) < 1e-6; }),
-               vals.end());
-    std::vector<double> diffs;
-    diffs.reserve(vals.size());
-    for (size_t i = 1; i < vals.size(); ++i) {
-        double d = vals[i] - vals[i - 1];
-        if (d > 1e-6) diffs.push_back(d);
-    }
-    if (diffs.empty()) return 0.0;
-    std::sort(diffs.begin(), diffs.end());
-    return diffs[diffs.size() / 2];
-}
 
 
 static double areaWeightedAverage(const Eigen::VectorXd& values,
