@@ -315,9 +315,25 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
         mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
                 (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
         centers = centers[mask]
-        gx = np.round(centers[:, 0] / dx) * dx
-        gy = np.round(centers[:, 1] / dy) * dy
-        positions = sorted({(float(x), float(y), z) for x, y in zip(gx, gy)})
+        gx_c = np.round(centers[:, 0] / dx) * dx
+        gy_c = np.round(centers[:, 1] / dy) * dy
+        occ_xy = np.unique(np.column_stack([gx_c, gy_c]), axis=0)
+        # NN-fill: add empty dx/dy cells within fill_radius of any occupied bin.
+        # fill_radius adapts to the coarsest mesh region (2× 95th-pct NN gap).
+        if _HAVE_SCIPY and len(occ_xy) > 1:
+            occ_tree = _cKDTree(occ_xy)
+            d_occ, _ = occ_tree.query(occ_xy, k=2)  # k=2: skip self (d[:,0]==0)
+            fill_radius = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0,
+                              max(dx, dy) * 2)
+            gxg, gyg = np.meshgrid(xs, ys)
+            all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
+            d_all, _ = occ_tree.query(all_xy)
+            positions = sorted(
+                (float(x), float(y), z)
+                for (x, y), d in zip(all_xy, d_all) if d <= fill_radius
+            )
+        else:
+            positions = sorted({(float(x), float(y), z) for x, y in zip(gx_c, gy_c)})
         return positions
 
     else:
@@ -347,20 +363,23 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
         gxg, gyg = np.meshgrid(xs, ys)
         all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
 
-        # NN-fill: each grid cell gets the Z of its nearest occupied bin
-        if _HAVE_SCIPY and len(occ_xy) > 0:
-            _, nn_idx = _cKDTree(occ_xy).query(all_xy)
-            all_z = occ_z[nn_idx]
+        # NN-fill: add empty dx/dy cells within fill_radius of any occupied bin.
+        # fill_radius adapts to the coarsest mesh region (2× 95th-pct NN gap).
+        if _HAVE_SCIPY and len(occ_xy) > 1:
+            occ_tree = _cKDTree(occ_xy)
+            d_occ, _ = occ_tree.query(occ_xy, k=2)
+            fill_radius = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0,
+                              max(dx, dy) * 2)
+            d_all, nn_idx = occ_tree.query(all_xy)
+            positions = sorted(
+                (float(x), float(y), float(occ_z[i]) + z_offset)
+                for (x, y), d, i in zip(all_xy, d_all, nn_idx) if d <= fill_radius
+            )
         else:
-            return sorted(
+            positions = sorted(
                 (x, y, float(np.median(zs)) + z_offset)
                 for (x, y), zs in bins.items()
             )
-
-        positions = sorted(
-            (float(x), float(y), float(z) + z_offset)
-            for (x, y), z in zip(all_xy, all_z)
-        )
         return positions
 
 
