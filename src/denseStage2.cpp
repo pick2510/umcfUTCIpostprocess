@@ -1061,7 +1061,7 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         double T4 = std::pow(denseTumrtAvg[i], 4)
                   + (fp * ABS_SW_PERSON * qrswNorm[i]) / (EPS_LW_PERSON * SIGMA);
         denseTmrt[i] = std::pow(std::max(0.0, T4), 0.25);
-        if (denseTumrtAvg[i] < 1.0) denseTmrt[i] = 0.0;
+        if (!std::isfinite(denseTumrtAvg[i]) || denseTumrtAvg[i] < 1.0) denseTmrt[i] = 0.0;
     }
 
     Eigen::VectorXd denseRH = Eigen::VectorXd::Zero(n);

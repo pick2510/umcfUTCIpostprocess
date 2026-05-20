@@ -17,45 +17,6 @@ double computeSkyTemperature(double Ta, double cc) {
     return std::pow(Tsky_pow6 + Tsky_pow4 * cc * ec, 0.25);
 }
 
-Eigen::VectorXd TmrtSolver::compute(
-    const std::vector<SurfacePatch>& surfaces,
-    const std::vector<SurfacePatch>& sky,
-    const ViewFactorResult& vf,
-    const MeteoData& meteo,
-    bool useSkyViewFactors)
-{
-    SurfaceRadiativeData surfaceData;
-    surfaceData.qrOut.resize(surfaces.size());
-    surfaceData.qsOut.resize(surfaces.size());
-    surfaceData.swClass.resize(surfaces.size());
-    for (size_t i = 0; i < surfaces.size(); ++i) {
-        if (surfaces[i].qrOut > 0.0) {
-            surfaceData.qrOut[i] = surfaces[i].qrOut;
-        } else {
-            surfaceData.qrOut[i] = SIGMA * std::pow(surfaces[i].temperature, 4)
-                                 + surfaces[i].qr * (1.0 - EPS_SURF) / EPS_SURF;
-        }
-        surfaceData.qsOut[i] = surfaces[i].qsOut;
-        double areaMag = surfaces[i].areaVector.norm();
-        double nz = (areaMag > 0.0) ? surfaces[i].areaVector.z() / areaMag : 0.0;
-        if (nz < -0.7) {
-            surfaceData.swClass[i] = (surfaces[i].center.z <= 2.5)
-                ? SurfaceSwClass::Ground
-                : SurfaceSwClass::ElevatedDown;
-        } else if (nz > 0.7) {
-            surfaceData.swClass[i] = SurfaceSwClass::Upward;
-        } else {
-            surfaceData.swClass[i] = SurfaceSwClass::Vertical;
-        }
-    }
-    std::array<double, 5> detail = computeFast(surfaceData, vf, meteo);
-    Eigen::VectorXd tmrt(5);
-    for (int i = 0; i < 5; ++i) tmrt[i] = detail[i];
-    (void)surfaces;
-    (void)sky;
-    (void)useSkyViewFactors;
-    return tmrt;
-}
 
 std::array<double, 5> TmrtSolver::computeFast(
     const SurfaceRadiativeData& surfaceData,

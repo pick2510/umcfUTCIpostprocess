@@ -38,14 +38,6 @@ public:
     TmrtSolver();
     ~TmrtSolver();
     
-    Eigen::VectorXd compute(
-        const std::vector<SurfacePatch>& surfaces,
-        const std::vector<SurfacePatch>& sky,
-        const ViewFactorResult& vf,
-        const MeteoData& meteo,
-        bool useSkyViewFactors
-    );
-
     TmrtBreakdown computeDetailed(
         const SurfaceRadiativeData& surfaceData,
         const ViewFactorResult& vf,

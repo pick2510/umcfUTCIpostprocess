@@ -312,10 +312,13 @@ int main(int argc, char *argv[])
         
         // sunPosVector i
         vector n2 = sunPosVector_y[lo]*(1-hi_fraction) + sunPosVector_y[hi]*(hi_fraction);
-        n2 /= mag(n2);
+        const scalar n2mag = mag(n2);
+        // Guard against zero sun vector at sunrise/sunset before normalising;
+        // without this, mag(n2)==0 triggers SIGFPE under FOAM_SIGFPE.
+        if (n2mag > SMALL) n2 /= n2mag;
 
         // only if sun is above the horizon
-        if ( (n2 & ez) > 0)
+        if (n2mag > SMALL && (n2 & ez) > 0)
         {
 
             DynamicField<point> startListCells(nMeshCells);
@@ -351,7 +354,7 @@ int main(int argc, char *argv[])
         runTime++;
 
         
-        Info << "Solar ray direction " << lo*(1-hi_fraction)+hi*(hi_fraction)
+        Info << "Solar ray direction " << n2
              << ", It took " ;
         printf("%.3f", (std::clock()-tstartStep) / static_cast<double>(CLOCKS_PER_SEC));
         //printf("%.3f", (std::clock()-tstartStep) / (double)CLOCKS_PER_SEC);
