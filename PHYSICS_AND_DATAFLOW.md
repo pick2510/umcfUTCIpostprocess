@@ -56,7 +56,7 @@ FijSky = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)   (no distance cap)
 FijsumSky = Σ FijSky
 ```
 
-Ray occlusion is tested per patch centre; a patch is either fully visible or fully blocked. Large boundary patches produce coarser shadow boundaries than the angular mode.
+Ray occlusion is tested per patch centre; a patch is either fully visible or fully blocked. Large boundary patches produce coarser shadow boundaries than the angular mode. Use `--sky-method angular` for geometrically accurate per-direction sky visibility.
 
 *Angular mode* (`--sky-method angular`): The upper hemisphere is discretised into `N_az × N_el` directional bins (default 48 × 12 = 576). For each bin direction **d** and body segment *n*:
 

@@ -1134,11 +1134,6 @@ def stage2(args):
         cmd += ['--sky-azimuth-samples', str(args.sky_azimuth_samples)]
         cmd += ['--sky-elevation-samples', str(args.sky_elevation_samples)]
         cmd += ['--sky-ray-length', str(args.sky_ray_length)]
-    if args.sky_subdivide_top > 1:
-        cmd += ['--sky-subdivide-top', str(args.sky_subdivide_top)]
-    if args.sky_subdivide_keep_original:
-        cmd.append('--sky-subdivide-keep-original')
-
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -1226,12 +1221,6 @@ def parse_args():
     p.add_argument('--dense-tumrt-smooth-passes', default=0, type=int,
                    dest='dense_tumrt_smooth_passes',
                    help='Smooth sparse Tumrt before dense interpolation; 0 disables smoothing')
-    p.add_argument('--sky-subdivide-top', default=1, type=int, dest='sky_subdivide_top',
-                   help='Virtually subdivide upward-facing sky patches into NxN subpatches in Stage 2')
-    p.add_argument('--sky-subdivide-keep-original', action='store_true',
-                   dest='sky_subdivide_keep_original',
-                   help='Keep original top sky patches in addition to the subdivided sky patches')
-
     # pedestrian grid spacing (flat and terrain)
     p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',
                    help='Pedestrian grid x-spacing [m]')

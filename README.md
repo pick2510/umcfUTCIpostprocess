@@ -82,7 +82,6 @@ Use `--stages` to run a subset, e.g. `--stages 2 3`.
 | `--sky-azimuth-samples N` | `48` | Angular sky: number of azimuth bins |
 | `--sky-elevation-samples N` | `12` | Angular sky: number of elevation bins |
 | `--sky-ray-length M` | `5000.0` | Angular sky: ray length [m] |
-| `--sky-subdivide-top N` | `1` | Virtually subdivide top sky patch into N×N sub-patches (patch sky only) |
 | `--bbox-padding M` | *(none)* | Clip probe grid to STL bounding box + M m padding |
 | `--vegetation` / `--no-vegetation` | `--vegetation` | Use `vegetation` or `air` region for radiation fields |
 | `--force-recompute` | off | Recompute view factors even if cache exists |

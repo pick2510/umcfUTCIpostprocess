@@ -64,8 +64,6 @@ struct CommandLineArgs {
     int skyAzimuthSamples = 48;
     int skyElevationSamples = 12;
     double skyRayLength = 5000.0;
-    int skySubdivideTop = 1;
-    bool skySubdivideKeepOriginal = false;
     DenseTumrtInterpMode denseTumrtInterp = DenseTumrtInterpMode::Cubic;
     int denseTumrtSmoothPasses = 0;
     DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::LocalRange;
@@ -224,8 +222,6 @@ void printUsage(const char* progName) {
     logInfo("  --sky-azimuth-samples <N> Angular sky azimuth bins (default 48)");
     logInfo("  --sky-elevation-samples <N> Angular sky elevation bins (default 12)");
     logInfo("  --sky-ray-length <m>   Angular sky ray length in metres (default 5000)");
-    logInfo("  --sky-subdivide-top <N> Virtually subdivide upward-facing sky patches into NxN subpatches");
-    logInfo("  --sky-subdivide-keep-original Keep original top sky patches in addition to the subdivided ones");
     logInfo("  --dense-tumrt-interp <m> Dense Tumrt interpolation: cubic (default) or idw");
     logInfo("  --dense-tumrt-smooth-passes <N> Smooth sparse Tumrt before dense interpolation (default 0)");
     logInfo("  --dense-interp-clamp <m> Dense interpolation clamp: none (default) or local-range");
@@ -326,14 +322,6 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
                 logError("--sky-ray-length must be > 0");
                 std::exit(1);
             }
-        } else if (arg == "--sky-subdivide-top" && i + 1 < argc) {
-            args.skySubdivideTop = parseIntArg(arg, argv[++i]);
-            if (args.skySubdivideTop < 1) {
-                logError("--sky-subdivide-top must be >= 1");
-                std::exit(1);
-            }
-        } else if (arg == "--sky-subdivide-keep-original") {
-            args.skySubdivideKeepOriginal = true;
         } else if (arg == "--dense-tumrt-interp" && i + 1 < argc) {
             const std::string mode = argv[++i];
             if (mode == "cubic") {
@@ -412,68 +400,6 @@ static double medianPositiveSpacing(std::vector<double> vals) {
     return diffs[diffs.size() / 2];
 }
 
-static std::vector<SurfacePatch> subdivideTopSkyPatches(const std::vector<SurfacePatch>& skyGeo,
-                                                        int factor,
-                                                        bool keepOriginal) {
-    if (factor <= 1 || skyGeo.empty()) return skyGeo;
-
-    std::vector<double> topXs;
-    std::vector<double> topYs;
-    topXs.reserve(skyGeo.size());
-    topYs.reserve(skyGeo.size());
-    for (const auto& patch : skyGeo) {
-        const double areaMag = patch.areaVector.norm();
-        if (areaMag <= 1e-12) continue;
-        const double nz = patch.areaVector.z() / areaMag;
-        if (std::abs(nz) > 0.9) {
-            topXs.push_back(patch.center.x);
-            topYs.push_back(patch.center.y);
-        }
-    }
-
-    const double dxMed = medianPositiveSpacing(topXs);
-    const double dyMed = medianPositiveSpacing(topYs);
-    if (dxMed <= 0.0 || dyMed <= 0.0) return skyGeo;
-
-    std::vector<SurfacePatch> out;
-    const size_t multiplier = keepOriginal ? static_cast<size_t>(factor * factor + 1)
-                                           : static_cast<size_t>(factor * factor);
-    out.reserve(skyGeo.size() * std::max<size_t>(1, multiplier));
-
-    const double baseArea = dxMed * dyMed;
-    const double invNN = 1.0 / static_cast<double>(factor * factor);
-    for (const auto& patch : skyGeo) {
-        const double areaMag = patch.areaVector.norm();
-        if (areaMag <= 1e-12) {
-            out.push_back(patch);
-            continue;
-        }
-
-        const double nz = patch.areaVector.z() / areaMag;
-        if (std::abs(nz) <= 0.9) {
-            out.push_back(patch);
-            continue;
-        }
-
-        if (keepOriginal) out.push_back(patch);
-
-        const double scale = (baseArea > 0.0) ? std::sqrt(patch.area / baseArea) : 1.0;
-        const double dx = dxMed * scale;
-        const double dy = dyMed * scale;
-        for (int iy = 0; iy < factor; ++iy) {
-            for (int ix = 0; ix < factor; ++ix) {
-                SurfacePatch sub = patch;
-                sub.center.x += ((static_cast<double>(ix) + 0.5) / factor - 0.5) * dx;
-                sub.center.y += ((static_cast<double>(iy) + 0.5) / factor - 0.5) * dy;
-                sub.areaVector *= invNN;
-                sub.area *= invNN;
-                out.push_back(sub);
-            }
-        }
-    }
-
-    return out;
-}
 
 static double areaWeightedAverage(const Eigen::VectorXd& values,
                                   const std::array<Vec3, 5>& areaVectors) {
@@ -1065,21 +991,7 @@ int main(int argc, char* argv[]) {
             logDetail(out.str());
         } else {
             skyGeo = loadSurfacePatches(firstSurfDir + "/Sf_skySurfaces.raw");
-            if (args.skySubdivideTop > 1) {
-                const size_t before = skyGeo.size();
-                skyGeo = subdivideTopSkyPatches(
-                    skyGeo, args.skySubdivideTop, args.skySubdivideKeepOriginal
-                );
-                std::ostringstream out;
-                out << "Sky surfaces:  " << before
-                    << " -> " << skyGeo.size()
-                    << " (top " << args.skySubdivideTop << "x" << args.skySubdivideTop
-                    << (args.skySubdivideKeepOriginal ? ", kept originals" : ", replaced originals")
-                    << ")";
-                logDetail(out.str());
-            } else {
-                logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
-            }
+            logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
         }
     }
 
@@ -1239,9 +1151,6 @@ int main(int argc, char* argv[]) {
         tag << "_skyAngular"
             << args.skyAzimuthSamples << "x" << args.skyElevationSamples
             << "_L" << static_cast<long long>(std::llround(args.skyRayLength));
-    } else if (args.skySubdivideTop > 1) {
-        tag << "_skyTopSub" << args.skySubdivideTop;
-        if (args.skySubdivideKeepOriginal) tag << "_keep";
     }
     cache.setVariantTag(tag.str());
     if (args.compressCache && !BinaryCache::compressionAvailable()) {
