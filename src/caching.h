@@ -15,6 +15,8 @@ public:
     
     void setBaseDir(const std::string& dir) { baseDir_ = dir; }
     const std::string& getBaseDir() const { return baseDir_; }
+    void setVariantTag(const std::string& tag) { variantTag_ = tag; }
+    const std::string& getVariantTag() const { return variantTag_; }
 
     // Enable/disable gzip compression for newly written cache files.
     // Has no effect if the binary was built without ZLIB support.
@@ -27,10 +29,11 @@ public:
     bool load(const std::string& path, ViewFactorResult& result);
     bool save(const std::string& path, const ViewFactorResult& result);
 
-    std::string getCachePath(int pedIndex) const;
+    std::string getCachePath(int pedIndex, const Point3& center) const;
 
 private:
     std::string baseDir_;
+    std::string variantTag_;
     bool compressed_ = false;
 };
 

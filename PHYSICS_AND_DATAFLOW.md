@@ -47,16 +47,26 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 - Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
 - Cache format: version 11 (plain binary) or version 12 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
 
-**Sky view factors** (explicit geometry):
+**Sky view factors — two modes:**
 
-Sky patches (`Sf_skySurfaces.raw`) are treated as a separate geometry set. The same differential formula applies, but with `enforceRangeLimit = false` so sky patches can be arbitrarily far away:
+*Patch mode* (`--sky-method patch`, default): Sky patches (`Sf_skySurfaces.raw`) are treated as a separate geometry set. The same differential formula applies, but with `enforceRangeLimit = false` so sky patches can be arbitrarily far away:
 
 ```
 FijSky = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)   (no distance cap)
 FijsumSky = Σ FijSky
 ```
 
-Ray occlusion is tested for sky rays with the same BVH but without the `R_MAG_MAX` cutoff.
+Ray occlusion is tested per patch centre; a patch is either fully visible or fully blocked. Large boundary patches produce coarser shadow boundaries than the angular mode.
+
+*Angular mode* (`--sky-method angular`): The upper hemisphere is discretised into `N_az × N_el` directional bins (default 48 × 12 = 576). For each bin direction **d** and body segment *n*:
+
+```
+FijsumSky[n] += max(nᵢ · d, 0) × w_s / π
+
+  w_s  = solid-angle weight of bin s (uniform in azimuth, sin-weighted in elevation)
+```
+
+Each direction is tested independently against the STL BVH with a ray of length `skyRayLength` (default 5000 m). Unblocked bins contribute their weighted cos(θ) factor; blocked bins contribute zero. This gives per-direction sky visibility and sharp, geometrically accurate shadow boundaries.
 
 ### 3. Outgoing Surface Radiation
 
@@ -277,7 +287,8 @@ For the **LUT method**, RH is used directly as a table axis; no Pa conversion is
 │                                                                     │
 │  Load once:                                                         │
 │    allGeo     ← Sf_wallAndTreeSurfaces.raw  (~329 k patch faces)    │
-│    skyGeo     ← Sf_skySurfaces.raw          (5 boundary patches)    │
+│    skyGeo     ← Sf_skySurfaces.raw  (patch mode, boundary patches)  │
+│               OR  N_az×N_el hemisphere dirs  (angular mode)         │
 │    STL BVH    ← wallAndTreeSurfaces.stl      (ray occlusion)        │
 │    meteo[t]   ← Tambient, cc, Idif, Idn, sunDir, va                 │
 │    probeT/U/w/qrsw ← per-position rows; probe points matched to     │

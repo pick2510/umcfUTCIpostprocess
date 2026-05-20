@@ -6,6 +6,7 @@
 #include "utciSolver.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -43,6 +44,7 @@ struct DenseInterpPointPlan {
     int nearestSparseIndex = -1;
     std::array<int, 16> stencil{};
     std::array<double, 16> weights{};
+    int weightCount = 0;
 };
 
 struct DenseInterpPlan {
@@ -51,6 +53,13 @@ struct DenseInterpPlan {
     std::unordered_map<long long, int> sparseIndexByCell;
     std::vector<DenseInterpPointPlan> pointPlans;
     bool valid = false;
+};
+
+struct DenseInterpDiagnostics {
+    size_t totalPoints = 0;
+    size_t nearestCount = 0;
+    std::array<size_t, 4> bandPointCounts{{0, 0, 0, 0}};
+    std::array<size_t, 4> bandNearestCounts{{0, 0, 0, 0}};
 };
 
 enum class QrswRemapMode {
@@ -66,20 +75,97 @@ struct QrswRemapPlan {
 };
 
 static constexpr double DENSE_INTERP_BBOX_INSET = 1.0;
+static constexpr int IDW_NEIGHBORS = 12;
+static constexpr int IDW_MAX_RADIUS = 16;
 
 static long long gridKey(int ix, int iy) {
     return (static_cast<long long>(ix) << 32) ^
            static_cast<unsigned int>(iy);
 }
 
+static Eigen::VectorXd smoothSparseGridValues(const std::vector<PedestrianPosition>& positions,
+                                              const Eigen::VectorXd& values,
+                                              int passes) {
+    if (passes <= 0 || positions.empty() ||
+        values.size() != static_cast<int>(positions.size())) {
+        return values;
+    }
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(positions.size());
+    ys.reserve(positions.size());
+    for (const auto& p : positions) {
+        xs.push_back(p.center.x);
+        ys.push_back(p.center.y);
+    }
+    auto dedupe = [](std::vector<double>& coords) {
+        std::sort(coords.begin(), coords.end());
+        coords.erase(std::unique(coords.begin(), coords.end(),
+            [](double a, double b) { return std::abs(a - b) < 1e-4; }),
+            coords.end());
+    };
+    dedupe(xs);
+    dedupe(ys);
+    if (xs.size() < 2 || ys.size() < 2) return values;
+
+    std::unordered_map<long long, int> sparseIndexByCell;
+    sparseIndexByCell.reserve(positions.size());
+    for (size_t i = 0; i < positions.size(); ++i) {
+        auto xit = std::lower_bound(xs.begin(), xs.end(), positions[i].center.x - 1e-4);
+        auto yit = std::lower_bound(ys.begin(), ys.end(), positions[i].center.y - 1e-4);
+        if (xit == xs.end() || yit == ys.end()) continue;
+        const int ix = static_cast<int>(xit - xs.begin());
+        const int iy = static_cast<int>(yit - ys.begin());
+        sparseIndexByCell[gridKey(ix, iy)] = static_cast<int>(i);
+    }
+
+    Eigen::VectorXd current = values;
+    Eigen::VectorXd next = values;
+    const std::array<std::array<int, 3>, 3> weights{{
+        {{1, 2, 1}},
+        {{2, 4, 2}},
+        {{1, 2, 1}}
+    }};
+
+    for (int pass = 0; pass < passes; ++pass) {
+        for (size_t i = 0; i < positions.size(); ++i) {
+            auto xit = std::lower_bound(xs.begin(), xs.end(), positions[i].center.x - 1e-4);
+            auto yit = std::lower_bound(ys.begin(), ys.end(), positions[i].center.y - 1e-4);
+            if (xit == xs.end() || yit == ys.end()) {
+                next[static_cast<int>(i)] = current[static_cast<int>(i)];
+                continue;
+            }
+            const int ix = static_cast<int>(xit - xs.begin());
+            const int iy = static_cast<int>(yit - ys.begin());
+            double sum = 0.0;
+            double wsum = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    auto it = sparseIndexByCell.find(gridKey(ix + dx, iy + dy));
+                    if (it == sparseIndexByCell.end()) continue;
+                    const int wi = weights[dy + 1][dx + 1];
+                    sum += static_cast<double>(wi) * current[it->second];
+                    wsum += static_cast<double>(wi);
+                }
+            }
+            next[static_cast<int>(i)] = (wsum > 0.0) ? sum / wsum : current[static_cast<int>(i)];
+        }
+        current.swap(next);
+    }
+
+    return current;
+}
+
 static std::string makePlanKey(const std::vector<PedestrianPosition>& sparsePositions,
-                               const std::vector<Point3>& densePoints) {
+                               const std::vector<Point3>& densePoints,
+                               DenseTumrtInterpMode interpMode) {
     auto appendPoint = [](std::ostringstream& oss, const Point3& p) {
         oss << std::fixed << std::setprecision(4)
             << p.x << "," << p.y << "," << p.z;
     };
     std::ostringstream oss;
-    oss << sparsePositions.size() << "|";
+    oss << static_cast<int>(interpMode) << "|" << sparsePositions.size() << "|";
     if (!sparsePositions.empty()) {
         appendPoint(oss, sparsePositions.front().center);
         oss << "|";
@@ -135,8 +221,114 @@ static std::array<double, 4> cubicWeights1D(double t) {
     };
 }
 
+static bool fillIdwPlan(const std::vector<PedestrianPosition>& positions,
+                        const DenseInterpPlan& plan,
+                        const Point3& densePoint,
+                        DenseInterpPointPlan& pointPlan) {
+    struct Candidate {
+        int index = -1;
+        double d2 = std::numeric_limits<double>::infinity();
+    };
+
+    if (plan.xs.empty() || plan.ys.empty()) return false;
+
+    auto xhi = std::lower_bound(plan.xs.begin(), plan.xs.end(), densePoint.x);
+    auto yhi = std::lower_bound(plan.ys.begin(), plan.ys.end(), densePoint.y);
+    int ix = static_cast<int>(xhi - plan.xs.begin());
+    int iy = static_cast<int>(yhi - plan.ys.begin());
+    if (ix >= static_cast<int>(plan.xs.size())) ix = static_cast<int>(plan.xs.size()) - 1;
+    if (iy >= static_cast<int>(plan.ys.size())) iy = static_cast<int>(plan.ys.size()) - 1;
+    if (ix < 0 || iy < 0) return false;
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(IDW_NEIGHBORS * 2);
+    for (int radius = 0; radius <= IDW_MAX_RADIUS; ++radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                if (radius > 0 && std::max(std::abs(dx), std::abs(dy)) != radius) continue;
+                const int cx = ix + dx;
+                const int cy = iy + dy;
+                if (cx < 0 || cy < 0 ||
+                    cx >= static_cast<int>(plan.xs.size()) ||
+                    cy >= static_cast<int>(plan.ys.size())) {
+                    continue;
+                }
+                auto it = plan.sparseIndexByCell.find(gridKey(cx, cy));
+                if (it == plan.sparseIndexByCell.end()) continue;
+                const int si = it->second;
+                const double ddx = positions[si].center.x - densePoint.x;
+                const double ddy = positions[si].center.y - densePoint.y;
+                candidates.push_back({si, ddx * ddx + ddy * ddy});
+            }
+        }
+        if (static_cast<int>(candidates.size()) >= IDW_NEIGHBORS) break;
+    }
+
+    if (candidates.empty()) return false;
+    std::sort(candidates.begin(), candidates.end(),
+        [](const Candidate& a, const Candidate& b) { return a.d2 < b.d2; });
+
+    if (candidates.front().d2 < 1e-12) {
+        pointPlan.useNearest = false;
+        pointPlan.weightCount = 1;
+        pointPlan.stencil[0] = candidates.front().index;
+        pointPlan.weights[0] = 1.0;
+        return true;
+    }
+
+    const int n = std::min(IDW_NEIGHBORS, static_cast<int>(candidates.size()));
+    double weightSum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        pointPlan.stencil[i] = candidates[i].index;
+        pointPlan.weights[i] = 1.0 / std::max(candidates[i].d2, 1e-12);
+        weightSum += pointPlan.weights[i];
+    }
+    if (weightSum <= 0.0) return false;
+    for (int i = 0; i < n; ++i) pointPlan.weights[i] /= weightSum;
+    pointPlan.useNearest = false;
+    pointPlan.weightCount = n;
+    return true;
+}
+
+static void fillNearestPlans(const std::vector<PedestrianPosition>& positions,
+                             const std::vector<Point3>& densePoints,
+                             DenseInterpPlan& plan) {
+    plan.pointPlans.resize(densePoints.size());
+    for (size_t i = 0; i < densePoints.size(); ++i) {
+        DenseInterpPointPlan pointPlan;
+        double bestD2 = std::numeric_limits<double>::infinity();
+        for (size_t j = 0; j < positions.size(); ++j) {
+            const double dx = positions[j].center.x - densePoints[i].x;
+            const double dy = positions[j].center.y - densePoints[i].y;
+            const double d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                pointPlan.nearestSparseIndex = static_cast<int>(j);
+            }
+        }
+        plan.pointPlans[i] = pointPlan;
+    }
+    plan.valid = !positions.empty();
+}
+
+static void setNearestSparseIndex(const std::vector<PedestrianPosition>& positions,
+                                  const Point3& densePoint,
+                                  DenseInterpPointPlan& pointPlan) {
+    double bestD2 = std::numeric_limits<double>::infinity();
+    for (size_t j = 0; j < positions.size(); ++j) {
+        const double dx = positions[j].center.x - densePoint.x;
+        const double dy = positions[j].center.y - densePoint.y;
+        const double d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            pointPlan.nearestSparseIndex = static_cast<int>(j);
+        }
+    }
+}
+
 static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition>& positions,
-                                            const std::vector<Point3>& densePoints) {
+                                            const std::vector<Point3>& densePoints,
+                                            DenseTumrtInterpMode interpMode) {
     DenseInterpPlan plan;
     plan.xs.reserve(positions.size());
     plan.ys.reserve(positions.size());
@@ -152,7 +344,10 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
     };
     dedupe(plan.xs);
     dedupe(plan.ys);
-    if (plan.xs.size() < 2 || plan.ys.size() < 2) return plan;
+    if (plan.xs.size() < 2 || plan.ys.size() < 2) {
+        fillNearestPlans(positions, densePoints, plan);
+        return plan;
+    }
 
     for (size_t i = 0; i < positions.size(); ++i) {
         auto xit = std::lower_bound(plan.xs.begin(), plan.xs.end(), positions[i].center.x - 1e-4);
@@ -168,22 +363,22 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
         const double x = densePoints[i].x;
         const double y = densePoints[i].y;
         DenseInterpPointPlan pointPlan;
+        auto useNearestFallback = [&]() {
+            setNearestSparseIndex(positions, densePoints[i], pointPlan);
+            plan.pointPlans[i] = pointPlan;
+        };
 
-        double bestD2 = std::numeric_limits<double>::infinity();
-        for (size_t j = 0; j < positions.size(); ++j) {
-            double dx = positions[j].center.x - x;
-            double dy = positions[j].center.y - y;
-            double d2 = dx * dx + dy * dy;
-            if (d2 < bestD2) {
-                bestD2 = d2;
-                pointPlan.nearestSparseIndex = static_cast<int>(j);
+        if (interpMode == DenseTumrtInterpMode::Idw) {
+            if (fillIdwPlan(positions, plan, densePoints[i], pointPlan)) {
+                plan.pointPlans[i] = pointPlan;
+                continue;
             }
         }
 
         if (x < plan.xs.front() || x > plan.xs.back() || y < plan.ys.front() || y > plan.ys.back() ||
             x < plan.xs.front() + DENSE_INTERP_BBOX_INSET || x > plan.xs.back() - DENSE_INTERP_BBOX_INSET ||
             y < plan.ys.front() + DENSE_INTERP_BBOX_INSET || y > plan.ys.back() - DENSE_INTERP_BBOX_INSET) {
-            plan.pointPlans[i] = pointPlan;
+            useNearestFallback();
             continue;
         }
 
@@ -191,7 +386,7 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
         auto yhi = std::lower_bound(plan.ys.begin(), plan.ys.end(), y);
         if (xhi == plan.xs.begin() || yhi == plan.ys.begin() ||
             xhi == plan.xs.end() || yhi == plan.ys.end()) {
-            plan.pointPlans[i] = pointPlan;
+            useNearestFallback();
             continue;
         }
 
@@ -206,7 +401,7 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
         if (ixm1 < 0 || iym1 < 0 ||
             ix2 >= static_cast<int>(plan.xs.size()) ||
             iy2 >= static_cast<int>(plan.ys.size())) {
-            plan.pointPlans[i] = pointPlan;
+            useNearestFallback();
             continue;
         }
 
@@ -225,7 +420,7 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
             }
         }
         if (!stencilOk) {
-            plan.pointPlans[i] = pointPlan;
+            useNearestFallback();
             continue;
         }
 
@@ -244,11 +439,40 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
             }
         }
         pointPlan.useNearest = false;
+        pointPlan.weightCount = 16;
         plan.pointPlans[i] = pointPlan;
     }
 
     plan.valid = true;
     return plan;
+}
+
+static DenseInterpDiagnostics summarizeDenseInterpPlan(const DenseInterpPlan& plan,
+                                                       const std::vector<Point3>& densePoints) {
+    DenseInterpDiagnostics diag;
+    diag.totalPoints = std::min(plan.pointPlans.size(), densePoints.size());
+    if (diag.totalPoints == 0) return diag;
+
+    double minX = densePoints.front().x;
+    double maxX = densePoints.front().x;
+    for (size_t i = 1; i < diag.totalPoints; ++i) {
+        minX = std::min(minX, densePoints[i].x);
+        maxX = std::max(maxX, densePoints[i].x);
+    }
+    const double dx = std::max(1e-9, maxX - minX);
+
+    for (size_t i = 0; i < diag.totalPoints; ++i) {
+        double t = (densePoints[i].x - minX) / dx;
+        int band = static_cast<int>(std::floor(t * 4.0));
+        band = std::max(0, std::min(3, band));
+        diag.bandPointCounts[band] += 1;
+        if (plan.pointPlans[i].useNearest) {
+            diag.nearestCount += 1;
+            diag.bandNearestCounts[band] += 1;
+        }
+    }
+
+    return diag;
 }
 
 static UniformGridField buildUniformGridField(const std::vector<PedestrianPosition>& positions,
@@ -393,7 +617,8 @@ static Eigen::VectorXd interpolateSparseTumrtWithPlan(const DenseInterpPlan& pla
         double interp = 0.0;
         double localMin = std::numeric_limits<double>::infinity();
         double localMax = -std::numeric_limits<double>::infinity();
-        for (int k = 0; k < 16; ++k) {
+        const int weightCount = pp.weightCount > 0 ? pp.weightCount : 16;
+        for (int k = 0; k < weightCount; ++k) {
             const double v = values[pp.stencil[k]];
             interp += pp.weights[k] * v;
             if (clampMode == DenseInterpClampMode::LocalRange) {
@@ -684,25 +909,31 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 const Eigen::VectorXd& sparseTumrtAvg,
                                 UtciSolver& utciSolver,
                                 bool debugWriteQrsw,
+                                DenseTumrtInterpMode interpMode,
+                                int smoothPasses,
                                 DenseInterpClampMode clampMode) {
     const std::string surfaceDir = casePath + "/postProcessing/surfaces/" + std::to_string(timestep);
     const std::string airDir = casePath + "/postProcessing/surfacesPedestrianAir/" + std::to_string(timestep);
     const std::string radDir = casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(timestep);
     const std::string meshPath = firstExistingPathImpl({
         surfaceDir + "/T_pedestrian.vtk",
-        airDir + "/T_pedestrian.vtk"
+        airDir + "/T_pedestrian.vtk",
+        airDir + "/pedestrian.vtk"
     });
     const std::string qrswPath = firstExistingPathImpl({
         surfaceDir + "/qrsw_pedestrian.vtk",
-        radDir + "/qrsw_pedestrian.vtk"
+        radDir + "/qrsw_pedestrian.vtk",
+        radDir + "/pedestrian.vtk"
     });
     const std::string uPath = firstExistingPathImpl({
         surfaceDir + "/U_pedestrian.vtk",
-        airDir + "/U_pedestrian.vtk"
+        airDir + "/U_pedestrian.vtk",
+        airDir + "/pedestrian.vtk"
     });
     const std::string wPath = firstExistingPathImpl({
         surfaceDir + "/w_pedestrian.vtk",
-        airDir + "/w_pedestrian.vtk"
+        airDir + "/w_pedestrian.vtk",
+        airDir + "/pedestrian.vtk"
     });
 
     VtkMeshData meshT, meshQrsw, meshU, meshW;
@@ -744,7 +975,7 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
 
     static std::mutex interpPlanMutex;
     static std::unordered_map<std::string, std::shared_ptr<const DenseInterpPlan>> interpPlanCache;
-    const std::string interpKey = makePlanKey(sparsePositions, meshT.points);
+    const std::string interpKey = makePlanKey(sparsePositions, meshT.points, interpMode);
     std::shared_ptr<const DenseInterpPlan> interpPlan;
     {
         std::lock_guard<std::mutex> lock(interpPlanMutex);
@@ -752,12 +983,39 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         if (it == interpPlanCache.end()) {
             it = interpPlanCache.emplace(
                 interpKey,
-                std::make_shared<DenseInterpPlan>(buildDenseInterpPlan(sparsePositions, meshT.points))
+                std::make_shared<DenseInterpPlan>(buildDenseInterpPlan(sparsePositions, meshT.points, interpMode))
             ).first;
         }
         interpPlan = it->second;
     }
-    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtAvg, clampMode);
+    const DenseInterpDiagnostics interpDiag = summarizeDenseInterpPlan(*interpPlan, meshT.points);
+    if (interpDiag.totalPoints > 0) {
+        auto fmtPct = [](size_t num, size_t den) {
+            if (den == 0) return 0.0;
+            return 100.0 * static_cast<double>(num) / static_cast<double>(den);
+        };
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1)
+            << "Dense interp fallback t=" << timestep
+            << ": nearest=" << interpDiag.nearestCount << "/" << interpDiag.totalPoints
+            << " (" << fmtPct(interpDiag.nearestCount, interpDiag.totalPoints) << "%)"
+            << " x-bands"
+            << " [0-25]=" << interpDiag.bandNearestCounts[0] << "/" << interpDiag.bandPointCounts[0]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[0], interpDiag.bandPointCounts[0]) << "%)"
+            << ", [25-50]=" << interpDiag.bandNearestCounts[1] << "/" << interpDiag.bandPointCounts[1]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[1], interpDiag.bandPointCounts[1]) << "%)"
+            << ", [50-75]=" << interpDiag.bandNearestCounts[2] << "/" << interpDiag.bandPointCounts[2]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[2], interpDiag.bandPointCounts[2]) << "%)"
+            << ", [75-100]=" << interpDiag.bandNearestCounts[3] << "/" << interpDiag.bandPointCounts[3]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[3], interpDiag.bandPointCounts[3]) << "%)";
+        logInfo(oss.str());
+    }
+    const Eigen::VectorXd sparseTumrtForDense =
+        smoothSparseGridValues(sparsePositions, sparseTumrtAvg, smoothPasses);
+    if (smoothPasses > 0) {
+        logInfo("  Dense Tumrt sparse-grid smoothing: " + std::to_string(smoothPasses) + " pass(es)");
+    }
+    Eigen::VectorXd denseTumrtAvg = interpolateSparseTumrtWithPlan(*interpPlan, sparseTumrtForDense, clampMode);
 
     static std::mutex qrswPlanMutex;
     static std::unordered_map<std::string, std::shared_ptr<const QrswRemapPlan>> qrswPlanCache;

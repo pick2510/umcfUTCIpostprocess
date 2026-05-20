@@ -14,6 +14,11 @@ enum class DenseInterpClampMode {
     LocalRange
 };
 
+enum class DenseTumrtInterpMode {
+    Cubic,
+    Idw
+};
+
 std::string probeKey(const Point3& p);
 
 std::string firstExistingPath(const std::vector<std::string>& paths);
@@ -28,6 +33,8 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 const Eigen::VectorXd& sparseTumrtAvg,
                                 UtciSolver& utciSolver,
                                 bool debugWriteQrsw,
+                                DenseTumrtInterpMode interpMode,
+                                int smoothPasses,
                                 DenseInterpClampMode clampMode);
 
 }

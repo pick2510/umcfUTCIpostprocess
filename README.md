@@ -22,7 +22,9 @@ For physics equations and internal dataflow see [PHYSICS_AND_DATAFLOW.md](PHYSIC
   - numpy, scipy, pyvista, vtk, matplotlib, joblib, tqdm, pandas
 
 **OpenFOAM** (must be sourced in environment)
+- Supported versions: **OpenFOAM-8** and **OpenFOAM-12**
 - Utilities compiled from `openfoam/` on first Stage 1 run: `calculateqrsw`, `calcSf`, `calcWallRadOut`
+- `run_utci.py` auto-detects the case's OF version from `constant/<region>/thermophysicalTransport` (OF-12) or the `FoamFile.object` field in `momentumTransport` (OF-8) and aborts with a clear error if the sourced environment does not match
 
 ---
 
@@ -76,10 +78,17 @@ Use `--stages` to run a subset, e.g. `--stages 2 3`.
 | `--lut-path FILE` | *(auto)* | Path to `utci_offset.Dat`; default: next to binary |
 | `--wall-patches NAME …` | `buildings roofs street ground` | OpenFOAM patch names for wall/roof surfaces |
 | `--sky-patches NAME …` | `west east north south top` | OpenFOAM patch names for sky boundaries |
+| `--sky-method` | `patch` | Sky treatment: `patch` (OF boundary patches) or `angular` (hemisphere ray sampling) |
+| `--sky-azimuth-samples N` | `48` | Angular sky: number of azimuth bins |
+| `--sky-elevation-samples N` | `12` | Angular sky: number of elevation bins |
+| `--sky-ray-length M` | `5000.0` | Angular sky: ray length [m] |
+| `--sky-subdivide-top N` | `1` | Virtually subdivide top sky patch into N×N sub-patches (patch sky only) |
 | `--bbox-padding M` | *(none)* | Clip probe grid to STL bounding box + M m padding |
+| `--vegetation` / `--no-vegetation` | `--vegetation` | Use `vegetation` or `air` region for radiation fields |
 | `--force-recompute` | off | Recompute view factors even if cache exists |
 | `--skip-utci` | off | Compute Tmrt only, skip UTCI |
-| `--no-vegetation` | off | Use `air` region instead of `vegetation` for radiation fields |
+| `--dense-interp-clamp` | `local-range` | Clamp dense interpolation to local stencil range (`none` to disable) |
+| `--dense-tumrt-interp` | `cubic` | Dense Tumrt interpolation method: `cubic` or `idw` |
 | `--calc-tmrt-bin PATH` | `build/umcfUTCIpostprocess` | Override path to C++ binary |
 
 ### Terrain options

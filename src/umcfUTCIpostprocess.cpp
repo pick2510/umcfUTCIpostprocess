@@ -60,7 +60,15 @@ struct CommandLineArgs {
     // Optional debug outputs from the investigation phase
     bool writeDebugTerms = false;
     bool writeDebugQrswSurface = false;
-    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::None;
+    bool angularSky = false;
+    int skyAzimuthSamples = 48;
+    int skyElevationSamples = 12;
+    double skyRayLength = 5000.0;
+    int skySubdivideTop = 1;
+    bool skySubdivideKeepOriginal = false;
+    DenseTumrtInterpMode denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+    int denseTumrtSmoothPasses = 0;
+    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::LocalRange;
 };
 
 struct TimestepScalars {
@@ -212,6 +220,14 @@ void printUsage(const char* progName) {
     logInfo("  --no-compress-cache    Write uncompressed cache files");
     logInfo("  --write-debug-terms    Write TumrtAvg_terms debug output");
     logInfo("  --write-debug-qrsw     Write qrsw_surface.vtk debug output");
+    logInfo("  --sky-method <m>       Sky mode: patch (default) or angular");
+    logInfo("  --sky-azimuth-samples <N> Angular sky azimuth bins (default 48)");
+    logInfo("  --sky-elevation-samples <N> Angular sky elevation bins (default 12)");
+    logInfo("  --sky-ray-length <m>   Angular sky ray length in metres (default 5000)");
+    logInfo("  --sky-subdivide-top <N> Virtually subdivide upward-facing sky patches into NxN subpatches");
+    logInfo("  --sky-subdivide-keep-original Keep original top sky patches in addition to the subdivided ones");
+    logInfo("  --dense-tumrt-interp <m> Dense Tumrt interpolation: cubic (default) or idw");
+    logInfo("  --dense-tumrt-smooth-passes <N> Smooth sparse Tumrt before dense interpolation (default 0)");
     logInfo("  --dense-interp-clamp <m> Dense interpolation clamp: none (default) or local-range");
     logInfo("  -j <N>                 Number of threads (default: 1)");
     logInfo("  --help                 Show this message");
@@ -282,6 +298,58 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.writeDebugTerms = true;
         } else if (arg == "--write-debug-qrsw") {
             args.writeDebugQrswSurface = true;
+        } else if (arg == "--sky-method" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "patch") {
+                args.angularSky = false;
+            } else if (mode == "angular") {
+                args.angularSky = true;
+            } else {
+                logError("Unknown --sky-method: " + mode + " (use patch or angular)");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-azimuth-samples" && i + 1 < argc) {
+            args.skyAzimuthSamples = parseIntArg(arg, argv[++i]);
+            if (args.skyAzimuthSamples < 1) {
+                logError("--sky-azimuth-samples must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-elevation-samples" && i + 1 < argc) {
+            args.skyElevationSamples = parseIntArg(arg, argv[++i]);
+            if (args.skyElevationSamples < 1) {
+                logError("--sky-elevation-samples must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-ray-length" && i + 1 < argc) {
+            args.skyRayLength = parseDoubleArg(arg, argv[++i]);
+            if (args.skyRayLength <= 0.0) {
+                logError("--sky-ray-length must be > 0");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-subdivide-top" && i + 1 < argc) {
+            args.skySubdivideTop = parseIntArg(arg, argv[++i]);
+            if (args.skySubdivideTop < 1) {
+                logError("--sky-subdivide-top must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-subdivide-keep-original") {
+            args.skySubdivideKeepOriginal = true;
+        } else if (arg == "--dense-tumrt-interp" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "cubic") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+            } else if (mode == "idw") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Idw;
+            } else {
+                logError("Unknown --dense-tumrt-interp: " + mode + " (use cubic or idw)");
+                std::exit(1);
+            }
+        } else if (arg == "--dense-tumrt-smooth-passes" && i + 1 < argc) {
+            args.denseTumrtSmoothPasses = parseIntArg(arg, argv[++i]);
+            if (args.denseTumrtSmoothPasses < 0) {
+                logError("--dense-tumrt-smooth-passes must be >= 0");
+                std::exit(1);
+            }
         } else if (arg == "--dense-interp-clamp" && i + 1 < argc) {
             const std::string mode = argv[++i];
             if (mode == "none") {
@@ -324,6 +392,86 @@ static std::vector<SurfacePatch> concat(const std::vector<SurfacePatch>& a,
                                         const std::vector<SurfacePatch>& b) {
     std::vector<SurfacePatch> out = a;
     out.insert(out.end(), b.begin(), b.end());
+    return out;
+}
+
+static double medianPositiveSpacing(std::vector<double> vals) {
+    if (vals.size() < 2) return 0.0;
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end(),
+                           [](double a, double b) { return std::abs(a - b) < 1e-6; }),
+               vals.end());
+    std::vector<double> diffs;
+    diffs.reserve(vals.size());
+    for (size_t i = 1; i < vals.size(); ++i) {
+        double d = vals[i] - vals[i - 1];
+        if (d > 1e-6) diffs.push_back(d);
+    }
+    if (diffs.empty()) return 0.0;
+    std::sort(diffs.begin(), diffs.end());
+    return diffs[diffs.size() / 2];
+}
+
+static std::vector<SurfacePatch> subdivideTopSkyPatches(const std::vector<SurfacePatch>& skyGeo,
+                                                        int factor,
+                                                        bool keepOriginal) {
+    if (factor <= 1 || skyGeo.empty()) return skyGeo;
+
+    std::vector<double> topXs;
+    std::vector<double> topYs;
+    topXs.reserve(skyGeo.size());
+    topYs.reserve(skyGeo.size());
+    for (const auto& patch : skyGeo) {
+        const double areaMag = patch.areaVector.norm();
+        if (areaMag <= 1e-12) continue;
+        const double nz = patch.areaVector.z() / areaMag;
+        if (std::abs(nz) > 0.9) {
+            topXs.push_back(patch.center.x);
+            topYs.push_back(patch.center.y);
+        }
+    }
+
+    const double dxMed = medianPositiveSpacing(topXs);
+    const double dyMed = medianPositiveSpacing(topYs);
+    if (dxMed <= 0.0 || dyMed <= 0.0) return skyGeo;
+
+    std::vector<SurfacePatch> out;
+    const size_t multiplier = keepOriginal ? static_cast<size_t>(factor * factor + 1)
+                                           : static_cast<size_t>(factor * factor);
+    out.reserve(skyGeo.size() * std::max<size_t>(1, multiplier));
+
+    const double baseArea = dxMed * dyMed;
+    const double invNN = 1.0 / static_cast<double>(factor * factor);
+    for (const auto& patch : skyGeo) {
+        const double areaMag = patch.areaVector.norm();
+        if (areaMag <= 1e-12) {
+            out.push_back(patch);
+            continue;
+        }
+
+        const double nz = patch.areaVector.z() / areaMag;
+        if (std::abs(nz) <= 0.9) {
+            out.push_back(patch);
+            continue;
+        }
+
+        if (keepOriginal) out.push_back(patch);
+
+        const double scale = (baseArea > 0.0) ? std::sqrt(patch.area / baseArea) : 1.0;
+        const double dx = dxMed * scale;
+        const double dy = dyMed * scale;
+        for (int iy = 0; iy < factor; ++iy) {
+            for (int ix = 0; ix < factor; ++ix) {
+                SurfacePatch sub = patch;
+                sub.center.x += ((static_cast<double>(ix) + 0.5) / factor - 0.5) * dx;
+                sub.center.y += ((static_cast<double>(iy) + 0.5) / factor - 0.5) * dy;
+                sub.areaVector *= invNN;
+                sub.area *= invNN;
+                out.push_back(sub);
+            }
+        }
+    }
+
     return out;
 }
 
@@ -413,7 +561,7 @@ static bool validateRequiredInputs(const CommandLineArgs& args,
         logError("no wall/tree surface geometry loaded from postProcessing/surfaces");
         ok = false;
     }
-    if (args.useSkyViewFactors && skyGeo.empty()) {
+    if (args.useSkyViewFactors && !args.angularSky && skyGeo.empty()) {
         logError("sky view factors requested but no sky surface geometry was loaded");
         ok = false;
     }
@@ -515,7 +663,10 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
         #pragma omp parallel for schedule(dynamic)
         for (size_t bi = 0; bi < bN; ++bi) {
             size_t pedIdx = bStart + bi;
-            std::string cachePath = ctx.cache.getCachePath(ctx.positions[pedIdx].originalIndex);
+            std::string cachePath = ctx.cache.getCachePath(
+                ctx.positions[pedIdx].originalIndex,
+                ctx.positions[pedIdx].center
+            );
             bool loaded = false;
             if (!ctx.args.forceRecompute) {
                 auto tLoad0 = std::chrono::steady_clock::now();
@@ -842,7 +993,13 @@ int main(int argc, char* argv[]) {
     // =========================================================
     // Load STL geometry for ray occlusion
     // =========================================================
-    std::string wallTreeStl = args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl";
+    std::string wallTreeStl = firstExistingPath({
+        args.casePath + "/constant/triSurface/wallAndTreesurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl",
+        args.casePath + "/constant/triSurface/walls.stl",
+        args.casePath + "/constant/triSurface/facades.stl"
+    });
     Raycaster raycaster;
     raycaster.setNumThreads(args.nThreads);
     logInfo("Loading STL geometry...");
@@ -850,6 +1007,7 @@ int main(int argc, char* argv[]) {
         logError("could not load " + wallTreeStl);
         return 1;
     }
+    raycaster.loadVegetation(args.casePath + "/constant/triSurface/air_to_vegetation.stl");
 
     // =========================================================
     // Load surface geometry ONCE (from first timestep)
@@ -898,8 +1056,31 @@ int main(int argc, char* argv[]) {
 
     std::vector<SurfacePatch> skyGeo;
     if (args.useSkyViewFactors) {
-        skyGeo = loadSurfacePatches(firstSurfDir + "/Sf_skySurfaces.raw");
-        logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
+        if (args.angularSky) {
+            std::ostringstream out;
+            out << "Sky mode:      angular"
+                << " (" << args.skyAzimuthSamples
+                << " azimuth x " << args.skyElevationSamples
+                << " elevation, ray length " << args.skyRayLength << " m)";
+            logDetail(out.str());
+        } else {
+            skyGeo = loadSurfacePatches(firstSurfDir + "/Sf_skySurfaces.raw");
+            if (args.skySubdivideTop > 1) {
+                const size_t before = skyGeo.size();
+                skyGeo = subdivideTopSkyPatches(
+                    skyGeo, args.skySubdivideTop, args.skySubdivideKeepOriginal
+                );
+                std::ostringstream out;
+                out << "Sky surfaces:  " << before
+                    << " -> " << skyGeo.size()
+                    << " (top " << args.skySubdivideTop << "x" << args.skySubdivideTop
+                    << (args.skySubdivideKeepOriginal ? ", kept originals" : ", replaced originals")
+                    << ")";
+                logDetail(out.str());
+            } else {
+                logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
+            }
+        }
     }
 
     // =========================================================
@@ -1042,11 +1223,27 @@ int main(int argc, char* argv[]) {
     // Batch processing: VF → Tmrt → write, one batch at a time
     // Each batch uses (batchSize × ~20 MB) for ViewFactorResults
     // =========================================================
-    ViewFactorCalculator vfCalc(raycaster);
+    ViewFactorCalculator vfCalc(
+        raycaster,
+        args.angularSky,
+        args.skyAzimuthSamples,
+        args.skyElevationSamples,
+        args.skyRayLength
+    );
     BinaryCache cache;
     std::string cacheBaseDir = args.casePath + "/" + args.outputDir;
     cache.setBaseDir(cacheBaseDir);
     cache.setCompressed(args.compressCache);
+    std::ostringstream tag;
+    if (args.angularSky) {
+        tag << "_skyAngular"
+            << args.skyAzimuthSamples << "x" << args.skyElevationSamples
+            << "_L" << static_cast<long long>(std::llround(args.skyRayLength));
+    } else if (args.skySubdivideTop > 1) {
+        tag << "_skyTopSub" << args.skySubdivideTop;
+        if (args.skySubdivideKeepOriginal) tag << "_keep";
+    }
+    cache.setVariantTag(tag.str());
     if (args.compressCache && !BinaryCache::compressionAvailable()) {
         logWarn("--compress-cache requested but binary was built without ZLIB support; cache files will be written uncompressed.");
     }
@@ -1120,7 +1317,8 @@ int main(int argc, char* argv[]) {
                 { {"Tmrt", TmrtC}, {"UTCI", sparseResults.utci[tIdx]} });
         }
         computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, sparseResults.tumrtNoSolar[tIdx],
-                                   utciSolver, args.writeDebugQrswSurface, args.denseInterpClamp);
+                                   utciSolver, args.writeDebugQrswSurface, args.denseTumrtInterp,
+                                   args.denseTumrtSmoothPasses, args.denseInterpClamp);
 
         // Print stats
         double tMin  = sparseResults.tmrt[tIdx].minCoeff();
