@@ -52,14 +52,15 @@ int main(int argc, char *argv[])
     instantList timeDirs = timeSelector::select0(runTime, args);
     const word regionName =
         args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    const word meshTimeName = Time::timeName(runTime.value());
     Info<< "Create mesh " << regionName << " for time = "
-        << runTime.name() << nl << endl;
+        << meshTimeName << nl << endl;
     fvMesh mesh
     (
         IOobject
         (
             regionName,
-            runTime.name(),
+            meshTimeName,
             runTime,
             IOobject::MUST_READ
         )
@@ -68,7 +69,8 @@ int main(int argc, char *argv[])
     forAll(timeDirs, timeI)
     {
         runTime.setTime(timeDirs[timeI], timeI);
-        Info<< "Time = " << runTime.name() << endl;
+        const word timeName = Time::timeName(runTime.value());
+        Info<< "Time = " << timeName << endl;
         mesh.readUpdate();
 
         volVectorField Sf
@@ -76,7 +78,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "Sf",
-                runTime.name(),
+                timeName,
                 mesh
             ),
             mesh,

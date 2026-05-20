@@ -29,6 +29,7 @@ Usage
 import argparse
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,7 @@ OF_DIR         = os.environ.get('WM_PROJECT_DIR') or (
 )
 UTCI_UTIL      = os.path.join(os.path.dirname(__file__), 'openfoam')
 CALC_TMRT_BIN  = os.path.join(os.path.dirname(__file__), 'build', 'umcfUTCIpostprocess')
+BREW_BIN       = '/home/linuxbrew/.linuxbrew/bin'
 
 # Default patches — override via CLI if your case differs
 WALL_PATCHES   = ('buildings', 'roofs', 'street', 'ground')
@@ -67,6 +69,99 @@ VEG_PATCH      = 'air_to_vegetation'
 PED_Z          = 2.0
 PED_GRID_DX    = 3.0
 PED_GRID_DY    = 3.0
+
+
+def _detect_of_major():
+    """Detect local OpenFOAM major version.
+
+    Priority:
+      1. WM_PROJECT_VERSION / FOAM_VERSION env vars (set when OF is sourced)
+      2. META-INFO/api file in OF_DIR (OF-12+ style)
+      3. WM_PROJECT_VERSION line in etc/bashrc
+      4. Numeric component from OF_DIR path (e.g. OpenFOAM-8, OpenFOAM-12)
+    """
+    # 1. Environment variables
+    for var in ('WM_PROJECT_VERSION', 'FOAM_VERSION'):
+        val = os.environ.get(var, '')
+        m = re.search(r'\b(\d+)\b', val)
+        if m:
+            return int(m.group(1))
+
+    # 2. OF-12+ META-INFO/api file
+    meta = os.path.join(OF_DIR, 'META-INFO', 'api')
+    if os.path.isfile(meta):
+        try:
+            with open(meta) as f:
+                m = re.search(r'\b(\d+)\b', f.read())
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+
+    # 3. WM_PROJECT_VERSION in etc/bashrc
+    bashrc = os.path.join(OF_DIR, 'etc', 'bashrc')
+    if os.path.isfile(bashrc):
+        try:
+            with open(bashrc) as f:
+                for line in f:
+                    m = re.match(r'\s*(?:export\s+)?WM_PROJECT_VERSION\s*=\s*["\']?(\d+)', line)
+                    if m:
+                        return int(m.group(1))
+        except OSError:
+            pass
+
+    # 4. Parse OF_DIR path components for a version number
+    for part in reversed(os.path.normpath(OF_DIR).split(os.sep)):
+        m = re.search(r'(?:OpenFOAM|foam)[-_]?(\d+)', part, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+
+def _detect_case_of_version(case_dir):
+    """Detect which OpenFOAM version a case was run with.
+
+    Uses case structure fingerprints from urbanMicroclimateFoam tutorials:
+    - OF-12: constant/<region>/thermophysicalTransport exists
+    - OF-8:  constant/<region>/momentumTransport has 'object turbulenceProperties'
+             (OF-12 has 'object momentumTransport')
+
+    Returns int major version (8 or 12) or None if undetectable.
+    """
+    for region in ('air', 'vegetation', ''):
+        const_dir = (os.path.join(case_dir, 'constant', region)
+                     if region else os.path.join(case_dir, 'constant'))
+
+        # OF-12 fingerprint: thermophysicalTransport file exists
+        if os.path.isfile(os.path.join(const_dir, 'thermophysicalTransport')):
+            return 12
+
+        # momentumTransport object name: turbulenceProperties=OF-8, momentumTransport=OF-12
+        mt = os.path.join(const_dir, 'momentumTransport')
+        if os.path.isfile(mt):
+            try:
+                with open(mt, errors='replace') as f:
+                    header = f.read(512)
+                if re.search(r'\bobject\s+turbulenceProperties\b', header):
+                    return 8
+                if re.search(r'\bobject\s+momentumTransport\b', header):
+                    return 12
+            except OSError:
+                pass
+
+    return None
+
+
+def _foam_shell_setup():
+    """Shell prefix for OpenFOAM environment and optional Linuxbrew toolchain."""
+    cmd = f'source {OF_DIR}/etc/bashrc'
+    if os.path.isdir(BREW_BIN):
+        cmd += f' && export PATH={BREW_BIN}:$PATH'
+    return cmd
+
+
+OF_MAJOR = _detect_of_major()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PEDESTRIAN SURFACE — OF dict + grid binning (flat and terrain)
@@ -83,6 +178,8 @@ def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
         caller adds PED_Z offset when binning.
     """
     if terrain_patches is None:
+        point_key = 'basePoint' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'point'
+        normal_key = 'normalVector' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'normal'
         surface_block = """\
     pedestrian
     {{
@@ -90,11 +187,11 @@ def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
         planeType   pointAndNormal;
         pointAndNormalDict
         {{
-            basePoint    (0 0 {z});
-            normalVector (0 0 1);
+            {point_key}  (0 0 {z});
+            {normal_key} (0 0 1);
         }}
         interpolate false;
-    }}""".format(z=z)
+    }}""".format(z=z, point_key=point_key, normal_key=normal_key)
     else:
         patches_str = ' '.join(terrain_patches)
         surface_block = """\
@@ -155,13 +252,38 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
 
     if z_offset == 0.0:
         # Flat: regular grid filtered by 2-D triangulation containment test.
-        # Build a matplotlib TriFinder on the mesh triangles (exact, O(log N) per point,
-        # vectorised over the whole grid in one call).
+        # Some case exports contain duplicate points or degenerate triangles,
+        # which can make matplotlib's TriFinder reject the mesh. Clean the
+        # triangulation first and fall back to cell-center binning if needed.
         mesh = mesh.triangulate()
-        pts  = mesh.points
+        pts = np.asarray(mesh.points)
         tris = mesh.faces.reshape(-1, 4)[:, 1:]
-        tri    = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
-        finder = tri.get_trifinder()
+
+        rounded_xy = np.round(pts[:, :2], decimals=6)
+        _, unique_idx, inverse = np.unique(
+            rounded_xy, axis=0, return_index=True, return_inverse=True
+        )
+        pts2 = pts[np.sort(unique_idx)]
+        order = np.zeros(len(unique_idx), dtype=int)
+        order[np.argsort(unique_idx)] = np.arange(len(unique_idx))
+        tris2 = order[inverse[tris]]
+
+        mask_distinct = (
+            (tris2[:, 0] != tris2[:, 1]) &
+            (tris2[:, 0] != tris2[:, 2]) &
+            (tris2[:, 1] != tris2[:, 2])
+        )
+        tris2 = tris2[mask_distinct]
+
+        if len(tris2) > 0:
+            p0 = pts2[tris2[:, 0], :2]
+            p1 = pts2[tris2[:, 1], :2]
+            p2 = pts2[tris2[:, 2], :2]
+            dbl_area = np.abs(
+                (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) -
+                (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
+            )
+            tris2 = tris2[dbl_area > 1e-10]
 
         if bbox is not None:
             xmin, xmax, ymin, ymax = bbox
@@ -171,13 +293,30 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
 
         xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
         ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
-        gx, gy = np.meshgrid(xs, ys)
-        inside = finder(gx.ravel(), gy.ravel()) >= 0
-
         z = float(np.median(pts[:, 2]))
-        vx = gx.ravel()[inside]
-        vy = gy.ravel()[inside]
-        positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
+
+        if len(tris2) > 0:
+            try:
+                tri = mtri.Triangulation(pts2[:, 0], pts2[:, 1], tris2)
+                finder = tri.get_trifinder()
+                gx, gy = np.meshgrid(xs, ys)
+                inside = finder(gx.ravel(), gy.ravel()) >= 0
+                vx = gx.ravel()[inside]
+                vy = gy.ravel()[inside]
+                positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
+                if positions:
+                    return positions
+            except RuntimeError:
+                print('  [WARN] Invalid triangulation in pedestrian surface mesh – '
+                      'falling back to flat cell-center binning')
+
+        centers = np.asarray(mesh.cell_centers().points)
+        mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
+                (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
+        centers = centers[mask]
+        gx = np.round(centers[:, 0] / dx) * dx
+        gy = np.round(centers[:, 1] / dy) * dy
+        positions = sorted({(float(x), float(y), z) for x, y in zip(gx, gy)})
         return positions
 
     else:
@@ -291,7 +430,7 @@ probeLocations
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run(cmd, case=None, region=None, time_range=None, use_case=True):
-    full = f'source {OF_DIR}/etc/bashrc && {cmd}'
+    full = f'{_foam_shell_setup()} && {cmd}'
     if use_case and case:
         full += f' -case {case}'
     if region:
@@ -408,7 +547,7 @@ def _run_required_per_timestep(cmd, case, region, timesteps, max_parallel, use_c
 
 def _available(binary):
     r = subprocess.run(
-        ['bash', '-lc', f'source {OF_DIR}/etc/bashrc && command -v {binary}'],
+        ['bash', '-lc', f'{_foam_shell_setup()} && command -v {binary}'],
         capture_output=True, text=True)
     return r.returncode == 0
 
@@ -484,6 +623,13 @@ def _find_pedestrian_vtk(case, subdir, t_start, legacy_name):
     return None
 
 
+def _first_existing_path(paths):
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _stage0_generate_positions(args):
     """Run postProcess to generate T_pedestrian.vtk and return (positions, resolved_mode)."""
     sys_air = os.path.join(args.case, 'system', 'air')
@@ -492,15 +638,19 @@ def _stage0_generate_positions(args):
     # Optional STL bounding-box clipping
     bbox = None
     if args.bbox_padding is not None:
-        stl_path = os.path.join(args.case, 'constant', 'triSurface',
-                                'wallAndTreeSurfaces.stl')
-        if os.path.isfile(stl_path):
+        stl_path = _first_existing_path([
+            os.path.join(args.case, 'constant', 'triSurface', 'wallAndTreeSurfaces.stl'),
+            os.path.join(args.case, 'constant', 'triSurface', 'walls.stl'),
+            os.path.join(args.case, 'constant', 'triSurface', 'facades.stl'),
+        ])
+        if stl_path is not None:
             bbox = _stl_bbox(stl_path, padding=args.bbox_padding)
             print(f'  STL bbox + {args.bbox_padding} m padding: '
                   f'x=[{bbox[0]:.1f}, {bbox[1]:.1f}]  '
                   f'y=[{bbox[2]:.1f}, {bbox[3]:.1f}]')
         else:
-            print(f'  [WARN] STL not found for bbox clipping: {stl_path}')
+            print('  [WARN] STL not found for bbox clipping '
+                  '(tried wallAndTreeSurfaces.stl, walls.stl, facades.stl)')
 
     # ── forced flat ──────────────────────────────────────────────────────────
     if args.mode == 'flat':
@@ -603,15 +753,17 @@ def stage0(args):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _qrsw_cutting_plane_dict():
-    return """\
+    point_key = 'basePoint' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'point'
+    normal_key = 'normalVector' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'normal'
+    return f"""\
 /*--------------------------------*- C++ -*----------------------------------*/
 FoamFile
-{
+{{
     version     2.0;
     format      ascii;
     class       dictionary;
     object      qrswCuttingPlane;
-}
+}}
 
 type            surfaces;
 libs            ("libsampling.so");
@@ -623,12 +775,12 @@ fields          ( qrsw );
 surfaces
 (
     pedestrian
-    {
+    {{
         type            cuttingPlane;
         planeType       pointAndNormal;
-        pointAndNormalDict { point (0 0 2); normal (0 0 1); }
+        pointAndNormalDict {{ {point_key} (0 0 2); {normal_key} (0 0 1); }}
         interpolate     false;
-    }
+    }}
 );
 """
 
@@ -733,12 +885,20 @@ def _split_of12_surface_xy(src_path, dst_dir, surface_name):
 
 
 def _normalize_of12_postprocessing(case, region, timesteps):
-    """Expose OF12 region-scoped outputs at the legacy paths used by Stage 2."""
+    """Expose OF12 region-scoped outputs at the legacy paths used by Stage 2.
+
+    Safe and idempotent for OF8 legacy layout (no-op when .xy inputs are absent).
+    """
     pp = os.path.join(case, 'postProcessing')
 
-    src_surfaces = os.path.join(pp, region, 'surfaces')
     dst_surfaces = os.path.join(pp, 'surfaces')
-    if os.path.isdir(src_surfaces):
+    src_roots = [
+        os.path.join(pp, region, 'surfaces'),
+        os.path.join(pp, 'surfaces'),
+    ]
+    for src_surfaces in src_roots:
+        if not os.path.isdir(src_surfaces):
+            continue
         for t in timesteps:
             src_t = os.path.join(src_surfaces, str(t))
             if not os.path.isdir(src_t):
@@ -840,19 +1000,16 @@ def stage1(args):
     _run_required('postProcess -func probes', args.case, region='air', time_range=time_range)
 
     # Step 7: Sample qrsw magnitude at probe positions from a z=2 m cutting plane.
-    # This provides direct-solar irradiance including canopy attenuation.
-    if args.vegetation:
-        print('  qrsw cutting plane (vegetation) ...')
-        sys_veg = os.path.join(args.case, 'system', 'vegetation')
-        os.makedirs(sys_veg, exist_ok=True)
-        with open(os.path.join(sys_veg, 'qrswCuttingPlane'), 'w') as f:
-            f.write(_qrsw_cutting_plane_dict())
-        _run_required_per_timestep('postProcess -func qrswCuttingPlane',
-                                   args.case, 'vegetation', timesteps, of_parallel)
+    # This provides direct-solar irradiance at pedestrian positions for both
+    # vegetation and non-vegetation workflows.
+    print(f'  qrsw cutting plane ({rad_region}) ...')
+    with open(os.path.join(sys_rad, 'qrswCuttingPlane'), 'w') as f:
+        f.write(_qrsw_cutting_plane_dict())
+    _run_required_per_timestep('postProcess -func qrswCuttingPlane',
+                               args.case, rad_region, timesteps, of_parallel)
 
     _normalize_of12_postprocessing(args.case, region, timesteps)
-    if args.vegetation:
-        _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
+    _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -972,6 +1129,15 @@ def stage2(args):
     cmd += ['--dense-tumrt-interp', args.dense_tumrt_interp]
     cmd += ['--dense-tumrt-smooth-passes', str(args.dense_tumrt_smooth_passes)]
     cmd += ['--dense-interp-clamp', args.dense_interp_clamp]
+    cmd += ['--sky-method', args.sky_method]
+    if args.sky_method == 'angular':
+        cmd += ['--sky-azimuth-samples', str(args.sky_azimuth_samples)]
+        cmd += ['--sky-elevation-samples', str(args.sky_elevation_samples)]
+        cmd += ['--sky-ray-length', str(args.sky_ray_length)]
+    if args.sky_subdivide_top > 1:
+        cmd += ['--sky-subdivide-top', str(args.sky_subdivide_top)]
+    if args.sky_subdivide_keep_original:
+        cmd.append('--sky-subdivide-keep-original')
 
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
@@ -1036,6 +1202,14 @@ def parse_args():
                    help='Use air region instead of vegetation for surface/radiation sampling')
     p.add_argument('--wall-patches', nargs='+', default=list(WALL_PATCHES), dest='wall_patches')
     p.add_argument('--sky-patches',  nargs='+', default=list(SKY_PATCHES),  dest='sky_patches')
+    p.add_argument('--sky-method', default='patch', choices=['patch', 'angular'], dest='sky_method',
+                   help='Sky treatment in Stage 2: OpenFOAM patch sky or angular hemisphere sampling')
+    p.add_argument('--sky-azimuth-samples', default=48, type=int, dest='sky_azimuth_samples',
+                   help='Angular sky azimuth bins for Stage 2')
+    p.add_argument('--sky-elevation-samples', default=12, type=int, dest='sky_elevation_samples',
+                   help='Angular sky elevation bins for Stage 2')
+    p.add_argument('--sky-ray-length', default=5000.0, type=float, dest='sky_ray_length',
+                   help='Angular sky ray length [m] for Stage 2')
     p.add_argument('--force-recompute', action='store_true', dest='force_recompute')
     p.add_argument('--skip-utci',       action='store_true', dest='skip_utci')
     p.add_argument('--calc-tmrt-bin', default=CALC_TMRT_BIN, dest='calc_tmrt_bin')
@@ -1052,6 +1226,11 @@ def parse_args():
     p.add_argument('--dense-tumrt-smooth-passes', default=0, type=int,
                    dest='dense_tumrt_smooth_passes',
                    help='Smooth sparse Tumrt before dense interpolation; 0 disables smoothing')
+    p.add_argument('--sky-subdivide-top', default=1, type=int, dest='sky_subdivide_top',
+                   help='Virtually subdivide upward-facing sky patches into NxN subpatches in Stage 2')
+    p.add_argument('--sky-subdivide-keep-original', action='store_true',
+                   dest='sky_subdivide_keep_original',
+                   help='Keep original top sky patches in addition to the subdivided sky patches')
 
     # pedestrian grid spacing (flat and terrain)
     p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',
@@ -1092,6 +1271,21 @@ def main():
     print(f'Time:      {args.t_start}..{args.t_end}  step {args.t_step}')
     print(f'Stages:    {args.stages}')
     print(f'Threads:   {args.threads}')
+    print(f'OpenFOAM:  {OF_DIR} (detected major: {OF_MAJOR if OF_MAJOR is not None else "unknown"})')
+
+    case_of = _detect_case_of_version(args.case)
+    print(f'Case OF version: {case_of if case_of is not None else "unknown"}')
+    if case_of is not None and OF_MAJOR is not None and case_of != OF_MAJOR:
+        print(
+            f'\n[ERROR] Case was run with OpenFOAM-{case_of} but the active installation'
+            f' is OpenFOAM-{OF_MAJOR}. Surface sampling utilities (calcSf, calcWallRadOut,'
+            f' calculateqrsw) must match the case version — results will be wrong or the'
+            f' run will crash.\n'
+            f'        Source the correct OpenFOAM environment before running, e.g.:\n'
+            f'          source /home/strebdom/OpenFOAM-{case_of}/etc/bashrc\n'
+        )
+        sys.exit(1)
+
     print(f'Vegetation: {args.vegetation}')
     print(f'UTCI method: {args.utci_method}' + (f' ({args.lut_path})' if args.lut_path else ''))
 

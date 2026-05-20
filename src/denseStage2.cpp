@@ -55,6 +55,13 @@ struct DenseInterpPlan {
     bool valid = false;
 };
 
+struct DenseInterpDiagnostics {
+    size_t totalPoints = 0;
+    size_t nearestCount = 0;
+    std::array<size_t, 4> bandPointCounts{{0, 0, 0, 0}};
+    std::array<size_t, 4> bandNearestCounts{{0, 0, 0, 0}};
+};
+
 enum class QrswRemapMode {
     None,
     DirectPoint,
@@ -438,6 +445,34 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
 
     plan.valid = true;
     return plan;
+}
+
+static DenseInterpDiagnostics summarizeDenseInterpPlan(const DenseInterpPlan& plan,
+                                                       const std::vector<Point3>& densePoints) {
+    DenseInterpDiagnostics diag;
+    diag.totalPoints = std::min(plan.pointPlans.size(), densePoints.size());
+    if (diag.totalPoints == 0) return diag;
+
+    double minX = densePoints.front().x;
+    double maxX = densePoints.front().x;
+    for (size_t i = 1; i < diag.totalPoints; ++i) {
+        minX = std::min(minX, densePoints[i].x);
+        maxX = std::max(maxX, densePoints[i].x);
+    }
+    const double dx = std::max(1e-9, maxX - minX);
+
+    for (size_t i = 0; i < diag.totalPoints; ++i) {
+        double t = (densePoints[i].x - minX) / dx;
+        int band = static_cast<int>(std::floor(t * 4.0));
+        band = std::max(0, std::min(3, band));
+        diag.bandPointCounts[band] += 1;
+        if (plan.pointPlans[i].useNearest) {
+            diag.nearestCount += 1;
+            diag.bandNearestCounts[band] += 1;
+        }
+    }
+
+    return diag;
 }
 
 static UniformGridField buildUniformGridField(const std::vector<PedestrianPosition>& positions,
@@ -952,6 +987,28 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
             ).first;
         }
         interpPlan = it->second;
+    }
+    const DenseInterpDiagnostics interpDiag = summarizeDenseInterpPlan(*interpPlan, meshT.points);
+    if (interpDiag.totalPoints > 0) {
+        auto fmtPct = [](size_t num, size_t den) {
+            if (den == 0) return 0.0;
+            return 100.0 * static_cast<double>(num) / static_cast<double>(den);
+        };
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1)
+            << "Dense interp fallback t=" << timestep
+            << ": nearest=" << interpDiag.nearestCount << "/" << interpDiag.totalPoints
+            << " (" << fmtPct(interpDiag.nearestCount, interpDiag.totalPoints) << "%)"
+            << " x-bands"
+            << " [0-25]=" << interpDiag.bandNearestCounts[0] << "/" << interpDiag.bandPointCounts[0]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[0], interpDiag.bandPointCounts[0]) << "%)"
+            << ", [25-50]=" << interpDiag.bandNearestCounts[1] << "/" << interpDiag.bandPointCounts[1]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[1], interpDiag.bandPointCounts[1]) << "%)"
+            << ", [50-75]=" << interpDiag.bandNearestCounts[2] << "/" << interpDiag.bandPointCounts[2]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[2], interpDiag.bandPointCounts[2]) << "%)"
+            << ", [75-100]=" << interpDiag.bandNearestCounts[3] << "/" << interpDiag.bandPointCounts[3]
+            << " (" << fmtPct(interpDiag.bandNearestCounts[3], interpDiag.bandPointCounts[3]) << "%)";
+        logInfo(oss.str());
     }
     const Eigen::VectorXd sparseTumrtForDense =
         smoothSparseGridValues(sparsePositions, sparseTumrtAvg, smoothPasses);

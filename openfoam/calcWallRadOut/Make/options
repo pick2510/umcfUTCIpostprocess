@@ -12,3 +12,7 @@ EXE_LIBS = \
     -lradiationModels \
     $(FOAM_USER_LIBBIN)/libsolarLoad.so \
     $(FOAM_USER_LIBBIN)/libvegetationModels.so
+
+ifeq ($(WM_PROJECT_VERSION),8)
+EXE_LIBS += -lregionModels
+endif

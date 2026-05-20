@@ -143,8 +143,9 @@ void createRegionMesh
 {
     const word regionName =
         args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    const word timeName = Time::timeName(runTime.value());
     Info<< "Create mesh " << regionName << " for time = "
-        << runTime.name() << nl << endl;
+        << timeName << nl << endl;
     meshPtr.reset
     (
         new fvMesh
@@ -152,7 +153,7 @@ void createRegionMesh
             IOobject
             (
                 regionName,
-                runTime.name(),
+                timeName,
                 runTime,
                 IOobject::MUST_READ
             )
@@ -186,7 +187,7 @@ int main(int argc, char *argv[])
       IOobject
       (
           "qr",
-          runTime.name(),
+          Time::timeName(runTime.value()),
           mesh,
           IOobject::MUST_READ,
           IOobject::NO_WRITE
@@ -266,7 +267,8 @@ int main(int argc, char *argv[])
     {
 
         runTime.setTime(timeDirs[timeI], timeI);
-        Info << nl << "Time = " << runTime.name() << endl;
+        const word timeName = Time::timeName(runTime.value());
+        Info << nl << "Time = " << timeName << endl;
 
         // start clock
         tstartStep = std::clock();
@@ -277,7 +279,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                "qrsw",
-               runTime.name(),
+               timeName,
                mesh,
                IOobject::NO_READ,
                IOobject::AUTO_WRITE 

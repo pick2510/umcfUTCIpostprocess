@@ -42,6 +42,7 @@ Description
 #include "physicoChemicalConstants.H"
 #include "greyDiffusiveViewFactorFixedValueFvPatchScalarField.H"
 #include "solarLoadViewFactorFixedValueFvPatchScalarField.H"
+#include "mixedFvPatchFields.H"
 
 using namespace Foam;
 
@@ -62,7 +63,7 @@ namespace
             Foam::IOobject
             (
                 fieldName,
-                runTime.name(),
+                Foam::Time::timeName(runTime.value()),
                 mesh,
                 Foam::IOobject::MUST_READ,
                 Foam::IOobject::NO_WRITE,
@@ -117,14 +118,15 @@ int main(int argc, char *argv[])
     instantList timeDirs = timeSelector::select0(runTime, args);
     const word regionName =
         args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    const word meshTimeName = Time::timeName(runTime.value());
     Info<< "Create mesh " << regionName << " for time = "
-        << runTime.name() << nl << endl;
+        << meshTimeName << nl << endl;
     fvMesh mesh
     (
         IOobject
         (
             regionName,
-            runTime.name(),
+            meshTimeName,
             runTime,
             IOobject::MUST_READ
         )
@@ -133,7 +135,8 @@ int main(int argc, char *argv[])
     forAll(timeDirs, timeI)
     {
         runTime.setTime(timeDirs[timeI], timeI);
-        Info<< "Time = " << runTime.name() << endl;
+        const word timeName = Time::timeName(runTime.value());
+        Info<< "Time = " << timeName << endl;
         mesh.readUpdate();
 
         volScalarField qrOut
@@ -141,7 +144,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qrOut",
-                runTime.name(),
+                timeName,
                 mesh
             ),
             mesh,
@@ -154,7 +157,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qsOut",
-                runTime.name(),
+                timeName,
                 mesh
             ),
             mesh,
@@ -167,7 +170,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "T",
-                runTime.name(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -179,7 +182,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qr",
-                runTime.name(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -191,7 +194,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qs",
-                runTime.name(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -246,7 +249,15 @@ int main(int argc, char *argv[])
                     Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField
                 >(qsPatch);
 
-            const fvPatchScalarField& Ti = TBf[patchi];
+            const fvPatchScalarField& TiBC = TBf[patchi];
+            // For mixed BCs (CFDHAMfluidTemperatureCoupledMixed and similar),
+            // BC evaluation in postprocessing mode returns the initial value
+            // (293.15 K). refValue() holds the actual face temperature written
+            // by the solver and is correct for all timesteps after t=0.
+            const scalarField Ti =
+                isA<mixedFvPatchScalarField>(TiBC)
+                ? refCast<const mixedFvPatchScalarField>(TiBC).refValue()
+                : scalarField(TiBC);
             const fvPatchScalarField& qri = qrBf[patchi];
             const fvPatchScalarField& qsi = qsBf[patchi];
 

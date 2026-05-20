@@ -186,9 +186,18 @@ bool BinaryCache::save(const std::string& path, const ViewFactorResult& result) 
 
 // ---------------------------------------------------------------------------
 
-std::string BinaryCache::getCachePath(int pedIndex) const {
+std::string BinaryCache::getCachePath(int pedIndex, const Point3& center) const {
+    auto q = [](double v) -> long long {
+        return static_cast<long long>(std::llround(v * 1000.0));
+    };
     std::ostringstream oss;
-    oss << baseDir_ << "/pos/" << pedIndex << ".bin";
+    oss << baseDir_ << "/pos/"
+        << pedIndex
+        << variantTag_
+        << "_x" << q(center.x)
+        << "_y" << q(center.y)
+        << "_z" << q(center.z)
+        << ".bin";
     return oss.str();
 }
 
