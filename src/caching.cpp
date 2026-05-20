@@ -6,6 +6,7 @@
 #include <limits>
 #include <sys/stat.h>
 #include <errno.h>
+#include <cstdio>
 
 #ifdef UTCI_HAVE_ZLIB
 #include "zstr.hpp"
@@ -115,6 +116,8 @@ static bool loadFromStream(Stream& file, ViewFactorResult& result) {
 // ---------------------------------------------------------------------------
 
 bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
+    auto removeCorrupt = [&]() { std::remove(path.c_str()); };
+
     if (fileIsGzip(path)) {
 #ifdef UTCI_HAVE_ZLIB
         zstr::ifstream file(path, std::ios::binary);
@@ -122,11 +125,11 @@ bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
 
         int version = 0;
         file.read(reinterpret_cast<char*>(&version), sizeof(int));
-        if (version != VERSION_COMPRESSED) return false;
+        if (version != VERSION_COMPRESSED) { removeCorrupt(); return false; }
 
-        return loadFromStream(file, result);
+        if (!loadFromStream(file, result)) { removeCorrupt(); return false; }
+        return true;
 #else
-        // File is compressed but we were built without zlib — force recompute.
         std::cerr << "Warning: compressed cache found but ZLIB support not compiled in; recomputing.\n";
         return false;
 #endif
@@ -136,9 +139,10 @@ bool BinaryCache::load(const std::string& path, ViewFactorResult& result) {
 
         int version = 0;
         file.read(reinterpret_cast<char*>(&version), sizeof(int));
-        if (version != VERSION_PLAIN) return false;
+        if (version != VERSION_PLAIN) { removeCorrupt(); return false; }
 
-        return loadFromStream(file, result);
+        if (!loadFromStream(file, result)) { removeCorrupt(); return false; }
+        return true;
     }
 }
 

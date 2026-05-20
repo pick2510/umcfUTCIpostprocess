@@ -1136,6 +1136,12 @@ int main(int argc, char* argv[]) {
             << args.skyAzimuthSamples << "x" << args.skyElevationSamples
             << "_L" << static_cast<long long>(std::llround(args.skyRayLength));
     }
+    // Include STL modification time so cache is invalidated when geometry changes.
+    if (!wallTreeStl.empty()) {
+        struct stat stlStat{};
+        if (stat(wallTreeStl.c_str(), &stlStat) == 0)
+            tag << "_g" << static_cast<long long>(stlStat.st_mtime);
+    }
     cache.setVariantTag(tag.str());
     if (args.compressCache && !BinaryCache::compressionAvailable()) {
         logWarn("--compress-cache requested but binary was built without ZLIB support; cache files will be written uncompressed.");
