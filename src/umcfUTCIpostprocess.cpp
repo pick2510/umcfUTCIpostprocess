@@ -60,6 +60,15 @@ struct CommandLineArgs {
     // Optional debug outputs from the investigation phase
     bool writeDebugTerms = false;
     bool writeDebugQrswSurface = false;
+    bool angularSky = false;
+    int skyAzimuthSamples = 48;
+    int skyElevationSamples = 12;
+    double skyRayLength = 5000.0;
+    int skySubdivideTop = 1;
+    bool skySubdivideKeepOriginal = false;
+    DenseTumrtInterpMode denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+    int denseTumrtSmoothPasses = 0;
+    DenseInterpClampMode denseInterpClamp = DenseInterpClampMode::LocalRange;
 };
 
 struct TimestepScalars {
@@ -110,6 +119,50 @@ struct SparseStage2Context {
     TmrtSolver& tmrtSolver;
     UtciSolver& utciSolver;
 };
+
+static SurfaceRadiativeData buildSurfaceRadiativeData(const SparseStage2Context& ctx,
+                                                      const TimestepScalars& sc) {
+    SurfaceRadiativeData surfaceData;
+    const size_t nSurf = ctx.allGeo.size();
+    surfaceData.qrOut.resize(nSurf);
+    surfaceData.qsOut.resize(nSurf);
+    surfaceData.swClass.resize(nSurf);
+
+    for (size_t i = 0; i < nSurf; ++i) {
+        const auto& geom = ctx.allGeo[i];
+        if (!sc.allQrOut.empty() && i < sc.allQrOut.size()) {
+            surfaceData.qrOut[i] = sc.allQrOut[i];
+        } else {
+            double temperature = geom.temperature;
+            double qr = geom.qr;
+            if (i < ctx.wallGeo.size()) {
+                if (i < sc.wallTemps.size()) temperature = sc.wallTemps[i];
+            } else {
+                const size_t vegIdx = i - ctx.wallGeo.size();
+                if (vegIdx < sc.vegTemps.size()) temperature = sc.vegTemps[vegIdx];
+                if (vegIdx < sc.vegQr.size()) qr = sc.vegQr[vegIdx];
+            }
+            surfaceData.qrOut[i] = SIGMA * std::pow(temperature, 4)
+                                 + qr * (1.0 - EPS_SURF) / EPS_SURF;
+        }
+
+        surfaceData.qsOut[i] = (i < sc.allQsOut.size()) ? sc.allQsOut[i] : geom.qsOut;
+
+        double areaMag = geom.areaVector.norm();
+        double nz = (areaMag > 0.0) ? geom.areaVector.z() / areaMag : 0.0;
+        if (nz < -0.7) {
+            surfaceData.swClass[i] = (geom.center.z <= 2.5)
+                ? SurfaceSwClass::Ground
+                : SurfaceSwClass::ElevatedDown;
+        } else if (nz > 0.7) {
+            surfaceData.swClass[i] = SurfaceSwClass::Upward;
+        } else {
+            surfaceData.swClass[i] = SurfaceSwClass::Vertical;
+        }
+    }
+
+    return surfaceData;
+}
 
 void utci::logInfo(const std::string& message) {
     std::cout << message << "\n";
@@ -167,12 +220,37 @@ void printUsage(const char* progName) {
     logInfo("  --no-compress-cache    Write uncompressed cache files");
     logInfo("  --write-debug-terms    Write TumrtAvg_terms debug output");
     logInfo("  --write-debug-qrsw     Write qrsw_surface.vtk debug output");
+    logInfo("  --sky-method <m>       Sky mode: patch (default) or angular");
+    logInfo("  --sky-azimuth-samples <N> Angular sky azimuth bins (default 48)");
+    logInfo("  --sky-elevation-samples <N> Angular sky elevation bins (default 12)");
+    logInfo("  --sky-ray-length <m>   Angular sky ray length in metres (default 5000)");
+    logInfo("  --sky-subdivide-top <N> Virtually subdivide upward-facing sky patches into NxN subpatches");
+    logInfo("  --sky-subdivide-keep-original Keep original top sky patches in addition to the subdivided ones");
+    logInfo("  --dense-tumrt-interp <m> Dense Tumrt interpolation: cubic (default) or idw");
+    logInfo("  --dense-tumrt-smooth-passes <N> Smooth sparse Tumrt before dense interpolation (default 0)");
+    logInfo("  --dense-interp-clamp <m> Dense interpolation clamp: none (default) or local-range");
     logInfo("  -j <N>                 Number of threads (default: 1)");
     logInfo("  --help                 Show this message");
 }
 
 CommandLineArgs parseArgs(int argc, char* argv[]) {
     CommandLineArgs args;
+    auto parseIntArg = [&](const std::string& flag, const char* value) -> int {
+        try {
+            return std::stoi(value);
+        } catch (const std::exception&) {
+            logError("Invalid integer for " + flag + ": " + value);
+            std::exit(1);
+        }
+    };
+    auto parseDoubleArg = [&](const std::string& flag, const char* value) -> double {
+        try {
+            return std::stod(value);
+        } catch (const std::exception&) {
+            logError("Invalid number for " + flag + ": " + value);
+            std::exit(1);
+        }
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -180,11 +258,11 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
         if (arg == "--case" && i + 1 < argc) {
             args.casePath = argv[++i];
         } else if (arg == "--start" && i + 1 < argc) {
-            args.tStart = std::stoi(argv[++i]);
+            args.tStart = parseIntArg(arg, argv[++i]);
         } else if (arg == "--end" && i + 1 < argc) {
-            args.tEnd = std::stoi(argv[++i]);
+            args.tEnd = parseIntArg(arg, argv[++i]);
         } else if (arg == "--step" && i + 1 < argc) {
-            args.tStep = std::stoi(argv[++i]);
+            args.tStep = parseIntArg(arg, argv[++i]);
         } else if (arg == "--output-dir" && i + 1 < argc) {
             args.outputDir = argv[++i];
         } else if (arg == "--skip-utci") {
@@ -199,19 +277,19 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
         } else if (arg == "--force-recompute") {
             args.forceRecompute = true;
         } else if (arg == "--max-positions" && i + 1 < argc) {
-            args.maxPositions = std::stoi(argv[++i]);
+            args.maxPositions = parseIntArg(arg, argv[++i]);
         } else if (arg == "--batch-size" && i + 1 < argc) {
-            args.batchSize = std::stoi(argv[++i]);
+            args.batchSize = parseIntArg(arg, argv[++i]);
         } else if (arg == "--filter-radius" && i + 1 < argc) {
-            args.filterRadius = std::stod(argv[++i]);
+            args.filterRadius = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "--filter-cx" && i + 1 < argc) {
-            args.filterCenterX = std::stod(argv[++i]);
+            args.filterCenterX = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "--filter-cy" && i + 1 < argc) {
-            args.filterCenterY = std::stod(argv[++i]);
+            args.filterCenterY = parseDoubleArg(arg, argv[++i]);
         } else if (arg == "-j" && i + 1 < argc) {
-            args.nThreads = std::stoi(argv[++i]);
+            args.nThreads = parseIntArg(arg, argv[++i]);
         } else if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'j') {
-            args.nThreads = std::stoi(arg.substr(2));
+            args.nThreads = parseIntArg("-j", arg.substr(2).c_str());
         } else if (arg == "--compress-cache") {
             args.compressCache = true;
         } else if (arg == "--no-compress-cache") {
@@ -220,6 +298,68 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
             args.writeDebugTerms = true;
         } else if (arg == "--write-debug-qrsw") {
             args.writeDebugQrswSurface = true;
+        } else if (arg == "--sky-method" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "patch") {
+                args.angularSky = false;
+            } else if (mode == "angular") {
+                args.angularSky = true;
+            } else {
+                logError("Unknown --sky-method: " + mode + " (use patch or angular)");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-azimuth-samples" && i + 1 < argc) {
+            args.skyAzimuthSamples = parseIntArg(arg, argv[++i]);
+            if (args.skyAzimuthSamples < 1) {
+                logError("--sky-azimuth-samples must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-elevation-samples" && i + 1 < argc) {
+            args.skyElevationSamples = parseIntArg(arg, argv[++i]);
+            if (args.skyElevationSamples < 1) {
+                logError("--sky-elevation-samples must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-ray-length" && i + 1 < argc) {
+            args.skyRayLength = parseDoubleArg(arg, argv[++i]);
+            if (args.skyRayLength <= 0.0) {
+                logError("--sky-ray-length must be > 0");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-subdivide-top" && i + 1 < argc) {
+            args.skySubdivideTop = parseIntArg(arg, argv[++i]);
+            if (args.skySubdivideTop < 1) {
+                logError("--sky-subdivide-top must be >= 1");
+                std::exit(1);
+            }
+        } else if (arg == "--sky-subdivide-keep-original") {
+            args.skySubdivideKeepOriginal = true;
+        } else if (arg == "--dense-tumrt-interp" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "cubic") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Cubic;
+            } else if (mode == "idw") {
+                args.denseTumrtInterp = DenseTumrtInterpMode::Idw;
+            } else {
+                logError("Unknown --dense-tumrt-interp: " + mode + " (use cubic or idw)");
+                std::exit(1);
+            }
+        } else if (arg == "--dense-tumrt-smooth-passes" && i + 1 < argc) {
+            args.denseTumrtSmoothPasses = parseIntArg(arg, argv[++i]);
+            if (args.denseTumrtSmoothPasses < 0) {
+                logError("--dense-tumrt-smooth-passes must be >= 0");
+                std::exit(1);
+            }
+        } else if (arg == "--dense-interp-clamp" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "none") {
+                args.denseInterpClamp = DenseInterpClampMode::None;
+            } else if (mode == "local-range") {
+                args.denseInterpClamp = DenseInterpClampMode::LocalRange;
+            } else {
+                logError("Unknown --dense-interp-clamp: " + mode + " (use none or local-range)");
+                std::exit(1);
+            }
         } else if (arg == "--help") {
             printUsage(argv[0]);
             exit(0);
@@ -255,6 +395,86 @@ static std::vector<SurfacePatch> concat(const std::vector<SurfacePatch>& a,
     return out;
 }
 
+static double medianPositiveSpacing(std::vector<double> vals) {
+    if (vals.size() < 2) return 0.0;
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end(),
+                           [](double a, double b) { return std::abs(a - b) < 1e-6; }),
+               vals.end());
+    std::vector<double> diffs;
+    diffs.reserve(vals.size());
+    for (size_t i = 1; i < vals.size(); ++i) {
+        double d = vals[i] - vals[i - 1];
+        if (d > 1e-6) diffs.push_back(d);
+    }
+    if (diffs.empty()) return 0.0;
+    std::sort(diffs.begin(), diffs.end());
+    return diffs[diffs.size() / 2];
+}
+
+static std::vector<SurfacePatch> subdivideTopSkyPatches(const std::vector<SurfacePatch>& skyGeo,
+                                                        int factor,
+                                                        bool keepOriginal) {
+    if (factor <= 1 || skyGeo.empty()) return skyGeo;
+
+    std::vector<double> topXs;
+    std::vector<double> topYs;
+    topXs.reserve(skyGeo.size());
+    topYs.reserve(skyGeo.size());
+    for (const auto& patch : skyGeo) {
+        const double areaMag = patch.areaVector.norm();
+        if (areaMag <= 1e-12) continue;
+        const double nz = patch.areaVector.z() / areaMag;
+        if (std::abs(nz) > 0.9) {
+            topXs.push_back(patch.center.x);
+            topYs.push_back(patch.center.y);
+        }
+    }
+
+    const double dxMed = medianPositiveSpacing(topXs);
+    const double dyMed = medianPositiveSpacing(topYs);
+    if (dxMed <= 0.0 || dyMed <= 0.0) return skyGeo;
+
+    std::vector<SurfacePatch> out;
+    const size_t multiplier = keepOriginal ? static_cast<size_t>(factor * factor + 1)
+                                           : static_cast<size_t>(factor * factor);
+    out.reserve(skyGeo.size() * std::max<size_t>(1, multiplier));
+
+    const double baseArea = dxMed * dyMed;
+    const double invNN = 1.0 / static_cast<double>(factor * factor);
+    for (const auto& patch : skyGeo) {
+        const double areaMag = patch.areaVector.norm();
+        if (areaMag <= 1e-12) {
+            out.push_back(patch);
+            continue;
+        }
+
+        const double nz = patch.areaVector.z() / areaMag;
+        if (std::abs(nz) <= 0.9) {
+            out.push_back(patch);
+            continue;
+        }
+
+        if (keepOriginal) out.push_back(patch);
+
+        const double scale = (baseArea > 0.0) ? std::sqrt(patch.area / baseArea) : 1.0;
+        const double dx = dxMed * scale;
+        const double dy = dyMed * scale;
+        for (int iy = 0; iy < factor; ++iy) {
+            for (int ix = 0; ix < factor; ++ix) {
+                SurfacePatch sub = patch;
+                sub.center.x += ((static_cast<double>(ix) + 0.5) / factor - 0.5) * dx;
+                sub.center.y += ((static_cast<double>(iy) + 0.5) / factor - 0.5) * dy;
+                sub.areaVector *= invNN;
+                sub.area *= invNN;
+                out.push_back(sub);
+            }
+        }
+    }
+
+    return out;
+}
+
 static double areaWeightedAverage(const Eigen::VectorXd& values,
                                   const std::array<Vec3, 5>& areaVectors) {
     double sum = 0.0;
@@ -265,6 +485,48 @@ static double areaWeightedAverage(const Eigen::VectorXd& values,
         sumArea += area;
     }
     return sumArea > 0.0 ? sum / sumArea : 0.0;
+}
+
+static double areaWeightedAverage(const std::array<double, 5>& values,
+                                  const std::array<Vec3, 5>& areaVectors) {
+    double sum = 0.0;
+    double sumArea = 0.0;
+    for (int i = 0; i < static_cast<int>(areaVectors.size()); ++i) {
+        const double area = areaVectors[i].norm();
+        sum += values[i] * area;
+        sumArea += area;
+    }
+    return sumArea > 0.0 ? sum / sumArea : 0.0;
+}
+
+static void removeIfExists(const std::string& path) {
+    if (std::ifstream(path).good()) {
+        std::remove(path.c_str());
+    }
+}
+
+static void cleanStage2Outputs(const std::string& outDir,
+                               bool writeDebugTerms,
+                               bool writeDebugQrswSurface) {
+    static const std::vector<std::string> baseFiles = {
+        "Tmrt_pedestrian.vtk",
+        "TumrtAvg",
+        "RH_pedestrian.vtk",
+        "UTCI.vtk",
+        "Tumrt_surface.vtk",
+        "Tmrt_surface.vtk",
+        "RH_surface.vtk",
+        "UTCI_surface.vtk"
+    };
+    for (const auto& name : baseFiles) {
+        removeIfExists(outDir + "/" + name);
+    }
+    if (writeDebugTerms) {
+        removeIfExists(outDir + "/TumrtAvg_terms");
+    }
+    if (writeDebugQrswSurface) {
+        removeIfExists(outDir + "/qrsw_surface.vtk");
+    }
 }
 
 template <typename T>
@@ -299,7 +561,7 @@ static bool validateRequiredInputs(const CommandLineArgs& args,
         logError("no wall/tree surface geometry loaded from postProcessing/surfaces");
         ok = false;
     }
-    if (args.useSkyViewFactors && skyGeo.empty()) {
+    if (args.useSkyViewFactors && !args.angularSky && skyGeo.empty()) {
         logError("sky view factors requested but no sky surface geometry was loaded");
         ok = false;
     }
@@ -392,22 +654,37 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
 
         std::vector<ViewFactorResult> batchVF(bN);
         std::atomic<size_t> vfDone{0};
+        std::atomic<long long> vfLoadNs{0};
+        std::atomic<long long> vfComputeNs{0};
+        std::atomic<long long> vfSaveNs{0};
         size_t vfInterval = std::max(size_t(1), bN / 10);
         auto vfT0 = std::chrono::steady_clock::now();
 
         #pragma omp parallel for schedule(dynamic)
         for (size_t bi = 0; bi < bN; ++bi) {
             size_t pedIdx = bStart + bi;
-            std::string cachePath = ctx.cache.getCachePath(ctx.positions[pedIdx].originalIndex);
+            std::string cachePath = ctx.cache.getCachePath(
+                ctx.positions[pedIdx].originalIndex,
+                ctx.positions[pedIdx].center
+            );
             bool loaded = false;
             if (!ctx.args.forceRecompute) {
+                auto tLoad0 = std::chrono::steady_clock::now();
                 loaded = ctx.cache.load(cachePath, batchVF[bi]);
+                auto tLoad1 = std::chrono::steady_clock::now();
+                vfLoadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tLoad1 - tLoad0).count();
             }
             if (!loaded) {
+                auto tCompute0 = std::chrono::steady_clock::now();
                 batchVF[bi] = ctx.vfCalc.compute(
                     ctx.positions[pedIdx], ctx.allGeo, ctx.skyGeo, ctx.args.useSkyViewFactors
                 );
+                auto tCompute1 = std::chrono::steady_clock::now();
+                vfComputeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tCompute1 - tCompute0).count();
+                auto tSave0 = std::chrono::steady_clock::now();
                 ctx.cache.save(cachePath, batchVF[bi]);
+                auto tSave1 = std::chrono::steady_clock::now();
+                vfSaveNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tSave1 - tSave0).count();
             }
             size_t cur = ++vfDone;
             if (cur % vfInterval == 0 || cur == bN) {
@@ -427,29 +704,29 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
             }
         }
 
+        {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(2)
+                << "  VF timing: load=" << (vfLoadNs.load() / 1e9) << "s"
+                << " compute=" << (vfComputeNs.load() / 1e9) << "s"
+                << " save=" << (vfSaveNs.load() / 1e9) << "s";
+            logSummary(out.str());
+        }
+
+        const int timestepThreads = std::max(
+            1,
+            std::min(
+                (!ctx.args.forceRecompute && ctx.args.nThreads > 0) ? ctx.args.nThreads
+                                                                    : std::min(ctx.args.nThreads > 0 ? ctx.args.nThreads : 1, 8),
+                static_cast<int>(ctx.timesteps.size())
+            )
+        );
+        #pragma omp parallel for schedule(dynamic) num_threads(timestepThreads)
         for (size_t tIdx = 0; tIdx < ctx.timesteps.size(); ++tIdx) {
             int t = ctx.timesteps[tIdx];
             const auto& sc = ctx.tsData[tIdx];
             const MeteoData& meteo = ctx.meteoData[tIdx];
-
-            std::vector<SurfacePatch> allSurfaces = ctx.allGeo;
-            if (!sc.allQrOut.empty()) {
-                for (size_t i = 0; i < allSurfaces.size() && i < sc.allQrOut.size(); ++i) {
-                    allSurfaces[i].qrOut = sc.allQrOut[i];
-                }
-            } else {
-                for (size_t i = 0; i < ctx.wallGeo.size() && i < sc.wallTemps.size(); ++i) {
-                    allSurfaces[i].temperature = sc.wallTemps[i];
-                }
-                for (size_t i = 0; i < ctx.vegGeo.size(); ++i) {
-                    size_t idx = ctx.wallGeo.size() + i;
-                    if (i < sc.vegTemps.size()) allSurfaces[idx].temperature = sc.vegTemps[i];
-                    if (i < sc.vegQr.size()) allSurfaces[idx].qr = sc.vegQr[i];
-                }
-            }
-            for (size_t i = 0; i < allSurfaces.size() && i < sc.allQsOut.size(); ++i) {
-                allSurfaces[i].qsOut = sc.allQsOut[i];
-            }
+            SurfaceRadiativeData surfaceData = buildSurfaceRadiativeData(ctx, sc);
 
             Eigen::VectorXd batchTmrt = Eigen::VectorXd::Zero(bN);
             Eigen::VectorXd batchUtci = Eigen::VectorXd::Zero(bN);
@@ -490,15 +767,22 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                 fp_solar = 0.308 * std::cos(betaDeg * (1.0 - betaDeg * betaDeg / 48402.0) * M_PI / 180.0);
             }
 
-            #pragma omp parallel for schedule(dynamic)
             for (size_t bi = 0; bi < bN; ++bi) {
                 size_t pedIdx = bStart + bi;
-                TmrtBreakdown tmrtDetail = ctx.tmrtSolver.computeDetailed(
-                    allSurfaces, ctx.skyGeo, batchVF[bi], meteo, ctx.args.useSkyViewFactors
-                );
-                double TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
-                    tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
-                );
+                std::array<double, 5> tmrtFast{};
+                TmrtBreakdown tmrtDetail;
+                double TumrtNoSolar = 0.0;
+                if (ctx.args.writeDebugTerms) {
+                    tmrtDetail = ctx.tmrtSolver.computeDetailed(surfaceData, batchVF[bi], meteo);
+                    TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
+                        tmrtDetail.Tmrt, ctx.positions[pedIdx].areaVectors
+                    );
+                } else {
+                    tmrtFast = ctx.tmrtSolver.computeFast(surfaceData, batchVF[bi], meteo);
+                    TumrtNoSolar = ctx.tmrtSolver.computeAreaWeightedAverage(
+                        tmrtFast, ctx.positions[pedIdx].areaVectors
+                    );
+                }
                 double TumrtAvg = TumrtNoSolar;
                 batchTumrtNoSolar[bi] = TumrtNoSolar;
                 if (ctx.args.writeDebugTerms) {
@@ -709,7 +993,13 @@ int main(int argc, char* argv[]) {
     // =========================================================
     // Load STL geometry for ray occlusion
     // =========================================================
-    std::string wallTreeStl = args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl";
+    std::string wallTreeStl = firstExistingPath({
+        args.casePath + "/constant/triSurface/wallAndTreesurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurface.stl",
+        args.casePath + "/constant/triSurface/wallAndTreeSurfaces.stl",
+        args.casePath + "/constant/triSurface/walls.stl",
+        args.casePath + "/constant/triSurface/facades.stl"
+    });
     Raycaster raycaster;
     raycaster.setNumThreads(args.nThreads);
     logInfo("Loading STL geometry...");
@@ -717,6 +1007,7 @@ int main(int argc, char* argv[]) {
         logError("could not load " + wallTreeStl);
         return 1;
     }
+    raycaster.loadVegetation(args.casePath + "/constant/triSurface/air_to_vegetation.stl");
 
     // =========================================================
     // Load surface geometry ONCE (from first timestep)
@@ -765,8 +1056,31 @@ int main(int argc, char* argv[]) {
 
     std::vector<SurfacePatch> skyGeo;
     if (args.useSkyViewFactors) {
-        skyGeo = loadSurfacePatches(firstSurfDir + "/Sf_skySurfaces.raw");
-        logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
+        if (args.angularSky) {
+            std::ostringstream out;
+            out << "Sky mode:      angular"
+                << " (" << args.skyAzimuthSamples
+                << " azimuth x " << args.skyElevationSamples
+                << " elevation, ray length " << args.skyRayLength << " m)";
+            logDetail(out.str());
+        } else {
+            skyGeo = loadSurfacePatches(firstSurfDir + "/Sf_skySurfaces.raw");
+            if (args.skySubdivideTop > 1) {
+                const size_t before = skyGeo.size();
+                skyGeo = subdivideTopSkyPatches(
+                    skyGeo, args.skySubdivideTop, args.skySubdivideKeepOriginal
+                );
+                std::ostringstream out;
+                out << "Sky surfaces:  " << before
+                    << " -> " << skyGeo.size()
+                    << " (top " << args.skySubdivideTop << "x" << args.skySubdivideTop
+                    << (args.skySubdivideKeepOriginal ? ", kept originals" : ", replaced originals")
+                    << ")";
+                logDetail(out.str());
+            } else {
+                logDetail("Sky surfaces:  " + std::to_string(skyGeo.size()));
+            }
+        }
     }
 
     // =========================================================
@@ -793,16 +1107,27 @@ int main(int argc, char* argv[]) {
     std::vector<TimestepScalars> tsData(timesteps.size());
     std::vector<Point3> pedCenters(positions.size());
     for (size_t i = 0; i < positions.size(); ++i) pedCenters[i] = positions[i].center;
+    const int preloadThreads = std::max(1, std::min({args.nThreads > 0 ? args.nThreads : 1,
+                                                     6,
+                                                     static_cast<int>(timesteps.size())}));
+    #pragma omp parallel for schedule(dynamic) num_threads(preloadThreads)
     for (size_t tIdx = 0; tIdx < timesteps.size(); ++tIdx) {
         int t = timesteps[tIdx];
         std::string surfDir = args.casePath + "/postProcessing/surfaces/" + std::to_string(t);
         std::string radDir = args.casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(t);
-        tsData[tIdx].wallTemps = loadScalarField(surfDir + "/T_wallSurfaces.raw");
-        tsData[tIdx].vegTemps  = loadScalarField(surfDir + "/T_vegSurfaces.raw");
-        tsData[tIdx].vegQr     = loadScalarField(surfDir + "/qr_vegSurfaces.raw");
+        auto timedLoadScalarField = [&](const std::string& path, double& secs) {
+            auto t0 = std::chrono::steady_clock::now();
+            auto values = loadScalarField(path);
+            secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            return values;
+        };
+        double tWallSecs = 0.0, tVegSecs = 0.0, qrVegSecs = 0.0, qrOutSecs = 0.0, qsOutSecs = 0.0;
+        tsData[tIdx].wallTemps = timedLoadScalarField(surfDir + "/T_wallSurfaces.raw", tWallSecs);
+        tsData[tIdx].vegTemps  = timedLoadScalarField(surfDir + "/T_vegSurfaces.raw", tVegSecs);
+        tsData[tIdx].vegQr     = timedLoadScalarField(surfDir + "/qr_vegSurfaces.raw", qrVegSecs);
         // combined outgoing LW radiation (reference format, replaces T+qr)
-        tsData[tIdx].allQrOut  = loadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw");
-        tsData[tIdx].allQsOut  = loadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw");
+        tsData[tIdx].allQrOut  = timedLoadScalarField(surfDir + "/qrOut_wallAndTreeSurfaces.raw", qrOutSecs);
+        tsData[tIdx].allQsOut  = timedLoadScalarField(surfDir + "/qsOut_wallAndTreeSurfaces.raw", qsOutSecs);
         const std::string qrswPath = firstExistingPath({
             surfDir + "/qrsw_pedestrian.vtk",
             radDir + "/qrsw_pedestrian.vtk"
@@ -814,8 +1139,18 @@ int main(int argc, char* argv[]) {
             }
         }
         if (tsData[tIdx].wallTemps.empty() && tsData[tIdx].allQrOut.empty()) {
+            #pragma omp critical
             logWarn("no wall temps or qrOut for t=" + std::to_string(t));
         }
+        std::ostringstream out;
+        out << "t=" << t
+            << " T_wall count=" << tsData[tIdx].wallTemps.size() << " time=" << std::fixed << std::setprecision(3) << tWallSecs << "s"
+            << " T_veg count=" << tsData[tIdx].vegTemps.size() << " time=" << tVegSecs << "s"
+            << " qr_veg count=" << tsData[tIdx].vegQr.size() << " time=" << qrVegSecs << "s"
+            << " qrOut count=" << tsData[tIdx].allQrOut.size() << " time=" << qrOutSecs << "s"
+            << " qsOut count=" << tsData[tIdx].allQsOut.size() << " time=" << qsOutSecs << "s";
+        #pragma omp critical
+        logDetail(out.str());
     }
     logInfo("Scalars loaded.");
 
@@ -880,6 +1215,7 @@ int main(int argc, char* argv[]) {
             if (!createDirectory(outDir)) {
                 logWarn("could not create " + outDir + ": " + std::strerror(errno));
             }
+            cleanStage2Outputs(outDir, args.writeDebugTerms, args.writeDebugQrswSurface);
         }
     }
 
@@ -887,11 +1223,27 @@ int main(int argc, char* argv[]) {
     // Batch processing: VF → Tmrt → write, one batch at a time
     // Each batch uses (batchSize × ~20 MB) for ViewFactorResults
     // =========================================================
-    ViewFactorCalculator vfCalc(raycaster);
+    ViewFactorCalculator vfCalc(
+        raycaster,
+        args.angularSky,
+        args.skyAzimuthSamples,
+        args.skyElevationSamples,
+        args.skyRayLength
+    );
     BinaryCache cache;
     std::string cacheBaseDir = args.casePath + "/" + args.outputDir;
     cache.setBaseDir(cacheBaseDir);
     cache.setCompressed(args.compressCache);
+    std::ostringstream tag;
+    if (args.angularSky) {
+        tag << "_skyAngular"
+            << args.skyAzimuthSamples << "x" << args.skyElevationSamples
+            << "_L" << static_cast<long long>(std::llround(args.skyRayLength));
+    } else if (args.skySubdivideTop > 1) {
+        tag << "_skyTopSub" << args.skySubdivideTop;
+        if (args.skySubdivideKeepOriginal) tag << "_keep";
+    }
+    cache.setVariantTag(tag.str());
     if (args.compressCache && !BinaryCache::compressionAvailable()) {
         logWarn("--compress-cache requested but binary was built without ZLIB support; cache files will be written uncompressed.");
     }
@@ -965,7 +1317,8 @@ int main(int argc, char* argv[]) {
                 { {"Tmrt", TmrtC}, {"UTCI", sparseResults.utci[tIdx]} });
         }
         computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, sparseResults.tumrtNoSolar[tIdx],
-                                   utciSolver, args.writeDebugQrswSurface);
+                                   utciSolver, args.writeDebugQrswSurface, args.denseTumrtInterp,
+                                   args.denseTumrtSmoothPasses, args.denseInterpClamp);
 
         // Print stats
         double tMin  = sparseResults.tmrt[tIdx].minCoeff();

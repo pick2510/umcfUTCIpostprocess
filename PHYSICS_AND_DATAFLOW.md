@@ -42,20 +42,31 @@ Fij = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)
 - Only patches within `R_MAG_MAX = 100 m` of the pedestrian are considered
 - Pairs where the body segment does not face the surface (`nᵢ · r ≥ 0`) are skipped
 - Each candidate pair is tested for ray occlusion against the STL BVH; blocked pairs contribute zero
-- Results stored as sparse `(patch_index, float32_value)` pairs per segment
+- Rays are trimmed to the 3 %–97 % segment of the full body→patch distance to avoid self-intersection artefacts (startOffset = 3 %, tmax = 0.94 × len from the offset origin = 97 % of original length)
+- Results stored as SoA sparse arrays (`std::vector<int> indices` + `std::vector<float> fij`) per segment — float32 values are sufficient precision for UTCI and halve cache size vs float64
 - Cached to `UTCI/pos/<original_probe_index>.bin`; cache key is the stable file-order index, not the post-filter array position
-- Cache format: version 9 (plain binary) or version 10 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
+- Cache format: version 11 (plain binary) or version 12 (gzip-compressed, requires ZLIB at build time); format auto-detected by magic bytes on load
 
-**Sky view factors** (explicit geometry):
+**Sky view factors — two modes:**
 
-Sky patches (`Sf_skySurfaces.raw`) are treated as a separate geometry set. The same differential formula applies, but with `enforceRangeLimit = false` so sky patches can be arbitrarily far away:
+*Patch mode* (`--sky-method patch`, default): Sky patches (`Sf_skySurfaces.raw`) are treated as a separate geometry set. The same differential formula applies, but with `enforceRangeLimit = false` so sky patches can be arbitrarily far away:
 
 ```
 FijSky = |nᵢ · r̂| × |nⱼ · r̂| × Aⱼ / (π r²)   (no distance cap)
 FijsumSky = Σ FijSky
 ```
 
-Ray occlusion is tested for sky rays with the same BVH but without the `R_MAG_MAX` cutoff.
+Ray occlusion is tested per patch centre; a patch is either fully visible or fully blocked. Large boundary patches produce coarser shadow boundaries than the angular mode.
+
+*Angular mode* (`--sky-method angular`): The upper hemisphere is discretised into `N_az × N_el` directional bins (default 48 × 12 = 576). For each bin direction **d** and body segment *n*:
+
+```
+FijsumSky[n] += max(nᵢ · d, 0) × w_s / π
+
+  w_s  = solid-angle weight of bin s (uniform in azimuth, sin-weighted in elevation)
+```
+
+Each direction is tested independently against the STL BVH with a ray of length `skyRayLength` (default 5000 m). Unblocked bins contribute their weighted cos(θ) factor; blocked bins contribute zero. This gives per-direction sky visibility and sharp, geometrically accurate shadow boundaries.
 
 ### 3. Outgoing Surface Radiation
 
@@ -116,6 +127,17 @@ Area-weighted average over all segments:
 ```
 Tmrt_avg = Σ(Tmrt_n × |Aₙ|) / Σ|Aₙ|
 ```
+
+The SW contributions are also categorised by surface orientation (used in debug output `TumrtAvg_terms/`):
+
+| Category | Condition |
+|----------|-----------|
+| `qswGround` | nz < −0.7 and patch centre z ≤ 2.5 m |
+| `qswElevatedDown` | nz < −0.7 and patch centre z > 2.5 m |
+| `qswUpward` | nz > +0.7 |
+| `qswVertical` | −0.7 ≤ nz ≤ +0.7 |
+
+where nz is the z-component of the normalised surface patch area vector.
 
 **Direct solar addition:**
 
@@ -183,13 +205,23 @@ va_ref = v_CFD / 0.667
 
 ```
 pv   = P_ref × w / (ε_H₂O + w)          [Pa]   (urbanMicroclimateFoam convention)
-psat = exp(77.345 + 0.0057 Ta_K − 7235/Ta_K) / Ta_K^8.2   [Pa]
+psat = exp(77.345 + 0.0057 Ta_K − 7235/Ta_K) / Ta_K^8.2   [Pa]   (Alduchov–Eskridge)
 RH   = clamp( pv / psat × 100,  0, 100 )   [%]
-Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 
   P_ref   = 101325 Pa
   ε_H₂O  = 0.621945  (ratio of molar masses M_water/M_dryair)
 ```
+
+For the **polynomial method**, `utciSolver` internally converts RH → Pa [kPa] using its own 8-term saturation formula (ISO 7933 / Hardy 1998):
+
+```
+es [hPa] = 0.01 × exp( 2.7150305 ln(Ta_K) − 2836.5744/Ta_K² − 6028.076559/Ta_K
+                       + 19.54263612 − 0.02737830188 Ta_K + 1.6261698×10⁻⁵ Ta_K²
+                       + 7.0229056×10⁻¹⁰ Ta_K³ − 1.8680009×10⁻¹³ Ta_K⁴ )
+Pa [kPa] = es × RH / 100 / 10
+```
+
+For the **LUT method**, RH is used directly as a table axis; no Pa conversion is needed.
 
 `qrsw` is stored as a 3-D vector field in OpenFOAM/VTK (solar irradiance direction × magnitude). The scalar irradiance used in the solar addition is its magnitude: `|qrsw|`.
 
@@ -255,12 +287,15 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │                                                                     │
 │  Load once:                                                         │
 │    allGeo     ← Sf_wallAndTreeSurfaces.raw  (~329 k patch faces)    │
-│    skyGeo     ← Sf_skySurfaces.raw          (5 boundary patches)    │
+│    skyGeo     ← Sf_skySurfaces.raw  (patch mode, boundary patches)  │
+│               OR  N_az×N_el hemisphere dirs  (angular mode)         │
 │    STL BVH    ← wallAndTreeSurfaces.stl      (ray occlusion)        │
 │    meteo[t]   ← Tambient, cc, Idif, Idn, sunDir, va                 │
 │    probeT/U/w/qrsw ← per-position rows; probe points matched to     │
 │                 pedestrian positions by xyz coordinate hash (mm      │
 │                 precision); falls back to original probe file index  │
+│    (files parsed with bulk strtod reader: full file into buffer,     │
+│     walked with strtod — no stream or istringstream overhead)        │
 │                                                                     │
 │  Batch loop (500 pos / batch, OpenMP):                              │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -271,7 +306,11 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │  │     Fijsum[5] = Σ Fij                                        │  │
 │  │                                                              │  │
 │  │ For each timestep t:                                         │  │
-│  │   qrOut[m], qsOut[m]  ←  .raw files for this t              │  │
+│  │   SurfaceRadiativeData built once per timestep (hoisted      │  │
+│  │     outside inner position loop): qrOut[m], qsOut[m],        │  │
+│  │     swClass[m] from .raw files for this t                    │  │
+│  │   computeFast() hot path per position (skips breakdown        │  │
+│  │     struct; thread cap removed for cached runs):              │  │
 │  │   qin_LW, qin_SW  per segment                               │  │
 │  │     = (surf contribution + sky contribution) / (Fijsum+FijsumSky)│ │
 │  │   Tmrt[5]  ←  (ε_p qin_LW + α_sw qin_SW) / (σ ε_p) ^0.25  │  │
@@ -288,6 +327,8 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 │    UTCI/<t>/RH_pedestrian.vtk      (point cloud, RH [%])           │
 │    UTCI/<t>/UTCI.vtk               (point cloud, Tmrt[°C]+UTCI[°C])│
 │    UTCI/<t>/Tumrt_surface.vtk      (dense mesh, pre-solar Tmrt)    │
+│    (dense output uses DenseInterpPlan: Catmull-Rom stencil +        │
+│     bilinear weights built once and reused across all timesteps)    │
 │    UTCI/<t>/Tmrt_surface.vtk       (dense mesh, final Tmrt)        │
 │    UTCI/<t>/RH_surface.vtk         (dense mesh, RH [%])            │
 │    UTCI/<t>/UTCI_surface.vtk       (dense mesh, UTCI+Tmrt [°C])    │
@@ -330,7 +371,7 @@ Pa   = pv / 100   (polynomial: kPa)  /  RH used directly (LUT)
 | `src/pedestrian.cpp` | 5-segment body model |
 | `src/raycaster.cpp` | STL BVH ray intersection |
 | `src/denseStage2.cpp` | Dense surface interpolation and output |
-| `src/caching.cpp` | Binary VF cache (v9 plain / v10 gzip) |
+| `src/caching.cpp` | Binary VF cache (v11 plain / v12 gzip) |
 | `src/io.cpp` | Raw/probe file readers, VTK writers |
 | `src/constants.h` | All physical constants |
 | `openfoam/calculateqrsw/` | OF utility — direct solar volume field (qrsw) |

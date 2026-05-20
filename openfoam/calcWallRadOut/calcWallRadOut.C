@@ -31,11 +31,81 @@ Description
 
 \*---------------------------------------------------------------------------*/
 
-#include "fvCFD.H"
+#include "argList.H"
+#include "timeSelector.H"
+#include "Time.H"
+#include "fvMesh.H"
+#include "volFields.H"
+#include "surfaceFields.H"
+#include "IOdictionary.H"
+#include "dimensionedScalar.H"
 #include "physicoChemicalConstants.H"
 #include "greyDiffusiveViewFactorFixedValueFvPatchScalarField.H"
 #include "solarLoadViewFactorFixedValueFvPatchScalarField.H"
-#include "wallFvPatch.H"
+#include "mixedFvPatchFields.H"
+
+using namespace Foam;
+
+namespace
+{
+    Foam::IOdictionary readFieldDictionary
+    (
+        const Foam::fvMesh& mesh,
+        const Foam::Time& runTime,
+        const Foam::word& fieldName
+    )
+    {
+        const Foam::word oldTypeName = Foam::IOdictionary::typeName;
+        const_cast<Foam::word&>(Foam::IOdictionary::typeName) = Foam::word::null;
+
+        Foam::IOdictionary fieldDict
+        (
+            Foam::IOobject
+            (
+                fieldName,
+                Foam::Time::timeName(runTime.value()),
+                mesh,
+                Foam::IOobject::MUST_READ,
+                Foam::IOobject::NO_WRITE,
+                false
+            )
+        );
+
+        const_cast<Foam::word&>(Foam::IOdictionary::typeName) = oldTypeName;
+        const_cast<Foam::word&>(fieldDict.type()) = fieldDict.headerClassName();
+        return fieldDict;
+    }
+
+    const Foam::dictionary& lookupBoundaryPatchDict
+    (
+        const Foam::dictionary& boundaryFieldDict,
+        const Foam::word& patchName
+    )
+    {
+        return boundaryFieldDict.lookupEntry(patchName, false, true).dict();
+    }
+
+    Foam::scalarField readLookupScalarField
+    (
+        const Foam::dictionary& boundaryFieldDict,
+        const Foam::word& patchName,
+        const char* key
+      , const Foam::label patchSize
+    )
+    {
+        const Foam::dictionary& dict =
+            lookupBoundaryPatchDict(boundaryFieldDict, patchName);
+
+        if (!dict.found(key))
+        {
+            FatalErrorInFunction
+                << "Missing key '" << key << "' for patch " << patchName
+                << Foam::exit(Foam::FatalError);
+        }
+
+        return Foam::scalarField(key, dict, patchSize);
+    }
+}
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -46,12 +116,27 @@ int main(int argc, char *argv[])
     #include "setRootCase.H"
     #include "createTime.H"
     instantList timeDirs = timeSelector::select0(runTime, args);
-    #include "createNamedMesh.H"
+    const word regionName =
+        args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    const word meshTimeName = Time::timeName(runTime.value());
+    Info<< "Create mesh " << regionName << " for time = "
+        << meshTimeName << nl << endl;
+    fvMesh mesh
+    (
+        IOobject
+        (
+            regionName,
+            meshTimeName,
+            runTime,
+            IOobject::MUST_READ
+        )
+    );
 
     forAll(timeDirs, timeI)
     {
         runTime.setTime(timeDirs[timeI], timeI);
-        Info<< "Time = " << runTime.timeName() << endl;
+        const word timeName = Time::timeName(runTime.value());
+        Info<< "Time = " << timeName << endl;
         mesh.readUpdate();
 
         volScalarField qrOut
@@ -59,7 +144,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qrOut",
-                runTime.timeName(),
+                timeName,
                 mesh
             ),
             mesh,
@@ -72,7 +157,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qsOut",
-                runTime.timeName(),
+                timeName,
                 mesh
             ),
             mesh,
@@ -85,7 +170,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "T",
-                runTime.timeName(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -97,7 +182,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qr",
-                runTime.timeName(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -109,7 +194,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                 "qs",
-                runTime.timeName(),
+                timeName,
                 mesh,
                 IOobject::MUST_READ,
                 IOobject::NO_WRITE
@@ -120,36 +205,113 @@ int main(int argc, char *argv[])
         volScalarField::Boundary& TBf = T.boundaryFieldRef();
         volScalarField::Boundary& qrBf = qr.boundaryFieldRef();
         volScalarField::Boundary& qsBf = qs.boundaryFieldRef();
+        const IOdictionary qrDict = readFieldDictionary(mesh, runTime, "qr");
+        const IOdictionary qsDict = readFieldDictionary(mesh, runTime, "qs");
+        const dictionary& qrBoundaryDict = qrDict.subDict("boundaryField");
+        const dictionary& qsBoundaryDict = qsDict.subDict("boundaryField");
         
         forAll(qrBf, patchi)
         {
-            if (isA<wallFvPatch>(mesh.boundary()[patchi]))
+            const fvPatch& patch = mesh.boundary()[patchi];
+            if (patch.size() == 0)
             {
-                fvPatchScalarField& qrOuti = qrOutBf[patchi];
-                fvPatchScalarField& qsOuti = qsOutBf[patchi];
-                const scalar sigma = constant::physicoChemical::sigma.value();
+                continue;
+            }
 
-                fvPatchScalarField& qrPatch = qrBf[patchi];
-                Foam::greyDiffusiveViewFactorFixedValueFvPatchScalarField& qrp =
-                    refCast
-                    <
-                        Foam::greyDiffusiveViewFactorFixedValueFvPatchScalarField
-                    >(qrPatch);
-                fvPatchScalarField& qsPatch = qsBf[patchi];
-                Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField& qsp =
-                    refCast
-                    <
-                        Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField
-                    >(qsPatch);
+            fvPatchScalarField& qrOuti = qrOutBf[patchi];
+            fvPatchScalarField& qsOuti = qsOutBf[patchi];
+            const scalar sigma = constant::physicoChemical::sigma.value();
+            fvPatchScalarField& qrPatch = qrBf[patchi];
+            fvPatchScalarField& qsPatch = qsBf[patchi];
 
-                const fvPatchScalarField& Ti = TBf[patchi];
-                const fvPatchScalarField& qri = qrBf[patchi];
-                const scalarField E = qrp.emissivity();
-                const fvPatchScalarField& qsi = qsBf[patchi];
-                const scalarField A = qsp.albedo();
-                
-                qrOuti = sigma*pow4(Ti) + qri*(1-E)/E;
-                qsOuti = qsi*A/(1-A);
+            if
+            (
+                !isA<Foam::greyDiffusiveViewFactorFixedValueFvPatchScalarField>(qrPatch)
+             || !isA<Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField>(qsPatch)
+            )
+            {
+                Info<< "Skipping patch " << patch.name()
+                    << " because qr/qs patch field types are "
+                    << qrPatch.type() << " / " << qsPatch.type()
+                    << " instead of greyDiffusiveRadiationViewFactor / "
+                    << "solarLoadRadiationViewFactor" << endl;
+                continue;
+            }
+
+            Foam::greyDiffusiveViewFactorFixedValueFvPatchScalarField& qrp =
+                refCast
+                <
+                    Foam::greyDiffusiveViewFactorFixedValueFvPatchScalarField
+                >(qrPatch);
+            Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField& qsp =
+                refCast
+                <
+                    Foam::solarLoad::solarLoadViewFactorFixedValueFvPatchScalarField
+                >(qsPatch);
+
+            const fvPatchScalarField& TiBC = TBf[patchi];
+            // For mixed BCs (CFDHAMfluidTemperatureCoupledMixed and similar),
+            // BC evaluation in postprocessing mode returns the initial value
+            // (293.15 K). refValue() holds the actual face temperature written
+            // by the solver and is correct for all timesteps after t=0.
+            const scalarField Ti =
+                isA<mixedFvPatchScalarField>(TiBC)
+                ? refCast<const mixedFvPatchScalarField>(TiBC).refValue()
+                : scalarField(TiBC);
+            const fvPatchScalarField& qri = qrBf[patchi];
+            const fvPatchScalarField& qsi = qsBf[patchi];
+
+            const word& patchName = patch.name();
+            const dictionary& qrPatchDict =
+                lookupBoundaryPatchDict(qrBoundaryDict, patchName);
+            const dictionary& qsPatchDict =
+                lookupBoundaryPatchDict(qsBoundaryDict, patchName);
+
+            scalarField E;
+            if
+            (
+                qrPatchDict.lookupOrDefault<word>("emissivityMode", "")
+                == "lookup"
+            )
+            {
+                E = readLookupScalarField
+                (
+                    qrBoundaryDict,
+                    patchName,
+                    "emissivity",
+                    qrPatch.size()
+                );
+            }
+            else
+            {
+                E = qrp.emissivity();
+            }
+
+            scalarField A;
+            if (qsPatchDict.lookupOrDefault<word>("albedoMode", "") == "lookup")
+            {
+                A = readLookupScalarField
+                (
+                    qsBoundaryDict,
+                    patchName,
+                    "albedo",
+                    qsPatch.size()
+                );
+            }
+            else
+            {
+                A = qsp.albedo();
+            }
+            
+            qrOuti = sigma*pow4(Ti) + qri*(1-E)/E;
+            qsOuti = scalar(0);
+            forAll(qsOuti, faceI)
+            {
+                const scalar denom = 1 - A[faceI];
+                if (denom > 1e-6)
+                {
+                    qsOuti[faceI] = qsi[faceI]*A[faceI]/denom;
+                }
             }
         }
         

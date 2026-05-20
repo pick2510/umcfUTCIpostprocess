@@ -24,43 +24,96 @@ Eigen::VectorXd TmrtSolver::compute(
     const MeteoData& meteo,
     bool useSkyViewFactors)
 {
-    return computeDetailed(surfaces, sky, vf, meteo, useSkyViewFactors).Tmrt;
+    SurfaceRadiativeData surfaceData;
+    surfaceData.qrOut.resize(surfaces.size());
+    surfaceData.qsOut.resize(surfaces.size());
+    surfaceData.swClass.resize(surfaces.size());
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+        if (surfaces[i].qrOut > 0.0) {
+            surfaceData.qrOut[i] = surfaces[i].qrOut;
+        } else {
+            surfaceData.qrOut[i] = SIGMA * std::pow(surfaces[i].temperature, 4)
+                                 + surfaces[i].qr * (1.0 - EPS_SURF) / EPS_SURF;
+        }
+        surfaceData.qsOut[i] = surfaces[i].qsOut;
+        double areaMag = surfaces[i].areaVector.norm();
+        double nz = (areaMag > 0.0) ? surfaces[i].areaVector.z() / areaMag : 0.0;
+        if (nz < -0.7) {
+            surfaceData.swClass[i] = (surfaces[i].center.z <= 2.5)
+                ? SurfaceSwClass::Ground
+                : SurfaceSwClass::ElevatedDown;
+        } else if (nz > 0.7) {
+            surfaceData.swClass[i] = SurfaceSwClass::Upward;
+        } else {
+            surfaceData.swClass[i] = SurfaceSwClass::Vertical;
+        }
+    }
+    std::array<double, 5> detail = computeFast(surfaceData, vf, meteo);
+    Eigen::VectorXd tmrt(5);
+    for (int i = 0; i < 5; ++i) tmrt[i] = detail[i];
+    (void)surfaces;
+    (void)sky;
+    (void)useSkyViewFactors;
+    return tmrt;
+}
+
+std::array<double, 5> TmrtSolver::computeFast(
+    const SurfaceRadiativeData& surfaceData,
+    const ViewFactorResult& vf,
+    const MeteoData& meteo)
+{
+    std::array<double, 5> out{};
+
+    if (surfaceData.qrOut.empty()) {
+        return out;
+    }
+
+    const double Tsky = computeSkyTemperature(meteo.Ta, meteo.cc);
+    const double sigmaTsky4 = SIGMA * std::pow(Tsky, 4);
+
+    for (int n = 0; n < 5; ++n) {
+        double qin_lw_surfaces = 0.0;
+        double qin_sw_surfaces = 0.0;
+
+        const auto& seg = vf.Fij[n];
+        const size_t segSize = seg.indices.size();
+        for (size_t k = 0; k < segSize; ++k) {
+            const int m = seg.indices[k];
+            const double fij_val = static_cast<double>(seg.fij[k]);
+            qin_lw_surfaces += surfaceData.qrOut[m] * fij_val;
+            qin_sw_surfaces += surfaceData.qsOut[m] * fij_val;
+        }
+
+        double qin_lw_sky = sigmaTsky4 * vf.FijsumSky[n];
+        double qin_sw_sky = meteo.Idif * vf.FijsumSky[n];
+        double total_vf = vf.Fijsum[n] + vf.FijsumSky[n];
+        if (total_vf > 0.0) {
+            qin_lw_surfaces /= total_vf;
+            qin_sw_surfaces /= total_vf;
+            qin_lw_sky /= total_vf;
+            qin_sw_sky /= total_vf;
+        }
+
+        const double qin_lw = qin_lw_surfaces + qin_lw_sky;
+        const double qin_sw = qin_sw_surfaces + qin_sw_sky;
+        const double Tmrt4 = (EPS_LW_PERSON * qin_lw + ABS_SW_PERSON * qin_sw)
+                           / (SIGMA * EPS_LW_PERSON);
+        out[n] = (Tmrt4 > 0.0) ? std::pow(Tmrt4, 0.25) : meteo.Ta;
+    }
+
+    return out;
 }
 
 TmrtBreakdown TmrtSolver::computeDetailed(
-    const std::vector<SurfacePatch>& surfaces,
-    const std::vector<SurfacePatch>& sky,
+    const SurfaceRadiativeData& surfaceData,
     const ViewFactorResult& vf,
-    const MeteoData& meteo,
-    bool useSkyViewFactors)
+    const MeteoData& meteo)
 {
     const int nBody = 5;
     TmrtBreakdown out;
-    out.Tmrt = Eigen::VectorXd::Zero(nBody);
-    out.qlwSurfaces = Eigen::VectorXd::Zero(nBody);
-    out.qlwSky = Eigen::VectorXd::Zero(nBody);
-    out.qswSurfaces = Eigen::VectorXd::Zero(nBody);
-    out.qswSky = Eigen::VectorXd::Zero(nBody);
-    out.qswGround = Eigen::VectorXd::Zero(nBody);
-    out.qswElevatedDown = Eigen::VectorXd::Zero(nBody);
-    out.qswVertical = Eigen::VectorXd::Zero(nBody);
-    out.qswUpward = Eigen::VectorXd::Zero(nBody);
     
-    if (surfaces.empty()) {
+    if (surfaceData.qrOut.empty()) {
         return out;
-    }
-    
-    // Precompute outgoing LW per surface.
-    // reference format: qrOut is already σT⁴ + qr*(1-ε)/ε (use directly).
-    // Legacy format: qrOut==0, compute from temperature and qr separately.
-    std::vector<double> QrOut(surfaces.size());
-    for (size_t i = 0; i < surfaces.size(); ++i) {
-        if (surfaces[i].qrOut > 0.0) {
-            QrOut[i] = surfaces[i].qrOut;
-        } else {
-            QrOut[i] = SIGMA * std::pow(surfaces[i].temperature, 4)
-                       + surfaces[i].qr * (1.0 - EPS_SURF) / EPS_SURF;
-        }
     }
     
     // Compute sky temperature once
@@ -73,16 +126,19 @@ TmrtBreakdown TmrtSolver::computeDetailed(
         double qin_sw_surfaces = 0.0;
 
         // LW and SW from wall/veg surfaces
-        for (const auto& [m, fij_val] : vf.Fij[n]) {
-            qin_lw_surfaces += QrOut[m] * fij_val;
-            double qsw = surfaces[m].qsOut * fij_val;
+        const auto& seg = vf.Fij[n];
+        const size_t segSize = seg.indices.size();
+        for (size_t k = 0; k < segSize; ++k) {
+            const int m = seg.indices[k];
+            const double fij_val = static_cast<double>(seg.fij[k]);
+            qin_lw_surfaces += surfaceData.qrOut[m] * fij_val;
+            double qsw = surfaceData.qsOut[m] * fij_val;
             qin_sw_surfaces += qsw;
-            double areaMag = surfaces[m].areaVector.norm();
-            double nz = (areaMag > 0.0) ? surfaces[m].areaVector.z() / areaMag : 0.0;
-            if (nz < -0.7) {
-                if (surfaces[m].center.z <= 2.5) out.qswGround[n] += qsw;
-                else out.qswElevatedDown[n] += qsw;
-            } else if (nz > 0.7) {
+            if (surfaceData.swClass[m] == SurfaceSwClass::Ground) {
+                out.qswGround[n] += qsw;
+            } else if (surfaceData.swClass[m] == SurfaceSwClass::ElevatedDown) {
+                out.qswElevatedDown[n] += qsw;
+            } else if (surfaceData.swClass[m] == SurfaceSwClass::Upward) {
                 out.qswUpward[n] += qsw;
             } else {
                 out.qswVertical[n] += qsw;
@@ -100,8 +156,6 @@ TmrtBreakdown TmrtSolver::computeDetailed(
             qin_lw_sky /= total_vf;
             qin_sw_sky /= total_vf;
         }
-        (void)useSkyViewFactors;
-
         out.qlwSurfaces[n] = qin_lw_surfaces;
         out.qlwSky[n] = qin_lw_sky;
         out.qswSurfaces[n] = qin_sw_surfaces;
@@ -120,7 +174,7 @@ TmrtBreakdown TmrtSolver::computeDetailed(
 }
 
 double TmrtSolver::computeAreaWeightedAverage(
-    const Eigen::VectorXd& Tmrt,
+    const std::array<double, 5>& Tmrt,
     const std::array<Vec3, 5>& areaVectors) const
 {
     double sumTmrtArea = 0.0;

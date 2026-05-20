@@ -8,6 +8,7 @@
 #include <vector>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <algorithm>
 #include <unordered_map>
 
@@ -60,35 +61,84 @@ struct GridMesh {
     bool empty() const { return tris.empty(); }
 
     void build(const std::string& stlPath, double cs = 5.0) {
-        // Read binary STL
         std::ifstream f(stlPath, std::ios::binary);
         if (!f.is_open()) return;
 
-        char header[80];
-        f.read(header, 80);
-        uint32_t nTri = 0;
-        f.read(reinterpret_cast<char*>(&nTri), 4);
-
-        tris.reserve(nTri);
         double mn[3] = {1e18, 1e18, 1e18};
         double mx[3] = {-1e18,-1e18,-1e18};
 
-        for (uint32_t i = 0; i < nTri; ++i) {
-            float buf[12];  // normal(3) + v0(3) + v1(3) + v2(3)
-            f.read(reinterpret_cast<char*>(buf), 48);
-            uint16_t attr; f.read(reinterpret_cast<char*>(&attr), 2);
-
+        auto appendTri = [&](const std::array<std::array<double, 3>, 3>& verts) {
             Tri tri;
             for (int k = 0; k < 3; ++k) {
-                tri.v[0][k] = buf[3+k];
-                tri.v[1][k] = buf[6+k];
-                tri.v[2][k] = buf[9+k];
+                tri.v[0][k] = verts[0][k];
+                tri.v[1][k] = verts[1][k];
+                tri.v[2][k] = verts[2][k];
                 tri.aabbMin[k] = std::min({tri.v[0][k], tri.v[1][k], tri.v[2][k]});
                 tri.aabbMax[k] = std::max({tri.v[0][k], tri.v[1][k], tri.v[2][k]});
                 mn[k] = std::min(mn[k], tri.aabbMin[k]);
                 mx[k] = std::max(mx[k], tri.aabbMax[k]);
             }
             tris.push_back(tri);
+        };
+
+        f.seekg(0, std::ios::end);
+        std::streamoff fileSize = f.tellg();
+        f.seekg(0, std::ios::beg);
+
+        char header[80] = {};
+        f.read(header, 80);
+        uint32_t nTri = 0;
+        f.read(reinterpret_cast<char*>(&nTri), 4);
+
+        const bool looksLikeBinary =
+            fileSize >= 84 &&
+            static_cast<std::streamoff>(84ULL + 50ULL * static_cast<unsigned long long>(nTri)) == fileSize;
+
+        f.clear();
+        f.seekg(0, std::ios::beg);
+
+        if (looksLikeBinary) {
+            tris.reserve(nTri);
+            f.read(header, 80);
+            f.read(reinterpret_cast<char*>(&nTri), 4);
+            for (uint32_t i = 0; i < nTri; ++i) {
+                float buf[12];  // normal(3) + v0(3) + v1(3) + v2(3)
+                f.read(reinterpret_cast<char*>(buf), 48);
+                uint16_t attr;
+                f.read(reinterpret_cast<char*>(&attr), 2);
+                if (!f) break;
+
+                std::array<std::array<double, 3>, 3> verts{};
+                for (int k = 0; k < 3; ++k) {
+                    verts[0][k] = buf[3 + k];
+                    verts[1][k] = buf[6 + k];
+                    verts[2][k] = buf[9 + k];
+                }
+                appendTri(verts);
+            }
+        } else {
+            std::ifstream text(stlPath);
+            if (!text.is_open()) return;
+            std::string line;
+            std::array<std::array<double, 3>, 3> verts{};
+            int vCount = 0;
+            while (std::getline(text, line)) {
+                std::istringstream iss(line);
+                std::string token;
+                iss >> token;
+                if (token != "vertex") continue;
+
+                double x = 0.0, y = 0.0, z = 0.0;
+                if (!(iss >> x >> y >> z)) continue;
+                verts[vCount][0] = x;
+                verts[vCount][1] = y;
+                verts[vCount][2] = z;
+                ++vCount;
+                if (vCount == 3) {
+                    appendTri(verts);
+                    vCount = 0;
+                }
+            }
         }
 
         if (tris.empty()) return;

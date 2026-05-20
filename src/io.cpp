@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <dirent.h>
 #include <limits>
@@ -58,6 +59,7 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
     
     std::string line;
     bool inList = false;
+    size_t skippedLines = 0;
     
     while (std::getline(file, line)) {
         line = trim(line);
@@ -87,12 +89,15 @@ std::vector<PedestrianPosition> loadPedestrianPositions(const std::string& probe
                     pos.originalIndex = static_cast<int>(positions.size());
                     positions.push_back(pos);
                 } catch (...) {
-                    // Skip invalid lines
+                    ++skippedLines;
                 }
             }
         }
     }
     
+    if (skippedLines > 0) {
+        logWarn("  Skipped " + std::to_string(skippedLines) + " invalid probe_locs entries");
+    }
     logInfo("  Loaded " + std::to_string(positions.size()) + " pedestrian positions");
     return positions;
 }
@@ -140,27 +145,51 @@ std::vector<SurfacePatch> loadSurfacePatches(const std::string& rawPath) {
 std::vector<double> loadScalarField(const std::string& rawPath) {
     std::vector<double> vals;
 
-    std::ifstream file(rawPath);
+    std::ifstream file(rawPath, std::ios::binary);
     if (!file.is_open()) {
         return vals;
     }
 
-    std::string line;
+    file.seekg(0, std::ios::end);
+    std::streamoff size = file.tellg();
+    if (size <= 0) return vals;
+    file.seekg(0, std::ios::beg);
+
+    std::string buffer(static_cast<size_t>(size), '\0');
+    file.read(buffer.data(), size);
+    if (!file) return vals;
+
+    vals.reserve(static_cast<size_t>(size) / 24);
+
+    const char* cur = buffer.data();
+    const char* end = cur + buffer.size();
+
     int headerLines = 0;
+    while (cur < end && headerLines < 2) {
+        if (*cur++ == '\n') ++headerLines;
+    }
 
-    while (std::getline(file, line)) {
-        if (headerLines < 2) {
-            headerLines++;
-            continue;
+    while (cur < end) {
+        double parsed[4];
+        int nParsed = 0;
+        bool lineHasData = false;
+
+        while (cur < end && *cur != '\n') {
+            char* next = nullptr;
+            double value = std::strtod(cur, &next);
+            if (next != cur) {
+                lineHasData = true;
+                if (nParsed < 4) parsed[nParsed++] = value;
+                cur = next;
+            } else {
+                ++cur;
+            }
         }
-        line = trim(line);
-        if (line.empty()) continue;
 
-        std::istringstream iss(line);
-        double x = 0.0, y = 0.0, z = 0.0, value = 0.0;
-        // Format: x y z value
-        if (iss >> x >> y >> z >> value) {
-            vals.push_back(value);
+        if (cur < end && *cur == '\n') ++cur;
+
+        if (lineHasData && nParsed >= 4) {
+            vals.push_back(parsed[3]);
         }
     }
 
@@ -335,7 +364,11 @@ bool writeTumrtAvg(const std::string& path,
         file << timestep << " " << pos.x << " " << pos.y << " " << pos.z 
              << " " << TumrtAvg[i] << "\n";
     }
-    
+
+    if (file.fail()) {
+        logError("Failed while writing TumrtAvg: " + path);
+        return false;
+    }
     return true;
 }
 
@@ -848,6 +881,10 @@ bool writeLegacyVtkMesh(const std::string& path,
         f << "SCALARS " << name << " float 1\n"
           << "LOOKUP_TABLE default\n";
         for (int i = 0; i < vals.size(); ++i) f << vals[i] << "\n";
+    }
+    if (f.fail()) {
+        logError("Failed while writing VTK: " + path);
+        return false;
     }
     return true;
 }

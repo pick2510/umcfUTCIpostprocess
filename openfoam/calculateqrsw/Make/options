@@ -1,13 +1,14 @@
 EXE_INC = \
-    -I$(LIB_SRC)/finiteVolume/lnInclude \
-    -I$(LIB_SRC)/meshTools/lnInclude \
-    -I$(LIB_SRC)/triSurface/lnInclude \
-    -I$(LIB_SRC)/surfMesh/lnInclude \
-    -I$(LIB_SRC)/parallel/distributed/lnInclude
+    -I$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude \
+    -I$(WM_PROJECT_DIR)/src/meshTools/lnInclude \
+    -I$(WM_PROJECT_DIR)/src/triSurface/lnInclude \
+    -I$(WM_PROJECT_DIR)/src/surfMesh/lnInclude \
+    -I$(WM_PROJECT_DIR)/src/parallel/distributed/lnInclude
 
 EXE_LIBS = \
     -lfiniteVolume \
     -lmeshTools \
     -ltriSurface \
     -lsurfMesh \
-    -ldistributed
+    -ldistributed \
+    -lradiationModels

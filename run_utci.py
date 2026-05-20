@@ -29,10 +29,13 @@ Usage
 import argparse
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib.tri as mtri
 import numpy as np
@@ -51,9 +54,12 @@ sys.stdout.reconfigure(line_buffering=True)
 # DEFAULTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-OF_DIR         = '/home/strebdom/OpenFOAM-8'
+OF_DIR         = os.environ.get('WM_PROJECT_DIR') or (
+    os.path.dirname(os.environ['FOAM_ETC']) if 'FOAM_ETC' in os.environ else '/home/strebdom/OpenFOAM-8'
+)
 UTCI_UTIL      = os.path.join(os.path.dirname(__file__), 'openfoam')
 CALC_TMRT_BIN  = os.path.join(os.path.dirname(__file__), 'build', 'umcfUTCIpostprocess')
+BREW_BIN       = '/home/linuxbrew/.linuxbrew/bin'
 
 # Default patches — override via CLI if your case differs
 WALL_PATCHES   = ('buildings', 'roofs', 'street', 'ground')
@@ -63,6 +69,99 @@ VEG_PATCH      = 'air_to_vegetation'
 PED_Z          = 2.0
 PED_GRID_DX    = 3.0
 PED_GRID_DY    = 3.0
+
+
+def _detect_of_major():
+    """Detect local OpenFOAM major version.
+
+    Priority:
+      1. WM_PROJECT_VERSION / FOAM_VERSION env vars (set when OF is sourced)
+      2. META-INFO/api file in OF_DIR (OF-12+ style)
+      3. WM_PROJECT_VERSION line in etc/bashrc
+      4. Numeric component from OF_DIR path (e.g. OpenFOAM-8, OpenFOAM-12)
+    """
+    # 1. Environment variables
+    for var in ('WM_PROJECT_VERSION', 'FOAM_VERSION'):
+        val = os.environ.get(var, '')
+        m = re.search(r'\b(\d+)\b', val)
+        if m:
+            return int(m.group(1))
+
+    # 2. OF-12+ META-INFO/api file
+    meta = os.path.join(OF_DIR, 'META-INFO', 'api')
+    if os.path.isfile(meta):
+        try:
+            with open(meta) as f:
+                m = re.search(r'\b(\d+)\b', f.read())
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+
+    # 3. WM_PROJECT_VERSION in etc/bashrc
+    bashrc = os.path.join(OF_DIR, 'etc', 'bashrc')
+    if os.path.isfile(bashrc):
+        try:
+            with open(bashrc) as f:
+                for line in f:
+                    m = re.match(r'\s*(?:export\s+)?WM_PROJECT_VERSION\s*=\s*["\']?(\d+)', line)
+                    if m:
+                        return int(m.group(1))
+        except OSError:
+            pass
+
+    # 4. Parse OF_DIR path components for a version number
+    for part in reversed(os.path.normpath(OF_DIR).split(os.sep)):
+        m = re.search(r'(?:OpenFOAM|foam)[-_]?(\d+)', part, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+
+def _detect_case_of_version(case_dir):
+    """Detect which OpenFOAM version a case was run with.
+
+    Uses case structure fingerprints from urbanMicroclimateFoam tutorials:
+    - OF-12: constant/<region>/thermophysicalTransport exists
+    - OF-8:  constant/<region>/momentumTransport has 'object turbulenceProperties'
+             (OF-12 has 'object momentumTransport')
+
+    Returns int major version (8 or 12) or None if undetectable.
+    """
+    for region in ('air', 'vegetation', ''):
+        const_dir = (os.path.join(case_dir, 'constant', region)
+                     if region else os.path.join(case_dir, 'constant'))
+
+        # OF-12 fingerprint: thermophysicalTransport file exists
+        if os.path.isfile(os.path.join(const_dir, 'thermophysicalTransport')):
+            return 12
+
+        # momentumTransport object name: turbulenceProperties=OF-8, momentumTransport=OF-12
+        mt = os.path.join(const_dir, 'momentumTransport')
+        if os.path.isfile(mt):
+            try:
+                with open(mt, errors='replace') as f:
+                    header = f.read(512)
+                if re.search(r'\bobject\s+turbulenceProperties\b', header):
+                    return 8
+                if re.search(r'\bobject\s+momentumTransport\b', header):
+                    return 12
+            except OSError:
+                pass
+
+    return None
+
+
+def _foam_shell_setup():
+    """Shell prefix for OpenFOAM environment and optional Linuxbrew toolchain."""
+    cmd = f'source {OF_DIR}/etc/bashrc'
+    if os.path.isdir(BREW_BIN):
+        cmd += f' && export PATH={BREW_BIN}:$PATH'
+    return cmd
+
+
+OF_MAJOR = _detect_of_major()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PEDESTRIAN SURFACE — OF dict + grid binning (flat and terrain)
@@ -79,6 +178,8 @@ def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
         caller adds PED_Z offset when binning.
     """
     if terrain_patches is None:
+        point_key = 'basePoint' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'point'
+        normal_key = 'normalVector' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'normal'
         surface_block = """\
     pedestrian
     {{
@@ -86,11 +187,11 @@ def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
         planeType   pointAndNormal;
         pointAndNormalDict
         {{
-            basePoint    (0 0 {z});
-            normalVector (0 0 1);
+            {point_key}  (0 0 {z});
+            {normal_key} (0 0 1);
         }}
         interpolate false;
-    }}""".format(z=z)
+    }}""".format(z=z, point_key=point_key, normal_key=normal_key)
     else:
         patches_str = ' '.join(terrain_patches)
         surface_block = """\
@@ -105,9 +206,11 @@ def _pedestrian_surface_dict(fields=('T',), terrain_patches=None, z=PED_Z):
     return (
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfacesPedestrian')
-        + """#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+        + """type            surfaces;
+libs            ("libsampling.so");
 
 surfaceFormat   vtk;
+interpolationScheme cellPoint;
 
 fields
 (
@@ -149,13 +252,38 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
 
     if z_offset == 0.0:
         # Flat: regular grid filtered by 2-D triangulation containment test.
-        # Build a matplotlib TriFinder on the mesh triangles (exact, O(log N) per point,
-        # vectorised over the whole grid in one call).
+        # Some case exports contain duplicate points or degenerate triangles,
+        # which can make matplotlib's TriFinder reject the mesh. Clean the
+        # triangulation first and fall back to cell-center binning if needed.
         mesh = mesh.triangulate()
-        pts  = mesh.points
+        pts = np.asarray(mesh.points)
         tris = mesh.faces.reshape(-1, 4)[:, 1:]
-        tri    = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
-        finder = tri.get_trifinder()
+
+        rounded_xy = np.round(pts[:, :2], decimals=6)
+        _, unique_idx, inverse = np.unique(
+            rounded_xy, axis=0, return_index=True, return_inverse=True
+        )
+        pts2 = pts[np.sort(unique_idx)]
+        order = np.zeros(len(unique_idx), dtype=int)
+        order[np.argsort(unique_idx)] = np.arange(len(unique_idx))
+        tris2 = order[inverse[tris]]
+
+        mask_distinct = (
+            (tris2[:, 0] != tris2[:, 1]) &
+            (tris2[:, 0] != tris2[:, 2]) &
+            (tris2[:, 1] != tris2[:, 2])
+        )
+        tris2 = tris2[mask_distinct]
+
+        if len(tris2) > 0:
+            p0 = pts2[tris2[:, 0], :2]
+            p1 = pts2[tris2[:, 1], :2]
+            p2 = pts2[tris2[:, 2], :2]
+            dbl_area = np.abs(
+                (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) -
+                (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
+            )
+            tris2 = tris2[dbl_area > 1e-10]
 
         if bbox is not None:
             xmin, xmax, ymin, ymax = bbox
@@ -165,13 +293,30 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
 
         xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
         ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
-        gx, gy = np.meshgrid(xs, ys)
-        inside = finder(gx.ravel(), gy.ravel()) >= 0
-
         z = float(np.median(pts[:, 2]))
-        vx = gx.ravel()[inside]
-        vy = gy.ravel()[inside]
-        positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
+
+        if len(tris2) > 0:
+            try:
+                tri = mtri.Triangulation(pts2[:, 0], pts2[:, 1], tris2)
+                finder = tri.get_trifinder()
+                gx, gy = np.meshgrid(xs, ys)
+                inside = finder(gx.ravel(), gy.ravel()) >= 0
+                vx = gx.ravel()[inside]
+                vy = gy.ravel()[inside]
+                positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
+                if positions:
+                    return positions
+            except RuntimeError:
+                print('  [WARN] Invalid triangulation in pedestrian surface mesh – '
+                      'falling back to flat cell-center binning')
+
+        centers = np.asarray(mesh.cell_centers().points)
+        mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
+                (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
+        centers = centers[mask]
+        gx = np.round(centers[:, 0] / dx) * dx
+        gy = np.round(centers[:, 1] / dy) * dy
+        positions = sorted({(float(x), float(y), z) for x, y in zip(gx, gy)})
         return positions
 
     else:
@@ -219,9 +364,11 @@ def _surfaces_patch_dict(wall_patches, sky_patches, fields=('Sf', 'qrOut', 'qsOu
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='surfaces')
         + """
-#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+type            surfaces;
+libs            ("libsampling.so");
 
 surfaceFormat   raw;
+interpolationScheme cellPoint;
 
 fields
 (
@@ -257,7 +404,11 @@ def _probes_dict(positions):
         "/*--------------------------------*- C++ -*----------------------------------*/\n"
         + _FOAM_HEADER.format(obj='probes')
         + """
-#includeEtc "caseDicts/postProcessing/probes/probes.cfg"
+type            probes;
+libs            ("libsampling.so");
+
+writeControl    timeStep;
+writeInterval   1;
 
 fields
 (
@@ -279,24 +430,124 @@ probeLocations
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run(cmd, case=None, region=None, time_range=None, use_case=True):
-    full = f'source {OF_DIR}/etc/bashrc && {cmd}'
+    full = f'{_foam_shell_setup()} && {cmd}'
     if use_case and case:
         full += f' -case {case}'
     if region:
         full += f' -region {region}'
     if time_range:
         full += f' -time {time_range}'
+    log_path = None
+    if case:
+        log_dir = os.path.join(case, 'postProcessing', 'run_utci_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        safe_cmd = ''.join(c if c.isalnum() else '_' for c in cmd).strip('_') or 'command'
+        safe_region = region or 'default'
+        safe_time = (time_range or 'notime').replace(':', '_')
+        log_path = os.path.join(log_dir, f'{safe_cmd}__{safe_region}__{safe_time}.log')
+    print(f'  RUN: {cmd}')
+    print(f'       shell: {full}')
+    if log_path:
+        print(f'       log  : {log_path}')
+    t0 = time.time()
     result = subprocess.run(['bash', '-c', full], capture_output=True, text=True)
+    elapsed = time.time() - t0
+    stdout_tail = (result.stdout or '').strip()[-4000:]
+    stderr_tail = (result.stderr or '').strip()[-4000:]
+    if log_path:
+        with open(log_path, 'w') as f:
+            f.write(f'command: {cmd}\n')
+            f.write(f'shell: {full}\n')
+            if case:
+                f.write(f'case: {case}\n')
+            if region:
+                f.write(f'region: {region}\n')
+            if time_range:
+                f.write(f'time: {time_range}\n')
+            f.write(f'returncode: {result.returncode}\n')
+            f.write(f'elapsed_seconds: {elapsed:.6f}\n')
+            f.write('\n=== STDOUT ===\n')
+            f.write(result.stdout or '')
+            f.write('\n=== STDERR ===\n')
+            f.write(result.stderr or '')
     if result.returncode != 0:
-        print(f'  [WARN] {cmd!r} returned {result.returncode}:\n{result.stderr[-600:]}')
+        print('  [ERROR] OpenFOAM command failed')
+        print(f'          command : {cmd}')
+        if case:
+            print(f'          case    : {case}')
+        if region:
+            print(f'          region  : {region}')
+        if time_range:
+            print(f'          time    : {time_range}')
+        print(f'          code    : {result.returncode}')
+        print(f'          elapsed : {elapsed:.2f}s')
+        if stdout_tail:
+            print('          stdout tail:')
+            for line in stdout_tail.splitlines():
+                print(f'            {line}')
+        if stderr_tail:
+            print('          stderr tail:')
+            for line in stderr_tail.splitlines():
+                print(f'            {line}')
+        print('          Stage 1 may continue, but later steps can silently reuse stale outputs.')
     else:
-        print(f'  OK: {cmd}')
+        print(f'  OK: {cmd} ({elapsed:.2f}s)')
+        if stdout_tail:
+            print('      stdout tail:')
+            for line in stdout_tail.splitlines()[-20:]:
+                print(f'        {line}')
+        if stderr_tail:
+            print('      stderr tail:')
+            for line in stderr_tail.splitlines()[-20:]:
+                print(f'        {line}')
     return result
+
+
+def _run_required(cmd, case=None, region=None, time_range=None, use_case=True):
+    result = _run(cmd, case=case, region=region, time_range=time_range, use_case=use_case)
+    if result.returncode != 0:
+        print(f'  [FATAL] Aborting because required command failed: {cmd}')
+        sys.exit(result.returncode)
+    return result
+
+
+def _run_required_per_timestep(cmd, case, region, timesteps, max_parallel, use_case=True):
+    """Run a required OpenFOAM command independently for each timestep.
+
+    Uses a thread pool because the work is external subprocess execution.
+    Raises SystemExit on the first failed timestep after all launched jobs finish.
+    """
+    if not timesteps:
+        return
+
+    max_parallel = max(1, min(int(max_parallel), len(timesteps)))
+    if max_parallel == 1:
+        for t in timesteps:
+            _run_required(cmd, case=case, region=region, time_range=str(t), use_case=use_case)
+        return
+
+    print(f'  Running {cmd} for {len(timesteps)} timestep(s) with up to {max_parallel} concurrent jobs')
+    failures = []
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        future_map = {
+            pool.submit(_run, cmd, case, region, str(t), use_case): t
+            for t in timesteps
+        }
+        for fut in as_completed(future_map):
+            t = future_map[fut]
+            result = fut.result()
+            if result.returncode != 0:
+                failures.append((t, result.returncode))
+
+    if failures:
+        t, code = sorted(failures)[0]
+        print(f'  [FATAL] Aborting because required command failed: {cmd} at timestep {t} (code {code})')
+        sys.exit(code)
 
 
 def _available(binary):
     r = subprocess.run(
-        ['bash', '-lc', f'source {OF_DIR}/etc/bashrc && command -v {binary}'],
+        ['bash', '-lc', f'{_foam_shell_setup()} && command -v {binary}'],
         capture_output=True, text=True)
     return r.returncode == 0
 
@@ -313,18 +564,70 @@ def _compile_if_missing(binary, src_dir):
 # STAGE 0 – Write system files
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _detect_terrain(vtk_path):
+def _projected_mesh_area_xy(mesh):
+    """Projected x-y area of a surface mesh."""
+    mesh = mesh.triangulate()
+    if mesh.n_cells == 0:
+        return 0.0
+    pts = mesh.points
+    tris = mesh.faces.reshape(-1, 4)[:, 1:]
+    a = pts[tris[:, 0], :2]
+    b = pts[tris[:, 1], :2]
+    c = pts[tris[:, 2], :2]
+    twice_area = (
+        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+        - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    )
+    return float(0.5 * np.abs(twice_area).sum())
+
+
+def _detect_terrain(vtk_path, bbox=None):
     """Return True if vtk_path looks like a terrain domain.
 
     Criteria (either triggers terrain mode):
       - VTK has no points (cutting plane at z=PED_Z missed the domain entirely)
       - std(z) of mesh points > 0.5 m (sloped terrain)
+      - projected x-y coverage of the flat cutting plane is too small
+        relative to the STL bbox area (typical when a terrain-following
+        pedestrian surface is needed instead of a flat z=PED_Z plane)
     """
     mesh = pv.read(vtk_path)
     if mesh.n_points == 0:
         return True
     z = mesh.points[:, 2]
-    return float(np.std(z)) > 0.5
+    if float(np.std(z)) > 0.5:
+        return True
+    if bbox is not None:
+        bbox_area = max(0.0, (bbox[1] - bbox[0]) * (bbox[3] - bbox[2]))
+        if bbox_area > 0.0:
+            coverage = _projected_mesh_area_xy(mesh) / bbox_area
+            if coverage < 0.2:
+                return True
+    return False
+
+
+def _find_pedestrian_vtk(case, subdir, t_start, legacy_name):
+    """Return first existing pedestrian surface VTK across legacy and OF12 layouts."""
+    t = str(t_start)
+    candidates = [
+        os.path.join(case, 'postProcessing', subdir, t, legacy_name),
+        os.path.join(case, 'postProcessing', subdir, t, 'pedestrian.vtk'),
+        os.path.join(case, 'postProcessing', 'air', subdir, t, legacy_name),
+        os.path.join(case, 'postProcessing', 'air', subdir, t, 'pedestrian.vtk'),
+        os.path.join(case, 'postProcessing', 'vegetation', subdir, t, legacy_name),
+        os.path.join(case, 'postProcessing', 'vegetation', subdir, t, 'pedestrian.vtk'),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _first_existing_path(paths):
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def _stage0_generate_positions(args):
@@ -332,22 +635,22 @@ def _stage0_generate_positions(args):
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
 
-    vtk_path = os.path.join(
-        args.case, 'postProcessing', 'surfacesPedestrian',
-        str(args.t_start), 'T_pedestrian.vtk')
-
     # Optional STL bounding-box clipping
     bbox = None
     if args.bbox_padding is not None:
-        stl_path = os.path.join(args.case, 'constant', 'triSurface',
-                                'wallAndTreeSurfaces.stl')
-        if os.path.isfile(stl_path):
+        stl_path = _first_existing_path([
+            os.path.join(args.case, 'constant', 'triSurface', 'wallAndTreeSurfaces.stl'),
+            os.path.join(args.case, 'constant', 'triSurface', 'walls.stl'),
+            os.path.join(args.case, 'constant', 'triSurface', 'facades.stl'),
+        ])
+        if stl_path is not None:
             bbox = _stl_bbox(stl_path, padding=args.bbox_padding)
             print(f'  STL bbox + {args.bbox_padding} m padding: '
                   f'x=[{bbox[0]:.1f}, {bbox[1]:.1f}]  '
                   f'y=[{bbox[2]:.1f}, {bbox[3]:.1f}]')
         else:
-            print(f'  [WARN] STL not found for bbox clipping: {stl_path}')
+            print('  [WARN] STL not found for bbox clipping '
+                  '(tried wallAndTreeSurfaces.stl, walls.stl, facades.stl)')
 
     # ── forced flat ──────────────────────────────────────────────────────────
     if args.mode == 'flat':
@@ -355,7 +658,8 @@ def _stage0_generate_positions(args):
             f.write(_pedestrian_surface_dict(terrain_patches=None))
         r = _run('postProcess -func surfacesPedestrian',
                  args.case, region='air', time_range=str(args.t_start))
-        if r.returncode != 0 or not os.path.isfile(vtk_path):
+        vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+        if r.returncode != 0 or vtk_path is None:
             return None, 'flat'
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
                                  z_offset=0.0, bbox=bbox), 'flat'
@@ -367,7 +671,8 @@ def _stage0_generate_positions(args):
             f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
         r = _run('postProcess -func surfacesPedestrian',
                  args.case, region='air', time_range=str(args.t_start))
-        if r.returncode != 0 or not os.path.isfile(vtk_path):
+        vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+        if r.returncode != 0 or vtk_path is None:
             return None, 'terrain'
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
                                  z_offset=PED_Z, bbox=bbox), 'terrain'
@@ -378,24 +683,27 @@ def _stage0_generate_positions(args):
         f.write(_pedestrian_surface_dict(terrain_patches=None))
     r = _run('postProcess -func surfacesPedestrian',
              args.case, region='air', time_range=str(args.t_start))
+    vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
 
-    if r.returncode != 0 or not os.path.isfile(vtk_path):
+    if r.returncode != 0 or vtk_path is None:
         return None, 'auto'
 
     # Step 2: inspect result
-    if not _detect_terrain(vtk_path):
+    if not _detect_terrain(vtk_path, bbox=bbox):
         return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
                                  z_offset=0.0, bbox=bbox), 'flat'
 
     # Step 3: re-run as terrain
-    print('  Auto-detected terrain domain (z-spread > 0.5 m or empty cutting plane) '
+    print('  Auto-detected terrain domain (z-spread > 0.5 m, low flat-plane coverage, '
+          'or empty cutting plane) '
           '— switching to terrain mode')
     terrain_patches = list(args.terrain_patches)
     with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
         f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
     r = _run('postProcess -func surfacesPedestrian',
              args.case, region='air', time_range=str(args.t_start))
-    if r.returncode != 0 or not os.path.isfile(vtk_path):
+    vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+    if r.returncode != 0 or vtk_path is None:
         return None, 'terrain'
     return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
                              z_offset=PED_Z, bbox=bbox), 'terrain'
@@ -445,30 +753,34 @@ def stage0(args):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _qrsw_cutting_plane_dict():
-    return """\
+    point_key = 'basePoint' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'point'
+    normal_key = 'normalVector' if (OF_MAJOR is not None and OF_MAJOR >= 12) else 'normal'
+    return f"""\
 /*--------------------------------*- C++ -*----------------------------------*/
 FoamFile
-{
+{{
     version     2.0;
     format      ascii;
     class       dictionary;
     object      qrswCuttingPlane;
-}
+}}
 
-#includeEtc "caseDicts/postProcessing/visualization/surfaces.cfg"
+type            surfaces;
+libs            ("libsampling.so");
 
 surfaceFormat   vtk;
+interpolationScheme cellPoint;
 fields          ( qrsw );
 
 surfaces
 (
     pedestrian
-    {
+    {{
         type            cuttingPlane;
         planeType       pointAndNormal;
-        pointAndNormalDict { point (0 0 2); normal (0 0 1); }
+        pointAndNormalDict {{ {point_key} (0 0 2); {normal_key} (0 0 1); }}
         interpolate     false;
-    }
+    }}
 );
 """
 
@@ -519,9 +831,101 @@ def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
 
     print(f'  qrsw sampled at {n_probes} probe positions -> {out_path}')
 
+
+def _ensure_symlink(src, dst):
+    if os.path.exists(dst) or os.path.islink(dst):
+        return
+    if not os.path.exists(src):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
+
+
+def _split_of12_surface_xy(src_path, dst_dir, surface_name):
+    """Split OpenFOAM-12 raw .xy multi-field surface output into legacy files."""
+    if not os.path.isfile(src_path):
+        return
+
+    files = {}
+
+    def open_out(field, columns):
+        path = os.path.join(dst_dir, f'{field}_{surface_name}.raw')
+        f = open(path, 'w')
+        f.write('# ' + ' '.join(columns) + '\n')
+        f.write('# split from OpenFOAM-12 surfaces .xy output\n')
+        files[field] = f
+
+    os.makedirs(dst_dir, exist_ok=True)
+    try:
+        with open(src_path) as src:
+            for line in src:
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 8:
+                    if 'Sf' not in files:
+                        open_out('Sf', ('face_x', 'face_y', 'face_z', 'Sf_x', 'Sf_y', 'Sf_z'))
+                    if 'qrOut' not in files:
+                        open_out('qrOut', ('face_x', 'face_y', 'face_z', 'qrOut'))
+                    if 'qsOut' not in files:
+                        open_out('qsOut', ('face_x', 'face_y', 'face_z', 'qsOut'))
+                    files['Sf'].write(' '.join(parts[0:6]) + '\n')
+                    files['qrOut'].write(' '.join(parts[0:3] + [parts[6]]) + '\n')
+                    files['qsOut'].write(' '.join(parts[0:3] + [parts[7]]) + '\n')
+                elif len(parts) >= 5:
+                    if 'qrOut' not in files:
+                        open_out('qrOut', ('face_x', 'face_y', 'face_z', 'qrOut'))
+                    if 'qsOut' not in files:
+                        open_out('qsOut', ('face_x', 'face_y', 'face_z', 'qsOut'))
+                    files['qrOut'].write(' '.join(parts[0:3] + [parts[3]]) + '\n')
+                    files['qsOut'].write(' '.join(parts[0:3] + [parts[4]]) + '\n')
+    finally:
+        for f in files.values():
+            f.close()
+
+
+def _normalize_of12_postprocessing(case, region, timesteps):
+    """Expose OF12 region-scoped outputs at the legacy paths used by Stage 2.
+
+    Safe and idempotent for OF8 legacy layout (no-op when .xy inputs are absent).
+    """
+    pp = os.path.join(case, 'postProcessing')
+
+    dst_surfaces = os.path.join(pp, 'surfaces')
+    src_roots = [
+        os.path.join(pp, region, 'surfaces'),
+        os.path.join(pp, 'surfaces'),
+    ]
+    for src_surfaces in src_roots:
+        if not os.path.isdir(src_surfaces):
+            continue
+        for t in timesteps:
+            src_t = os.path.join(src_surfaces, str(t))
+            if not os.path.isdir(src_t):
+                continue
+            dst_t = os.path.join(dst_surfaces, str(t))
+            _split_of12_surface_xy(
+                os.path.join(src_t, 'wallAndTreeSurfaces.xy'),
+                dst_t,
+                'wallAndTreeSurfaces'
+            )
+            _split_of12_surface_xy(
+                os.path.join(src_t, 'skySurfaces.xy'),
+                dst_t,
+                'skySurfaces'
+            )
+
+    _ensure_symlink(os.path.join(pp, 'air', 'surfacesPedestrian'), os.path.join(pp, 'surfacesPedestrian'))
+    _ensure_symlink(os.path.join(pp, 'air', 'surfacesPedestrianAir'), os.path.join(pp, 'surfacesPedestrianAir'))
+    _ensure_symlink(os.path.join(pp, region, 'surfacesPedestrianRad'), os.path.join(pp, 'surfacesPedestrianRad'))
+    _ensure_symlink(os.path.join(pp, region, 'qrswCuttingPlane'), os.path.join(pp, 'qrswCuttingPlane'))
+    _ensure_symlink(os.path.join(pp, 'air', 'probes'), os.path.join(pp, 'probes', 'air'))
+
 def stage1(args):
     print('\n=== Stage 1: OpenFOAM postprocessing ===')
     time_range = f'{args.t_start}:{args.t_end}'
+    timesteps = list(range(args.t_start, args.t_end + 1, args.t_step))
+    of_parallel = max(1, min(6, args.threads, len(timesteps)))
     sys_air = os.path.join(args.case, 'system', 'air')
     os.makedirs(sys_air, exist_ok=True)
 
@@ -534,15 +938,17 @@ def stage1(args):
 
     # Step 1: Direct solar radiation volume field
     print(f'  calculateqrsw ({region}) ...')
-    _run('calculateqrsw', args.case, region=region, time_range=time_range)
+    _run_required_per_timestep('calculateqrsw', args.case, region, timesteps, of_parallel)
 
-    # Step 2: Surface area vectors (first timestep only)
+    # Step 2: Surface area vectors. Geometry is static, so Sf is only needed
+    # for the first timestep used by Stage 2 to build the surface geometry.
     print(f'  calcSf ({region}) ...')
-    _run('calcSf', args.case, region=region, time_range=str(args.t_start))
+    geometry_time = timesteps[0]
+    _run_required('calcSf', args.case, region=region, time_range=str(geometry_time))
 
     # Step 3: Outgoing wall radiation
     print(f'  calcWallRadOut ({region}) ...')
-    _run('calcWallRadOut', args.case, region=region, time_range=time_range)
+    _run_required_per_timestep('calcWallRadOut', args.case, region, timesteps, of_parallel)
 
     # Step 4: Extract Sf, qrOut, qsOut at wall + sky patches → raw files
     wall_patches = list(args.wall_patches)
@@ -550,17 +956,22 @@ def stage1(args):
         wall_patches.append(VEG_PATCH)
     sys_region = os.path.join(args.case, 'system', region)
     os.makedirs(sys_region, exist_ok=True)
+    print(f'  postProcess: Sf, qrOut, qsOut at patches ({region}) ...')
     with open(os.path.join(sys_region, 'surfaces'), 'w') as f:
         f.write(_surfaces_patch_dict(wall_patches, args.sky_patches))
-    print(f'  postProcess: Sf, qrOut, qsOut at patches ({region}) ...')
-    _run('postProcess -func surfaces', args.case, region=region, time_range=time_range)
+    _run_required('postProcess -func surfaces', args.case, region=region, time_range=str(geometry_time))
+
+    scalar_timesteps = timesteps[1:]
+    if scalar_timesteps:
+        with open(os.path.join(sys_region, 'surfaces'), 'w') as f:
+            f.write(_surfaces_patch_dict(wall_patches, args.sky_patches, fields=('qrOut', 'qsOut')))
+        _run_required_per_timestep('postProcess -func surfaces', args.case, region, scalar_timesteps, of_parallel)
 
     # Step 5: Extract dense pedestrian-surface fields used by C++ Stage 2
-    ped_vtk = os.path.join(args.case, 'postProcessing', 'surfacesPedestrian',
-                           str(args.t_start), 'T_pedestrian.vtk')
+    ped_vtk = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
     ped_mode = args.mode
     if ped_mode == 'auto':
-        ped_mode = 'terrain' if (os.path.isfile(ped_vtk) and _detect_terrain(ped_vtk)) else 'flat'
+        ped_mode = 'terrain' if (ped_vtk and _detect_terrain(ped_vtk)) else 'flat'
 
     terrain_patches = list(args.terrain_patches) if ped_mode == 'terrain' else None
 
@@ -568,8 +979,11 @@ def stage1(args):
         f.write(_pedestrian_surface_dict(fields=('T', 'U', 'w'),
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian T, U, w ({ped_mode}, air) ...')
-    _run('postProcess -func surfacesPedestrianAir',
-         args.case, region='air', time_range=time_range)
+    _run_required('postProcess -func surfacesPedestrianAir',
+                  args.case, region='air', time_range=str(args.t_start))
+    if len(timesteps) > 1:
+        _run_required_per_timestep('postProcess -func surfacesPedestrianAir',
+                                   args.case, 'air', timesteps[1:], of_parallel)
 
     rad_region = 'vegetation' if args.vegetation else 'air'
     sys_rad = os.path.join(args.case, 'system', rad_region)
@@ -578,25 +992,24 @@ def stage1(args):
         f.write(_pedestrian_surface_dict(fields=('qrsw',),
                                          terrain_patches=terrain_patches))
     print(f'  postProcess: dense pedestrian qrsw ({ped_mode}, {rad_region}) ...')
-    _run('postProcess -func surfacesPedestrianRad',
-         args.case, region=rad_region, time_range=time_range)
+    _run_required_per_timestep('postProcess -func surfacesPedestrianRad',
+                               args.case, rad_region, timesteps, of_parallel)
 
     # Step 6: Extract T, U, w at pedestrian positions (air region, probes)
     print('  postProcess: probes T, U, w (air) ...')
-    _run('postProcess -func probes', args.case, region='air', time_range=time_range)
+    _run_required('postProcess -func probes', args.case, region='air', time_range=time_range)
 
     # Step 7: Sample qrsw magnitude at probe positions from a z=2 m cutting plane.
-    # This provides direct-solar irradiance including canopy attenuation.
-    if args.vegetation:
-        print('  qrsw cutting plane (vegetation) ...')
-        sys_veg = os.path.join(args.case, 'system', 'vegetation')
-        os.makedirs(sys_veg, exist_ok=True)
-        with open(os.path.join(sys_veg, 'qrswCuttingPlane'), 'w') as f:
-            f.write(_qrsw_cutting_plane_dict())
-        _run('postProcess -func qrswCuttingPlane',
-             args.case, region='vegetation', time_range=time_range)
-        _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
+    # This provides direct-solar irradiance at pedestrian positions for both
+    # vegetation and non-vegetation workflows.
+    print(f'  qrsw cutting plane ({rad_region}) ...')
+    with open(os.path.join(sys_rad, 'qrswCuttingPlane'), 'w') as f:
+        f.write(_qrsw_cutting_plane_dict())
+    _run_required_per_timestep('postProcess -func qrswCuttingPlane',
+                               args.case, rad_region, timesteps, of_parallel)
 
+    _normalize_of12_postprocessing(args.case, region, timesteps)
+    _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -605,7 +1018,7 @@ def stage1(args):
 
 def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
     """Resample C++ UTCI/Tmrt point-cloud results onto the dense CFD pedestrian
-    surface mesh using cubic interpolation.
+    surface mesh using linear interpolation.
 
     Reads:  postProcessing/surfacesPedestrian/<t_start>/T_pedestrian.vtk  (CFD mesh)
             <output_dir>/<t>/UTCI.vtk                                     (probe point cloud)
@@ -616,10 +1029,9 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
         return
 
     # Load the dense CFD cutting-plane mesh once (building interiors absent)
-    mesh_path = os.path.join(case, 'postProcessing', 'surfacesPedestrian',
-                             str(t_start), 'T_pedestrian.vtk')
-    if not os.path.isfile(mesh_path):
-        print(f'  [WARN] CFD surface mesh not found: {mesh_path}  – skipping interpolation')
+    mesh_path = _find_pedestrian_vtk(case, 'surfacesPedestrian', t_start, 'T_pedestrian.vtk')
+    if not mesh_path:
+        print('  [WARN] CFD surface mesh not found (surfacesPedestrian)  – skipping interpolation')
         return
 
     mesh = pv.read(mesh_path)
@@ -630,7 +1042,7 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
     mx, my = mesh_pts[:, 0], mesh_pts[:, 1]
 
     # Restrict interpolation to the interior of the probe bounding box (1 m inset
-    # on each side) to avoid edge artefacts from cubic extrapolation.
+    # on each side) to avoid edge artefacts from interpolation near the boundary.
     # Points outside this box are set to NaN and filled by nearest-neighbour below.
     BBOX_INSET = 1.0
     print(f'  Interpolating onto CFD surface ({len(mesh_pts)} points) ...')
@@ -657,12 +1069,12 @@ def _interpolate_utci_surface(case, output_dir, t_start, timesteps):
             vals = probe.point_data[name]
             interp = np.full(len(mx), np.nan)
             interp[in_bbox] = _scipy_griddata(
-                (px, py), vals, (mx[in_bbox], my[in_bbox]), method='cubic')
+                (px, py), vals, (mx[in_bbox], my[in_bbox]), method='linear')
             nan_mask = np.isnan(interp)
             if nan_mask.any():
                 interp[nan_mask] = _scipy_griddata(
                     (px, py), vals, (mx[nan_mask], my[nan_mask]), method='nearest')
-            # Clip cubic overshoot to the probe data range
+            # Clip interpolation overshoot to the probe data range
             interp = np.clip(interp, vals.min(), vals.max())
             out.point_data[name] = interp.astype('float32')
 
@@ -714,6 +1126,18 @@ def stage2(args):
     cmd += ['--utci-method', args.utci_method]
     if args.lut_path:
         cmd += ['--lut-path', args.lut_path]
+    cmd += ['--dense-tumrt-interp', args.dense_tumrt_interp]
+    cmd += ['--dense-tumrt-smooth-passes', str(args.dense_tumrt_smooth_passes)]
+    cmd += ['--dense-interp-clamp', args.dense_interp_clamp]
+    cmd += ['--sky-method', args.sky_method]
+    if args.sky_method == 'angular':
+        cmd += ['--sky-azimuth-samples', str(args.sky_azimuth_samples)]
+        cmd += ['--sky-elevation-samples', str(args.sky_elevation_samples)]
+        cmd += ['--sky-ray-length', str(args.sky_ray_length)]
+    if args.sky_subdivide_top > 1:
+        cmd += ['--sky-subdivide-top', str(args.sky_subdivide_top)]
+    if args.sky_subdivide_keep_original:
+        cmd.append('--sky-subdivide-keep-original')
 
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
@@ -778,6 +1202,14 @@ def parse_args():
                    help='Use air region instead of vegetation for surface/radiation sampling')
     p.add_argument('--wall-patches', nargs='+', default=list(WALL_PATCHES), dest='wall_patches')
     p.add_argument('--sky-patches',  nargs='+', default=list(SKY_PATCHES),  dest='sky_patches')
+    p.add_argument('--sky-method', default='patch', choices=['patch', 'angular'], dest='sky_method',
+                   help='Sky treatment in Stage 2: OpenFOAM patch sky or angular hemisphere sampling')
+    p.add_argument('--sky-azimuth-samples', default=48, type=int, dest='sky_azimuth_samples',
+                   help='Angular sky azimuth bins for Stage 2')
+    p.add_argument('--sky-elevation-samples', default=12, type=int, dest='sky_elevation_samples',
+                   help='Angular sky elevation bins for Stage 2')
+    p.add_argument('--sky-ray-length', default=5000.0, type=float, dest='sky_ray_length',
+                   help='Angular sky ray length [m] for Stage 2')
     p.add_argument('--force-recompute', action='store_true', dest='force_recompute')
     p.add_argument('--skip-utci',       action='store_true', dest='skip_utci')
     p.add_argument('--calc-tmrt-bin', default=CALC_TMRT_BIN, dest='calc_tmrt_bin')
@@ -785,6 +1217,20 @@ def parse_args():
                    help='UTCI calculation method: poly=165-term polynomial, lut=lookup table')
     p.add_argument('--lut-path', default='', dest='lut_path',
                    help='Path to utci_offset.Dat LUT file (default: auto-resolved near binary)')
+    p.add_argument('--dense-interp-clamp', default='local-range', choices=['none', 'local-range'],
+                   dest='dense_interp_clamp',
+                   help='Clamp dense interpolation output to the local 4x4 stencil range')
+    p.add_argument('--dense-tumrt-interp', default='cubic', choices=['cubic', 'idw'],
+                   dest='dense_tumrt_interp',
+                   help='Dense Tumrt interpolation from sparse raytraced positions')
+    p.add_argument('--dense-tumrt-smooth-passes', default=0, type=int,
+                   dest='dense_tumrt_smooth_passes',
+                   help='Smooth sparse Tumrt before dense interpolation; 0 disables smoothing')
+    p.add_argument('--sky-subdivide-top', default=1, type=int, dest='sky_subdivide_top',
+                   help='Virtually subdivide upward-facing sky patches into NxN subpatches in Stage 2')
+    p.add_argument('--sky-subdivide-keep-original', action='store_true',
+                   dest='sky_subdivide_keep_original',
+                   help='Keep original top sky patches in addition to the subdivided sky patches')
 
     # pedestrian grid spacing (flat and terrain)
     p.add_argument('--ped-grid-dx', type=float, default=PED_GRID_DX, dest='ped_grid_dx',
@@ -805,6 +1251,18 @@ def parse_args():
     return p.parse_args()
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    whole = int(round(seconds))
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f'{h:d}h {m:02d}m {s:02d}s'
+    if m:
+        return f'{m:d}m {s:02d}s'
+    return f'{seconds:.2f}s'
+
+
 def main():
     args = parse_args()
     args.case = os.path.abspath(args.case)
@@ -813,16 +1271,42 @@ def main():
     print(f'Time:      {args.t_start}..{args.t_end}  step {args.t_step}')
     print(f'Stages:    {args.stages}')
     print(f'Threads:   {args.threads}')
+    print(f'OpenFOAM:  {OF_DIR} (detected major: {OF_MAJOR if OF_MAJOR is not None else "unknown"})')
+
+    case_of = _detect_case_of_version(args.case)
+    print(f'Case OF version: {case_of if case_of is not None else "unknown"}')
+    if case_of is not None and OF_MAJOR is not None and case_of != OF_MAJOR:
+        print(
+            f'\n[ERROR] Case was run with OpenFOAM-{case_of} but the active installation'
+            f' is OpenFOAM-{OF_MAJOR}. Surface sampling utilities (calcSf, calcWallRadOut,'
+            f' calculateqrsw) must match the case version — results will be wrong or the'
+            f' run will crash.\n'
+            f'        Source the correct OpenFOAM environment before running, e.g.:\n'
+            f'          source /home/strebdom/OpenFOAM-{case_of}/etc/bashrc\n'
+        )
+        sys.exit(1)
+
     print(f'Vegetation: {args.vegetation}')
     print(f'UTCI method: {args.utci_method}' + (f' ({args.lut_path})' if args.lut_path else ''))
 
     stage_map = {0: stage0, 1: stage1, 2: stage2, 3: stage3}
+    stage_timings = {}
+    total_start = time.perf_counter()
     for s in sorted(args.stages):
         if s not in stage_map:
             print(f'[ERROR] Unknown stage {s}')
             sys.exit(1)
+        stage_start = time.perf_counter()
         stage_map[s](args)
+        elapsed = time.perf_counter() - stage_start
+        stage_timings[s] = elapsed
+        print(f'=== Stage {s} done in {_format_elapsed(elapsed)} ===')
 
+    total_elapsed = time.perf_counter() - total_start
+    print('\n=== Timing Summary ===')
+    for s in sorted(stage_timings):
+        print(f'  Stage {s}: {_format_elapsed(stage_timings[s])}')
+    print(f'  Total:   {_format_elapsed(total_elapsed)}')
     print('\nDone.')
 
 

@@ -34,13 +34,10 @@ Description
 #include "fvMesh.H"
 #include "Time.H"
 #include "fvc.H"
-#include "fvCFD.H"
 #include "volFields.H"
 #include "surfaceFields.H"
 #include "distributedTriSurfaceMesh.H"
-#include "cyclicAMIPolyPatch.H"
 #include "triSurfaceTools.H"
-#include "mapDistribute.H"
 #include "OFstream.H"
 #include "meshTools.H"
 #include "meshSearch.H"
@@ -65,12 +62,10 @@ Description
 #include "IOdictionary.H"
 #include "fixedValueFvPatchFields.H"
 #include "wallFvPatch.H"
+#include "uniformDimensionedFields.H"
 #include "unitConversion.H"
-
-// #include "interpolationTable.H"
-
-#include "interpolation2DTable.H"
-#include "TableFile.H"
+#include "timeSelector.H"
+#include "Tuple2.H"
 
 using namespace Foam;
 
@@ -113,6 +108,61 @@ point calcEndPoint
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+template<class Type>
+void readTimeTable
+(
+    const fileName& path,
+    scalarField& times,
+    Field<Type>& values
+)
+{
+    IFstream is(path);
+    if (!is.good())
+    {
+        FatalErrorInFunction
+            << "Cannot read table " << path
+            << exit(FatalError);
+    }
+
+    List<Tuple2<scalar, Type>> table(is);
+    times.setSize(table.size());
+    values.setSize(table.size());
+    forAll(table, i)
+    {
+        times[i] = table[i].first();
+        values[i] = table[i].second();
+    }
+}
+
+void createRegionMesh
+(
+    const argList& args,
+    Time& runTime,
+    autoPtr<fvMesh>& meshPtr
+)
+{
+    const word regionName =
+        args.optionLookupOrDefault<word>("region", fvMesh::defaultRegion);
+    const word timeName = Time::timeName(runTime.value());
+    Info<< "Create mesh " << regionName << " for time = "
+        << timeName << nl << endl;
+    meshPtr.reset
+    (
+        new fvMesh
+        (
+            IOobject
+            (
+                regionName,
+                timeName,
+                runTime,
+                IOobject::MUST_READ
+            )
+        )
+    );
+}
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
 int main(int argc, char *argv[])
 {
     // start timer
@@ -128,14 +178,16 @@ int main(int argc, char *argv[])
 
     runTime.setTime(timeDirs.last(), timeDirs.size()-1);
 
-    #include "createNamedMesh.H"
+    autoPtr<fvMesh> meshPtr;
+    createRegionMesh(args, runTime, meshPtr);
+    fvMesh& mesh = meshPtr();
 
     volScalarField qr
     (
       IOobject
       (
           "qr",
-          runTime.timeName(),
+          Time::timeName(runTime.value()),
           mesh,
           IOobject::MUST_READ,
           IOobject::NO_WRITE
@@ -157,26 +209,17 @@ int main(int argc, char *argv[])
     //     /"sunPosVector"
     // ); 
 
-    dictionary sunPosVectorIO;
-    sunPosVectorIO.add(
-        "file",
-        fileName
-        (
-            runTime.time().rootPath()
-            /runTime.time().globalCaseName()
-            /runTime.time().constant()
-            /"sunPosVector"
-            // mesh.time().constant()
-            // /"sunPosVector"
-        )
-    );
-    Function1s::TableFile<vector> sunPosVector
+    scalarField sunPosVector_x;
+    vectorField sunPosVector_y;
+    readTimeTable
     (
-        "sunPosVector",
-        sunPosVectorIO
+        runTime.time().rootPath()
+       /runTime.time().globalCaseName()
+       /runTime.time().constant()
+       /"sunPosVector",
+        sunPosVector_x,
+        sunPosVector_y
     ); 
-    scalarField sunPosVector_x = sunPosVector.x();
-    vectorField sunPosVector_y = sunPosVector.y();
 
     // interpolationTable<scalar> IDN // direct solar radiation intensity flux
     // (
@@ -186,25 +229,17 @@ int main(int argc, char *argv[])
     //     /"IDN"
     // );
 
-    dictionary IDNIO;
-    IDNIO.add(
-        "file",
-        fileName
-        (
-            runTime.time().rootPath()
-            /runTime.time().globalCaseName()
-            /runTime.time().constant()
-            /"IDN"
-            // mesh.time().constant()
-            // /"IDN"
-        )
-    );
-    Function1s::TableFile<scalar> IDN // direct solar radiation intensity flux
+    scalarField IDN_x;
+    scalarField IDN_y;
+    readTimeTable
     (
-        "IDN",
-        IDNIO
-    );   
-    scalarField IDN_y = IDN.y();
+        runTime.time().rootPath()
+       /runTime.time().globalCaseName()
+       /runTime.time().constant()
+       /"IDN",
+        IDN_x,
+        IDN_y
+    );
 
 
     #include "readGravitationalAcceleration.H"
@@ -232,7 +267,8 @@ int main(int argc, char *argv[])
     {
 
         runTime.setTime(timeDirs[timeI], timeI);
-        Info << nl << "Time = " << runTime.timeName() << endl;
+        const word timeName = Time::timeName(runTime.value());
+        Info << nl << "Time = " << timeName << endl;
 
         // start clock
         tstartStep = std::clock();
@@ -243,7 +279,7 @@ int main(int argc, char *argv[])
             IOobject
             (
                "qrsw",
-               runTime.timeName(),
+               timeName,
                mesh,
                IOobject::NO_READ,
                IOobject::AUTO_WRITE 

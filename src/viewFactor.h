@@ -11,7 +11,11 @@ class Raycaster;
 
 class ViewFactorCalculator {
 public:
-    ViewFactorCalculator(const Raycaster& raycaster);
+    ViewFactorCalculator(const Raycaster& raycaster,
+                         bool angularSky = false,
+                         int skyAzimuthSamples = 48,
+                         int skyElevationSamples = 12,
+                         double skyRayLength = 5000.0);
     ~ViewFactorCalculator();
     
     ViewFactorResult compute(

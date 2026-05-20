@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <fstream>
+#include <algorithm>
 
 namespace utci {
 
@@ -30,8 +31,39 @@ static double computePatchFij(
 
 struct ViewFactorCalculator::Impl {
     const Raycaster& raycaster;
+    bool angularSky = false;
+    double skyRayLength = 5000.0;
+    std::vector<Vec3> skyDirs;
+    std::vector<double> skyWeights;
 
-    Impl(const Raycaster& rc) : raycaster(rc) {}
+    Impl(const Raycaster& rc,
+         bool angularSky_,
+         int skyAzimuthSamples,
+         int skyElevationSamples,
+         double skyRayLength_)
+        : raycaster(rc), angularSky(angularSky_), skyRayLength(skyRayLength_) {
+        if (angularSky) {
+            const int nPhi = std::max(1, skyAzimuthSamples);
+            const int nMu = std::max(1, skyElevationSamples);
+            skyDirs.reserve(static_cast<size_t>(nPhi * nMu));
+            skyWeights.reserve(static_cast<size_t>(nPhi * nMu));
+            const double dPhi = 2.0 * M_PI / static_cast<double>(nPhi);
+            const double dMu = 1.0 / static_cast<double>(nMu);
+            for (int iMu = 0; iMu < nMu; ++iMu) {
+                const double mu = (static_cast<double>(iMu) + 0.5) * dMu;
+                const double sinTheta = std::sqrt(std::max(0.0, 1.0 - mu * mu));
+                for (int iPhi = 0; iPhi < nPhi; ++iPhi) {
+                    const double phi = (static_cast<double>(iPhi) + 0.5) * dPhi;
+                    skyDirs.emplace_back(
+                        sinTheta * std::cos(phi),
+                        sinTheta * std::sin(phi),
+                        mu
+                    );
+                    skyWeights.push_back(dPhi * dMu);
+                }
+            }
+        }
+    }
 
     bool isRayBlocked(const Vec3& start, const Vec3& end) const {
         return raycaster.isBlocked(start, end);
@@ -42,8 +74,14 @@ struct ViewFactorCalculator::Impl {
     }
 };
 
-ViewFactorCalculator::ViewFactorCalculator(const Raycaster& raycaster)
-    : pImpl(std::make_unique<Impl>(raycaster)) {}
+ViewFactorCalculator::ViewFactorCalculator(const Raycaster& raycaster,
+                                           bool angularSky,
+                                           int skyAzimuthSamples,
+                                           int skyElevationSamples,
+                                           double skyRayLength)
+    : pImpl(std::make_unique<Impl>(
+        raycaster, angularSky, skyAzimuthSamples, skyElevationSamples, skyRayLength
+      )) {}
 
 ViewFactorCalculator::~ViewFactorCalculator() = default;
 
@@ -57,7 +95,7 @@ ViewFactorResult ViewFactorCalculator::compute(
 
     const int nBody = 5;
     const int nSurf = static_cast<int>(surfaces.size());
-    const int nSky  = useSky ? static_cast<int>(sky.size()) : 0;
+    const int nSky  = (useSky && !pImpl->angularSky) ? static_cast<int>(sky.size()) : 0;
 
     result.Fijsum    = Eigen::VectorXd::Zero(nBody);
     result.FijsumSky = Eigen::VectorXd::Zero(nBody);
@@ -116,11 +154,22 @@ ViewFactorResult ViewFactorCalculator::compute(
 
             double Fij_val = computePatchFij(i_n, Ai_n, ni, j_m, nj, AjMag, true);
             if (Fij_val <= 0.0) continue;
-            result.Fij[n].emplace_back(m, Fij_val);
+            result.Fij[n].indices.push_back(m);
+            result.Fij[n].fij.push_back(static_cast<float>(Fij_val));
             result.Fijsum[n] += Fij_val;
         }
 
-        if (useSky && !nearSky.empty()) {
+        if (useSky && pImpl->angularSky) {
+            const size_t nSamples = pImpl->skyDirs.size();
+            for (size_t s = 0; s < nSamples; ++s) {
+                const Vec3& dir = pImpl->skyDirs[s];
+                const double cosThetaI = ni.dot(dir);
+                if (cosThetaI <= 0.0) continue;
+                const Vec3 end = i_n + dir * pImpl->skyRayLength;
+                if (pImpl->isSkyRayBlocked(i_n, end)) continue;
+                result.FijsumSky[n] += (cosThetaI * pImpl->skyWeights[s]) / M_PI;
+            }
+        } else if (useSky && !nearSky.empty()) {
             for (int mi = 0; mi < (int)nearSky.size(); ++mi) {
                 int m = nearSky[mi];
                 const auto& surfSky = sky[m];
@@ -137,7 +186,8 @@ ViewFactorResult ViewFactorCalculator::compute(
                 Vec3 nj = surfSky.areaVector / AjSkyMag;
                 double FijSky_val = computePatchFij(i_n, Ai_n, ni, j_sky, nj, AjSkyMag, false);
                 if (FijSky_val <= 0.0) continue;
-                result.FijSky[n].emplace_back(m, FijSky_val);
+                result.FijSky[n].indices.push_back(m);
+                result.FijSky[n].fij.push_back(static_cast<float>(FijSky_val));
                 result.FijsumSky[n] += FijSky_val;
             }
         }

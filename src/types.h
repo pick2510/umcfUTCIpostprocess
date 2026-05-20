@@ -47,11 +47,15 @@ struct PedestrianPosition {
 };
 
 struct ViewFactorResult {
+    struct SparseSegment {
+        std::vector<int> indices;
+        std::vector<float> fij;
+    };
     // Sparse per body segment: only non-zero entries stored as (surface_index, fij_value)
     // Dense dense dense is avoided: only surfaces within R_MAG_MAX with line-of-sight contribute
-    std::array<std::vector<std::pair<int,double>>, 5> Fij;
+    std::array<SparseSegment, 5> Fij;
     Eigen::VectorXd Fijsum;
-    std::array<std::vector<std::pair<int,double>>, 5> FijSky;
+    std::array<SparseSegment, 5> FijSky;
     Eigen::VectorXd FijsumSky;
 };
 
