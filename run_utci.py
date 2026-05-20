@@ -43,6 +43,7 @@ import pyvista as pv
 
 try:
     from scipy.interpolate import griddata as _scipy_griddata
+    from scipy.spatial import cKDTree as _cKDTree
     _HAVE_SCIPY = True
 except ImportError:
     _HAVE_SCIPY = False
@@ -320,21 +321,45 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
         return positions
 
     else:
-        # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z
+        # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z.
+        # After binning, NN-fill empty dx/dy cells so coverage is uniform.
         centers = mesh.cell_centers().points
         if bbox is not None:
             xmin, xmax, ymin, ymax = bbox
             mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
                     (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
             centers = centers[mask]
+        else:
+            b = mesh.bounds
+            xmin, xmax, ymin, ymax = b[0], b[1], b[2], b[3]
         gx = np.round(centers[:, 0] / dx) * dx
         gy = np.round(centers[:, 1] / dy) * dy
         bins = defaultdict(list)
         for i in range(len(centers)):
             bins[(float(gx[i]), float(gy[i]))].append(centers[i, 2])
+
+        occ_xy = np.array(list(bins.keys()))
+        occ_z  = np.array([float(np.median(zs)) for zs in bins.values()])
+
+        # Build full uniform grid over bbox
+        xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
+        ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
+        gxg, gyg = np.meshgrid(xs, ys)
+        all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
+
+        # NN-fill: each grid cell gets the Z of its nearest occupied bin
+        if _HAVE_SCIPY and len(occ_xy) > 0:
+            _, nn_idx = _cKDTree(occ_xy).query(all_xy)
+            all_z = occ_z[nn_idx]
+        else:
+            return sorted(
+                (x, y, float(np.median(zs)) + z_offset)
+                for (x, y), zs in bins.items()
+            )
+
         positions = sorted(
-            (x, y, float(np.median(zs)) + z_offset)
-            for (x, y), zs in bins.items()
+            (float(x), float(y), float(z) + z_offset)
+            for (x, y), z in zip(all_xy, all_z)
         )
         return positions
 
