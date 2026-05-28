@@ -737,18 +737,19 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                 batchTmrt[bi] = TumrtAvg;
 
                 double Ta_K = (probeIdx < static_cast<int>(probeT.size())) ? probeT[probeIdx] : meteo.Ta;
-                if (Ta_K < 200.0) Ta_K = meteo.Ta;
+                if (!std::isfinite(Ta_K) || Ta_K < 200.0 || Ta_K > 370.0) Ta_K = meteo.Ta;
                 double Ta_c = Ta_K - 273.15;
                 double va = (probeIdx < static_cast<int>(probeU.size())) ? probeU[probeIdx] / 0.667 : meteo.va;
                 va = std::max(0.5, std::min(17.0, va));
                 double w = (probeIdx < static_cast<int>(probeW.size())) ? probeW[probeIdx] : 0.01;
+                if (!std::isfinite(w) || w < 0.0 || w > 0.1) w = 0.01;
                 double psat = std::exp(77.345 + 0.0057 * Ta_K - 7235.0 / Ta_K) / std::pow(Ta_K, 8.2);
                 double pv = P_REF * w / (EPSILON_H2O + w);
                 double RH = std::min(100.0, std::max(0.0, pv / psat * 100.0));
                 batchRH[bi] = RH;
 
                 if (ctx.args.computeUtci) {
-                    double Tmrt_c = batchTmrt[bi] - 273.15;
+                    double Tmrt_c = std::max(-30.0, std::min(70.0, batchTmrt[bi] - 273.15));
                     batchUtci[bi] = ctx.utciSolver.calculate(Ta_c, va, RH, Tmrt_c);
                 }
             }
