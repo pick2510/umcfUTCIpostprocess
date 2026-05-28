@@ -1322,6 +1322,8 @@ def stage2(args):
         cmd += ['--sky-azimuth-samples', str(args.sky_azimuth_samples)]
         cmd += ['--sky-elevation-samples', str(args.sky_elevation_samples)]
         cmd += ['--sky-ray-length', str(args.sky_ray_length)]
+    if getattr(args, 'surface_centres', False):
+        cmd.append('--surface-centres')
     print('  ' + ' '.join(cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:
