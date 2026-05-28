@@ -1,6 +1,7 @@
 #include "denseStage2.h"
 
 #include "constants.h"
+#include "raycaster.h"
 #include "io.h"
 #include "logging.h"
 #include "utciSolver.h"
@@ -224,7 +225,8 @@ static std::array<double, 4> cubicWeights1D(double t) {
 static bool fillIdwPlan(const std::vector<PedestrianPosition>& positions,
                         const DenseInterpPlan& plan,
                         const Point3& densePoint,
-                        DenseInterpPointPlan& pointPlan) {
+                        DenseInterpPointPlan& pointPlan,
+                        const Raycaster* raycaster) {
     struct Candidate {
         int index = -1;
         double d2 = std::numeric_limits<double>::infinity();
@@ -258,6 +260,12 @@ static bool fillIdwPlan(const std::vector<PedestrianPosition>& positions,
                 const int si = it->second;
                 const double ddx = positions[si].center.x - densePoint.x;
                 const double ddy = positions[si].center.y - densePoint.y;
+                if (raycaster) {
+                    Vec3 from{densePoint.x, densePoint.y, densePoint.z};
+                    Vec3 to{positions[si].center.x, positions[si].center.y, positions[si].center.z};
+                    if (raycaster->isBlocked(from, to, /*enforceRangeLimit=*/false))
+                        continue;
+                }
                 candidates.push_back({si, ddx * ddx + ddy * ddy});
             }
         }
@@ -328,7 +336,8 @@ static void setNearestSparseIndex(const std::vector<PedestrianPosition>& positio
 
 static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition>& positions,
                                             const std::vector<Point3>& densePoints,
-                                            DenseTumrtInterpMode interpMode) {
+                                            DenseTumrtInterpMode interpMode,
+                                            const Raycaster* raycaster) {
     DenseInterpPlan plan;
     plan.xs.reserve(positions.size());
     plan.ys.reserve(positions.size());
@@ -369,7 +378,7 @@ static DenseInterpPlan buildDenseInterpPlan(const std::vector<PedestrianPosition
         };
 
         if (interpMode == DenseTumrtInterpMode::Idw) {
-            if (fillIdwPlan(positions, plan, densePoints[i], pointPlan)) {
+            if (fillIdwPlan(positions, plan, densePoints[i], pointPlan, raycaster)) {
                 plan.pointPlans[i] = pointPlan;
                 continue;
             }
@@ -911,7 +920,8 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 bool debugWriteQrsw,
                                 DenseTumrtInterpMode interpMode,
                                 int smoothPasses,
-                                DenseInterpClampMode clampMode) {
+                                DenseInterpClampMode clampMode,
+                                const Raycaster* raycaster) {
     const std::string surfaceDir = casePath + "/postProcessing/surfaces/" + std::to_string(timestep);
     const std::string airDir = casePath + "/postProcessing/surfacesPedestrianAir/" + std::to_string(timestep);
     const std::string radDir = casePath + "/postProcessing/surfacesPedestrianRad/" + std::to_string(timestep);
@@ -983,7 +993,7 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
         if (it == interpPlanCache.end()) {
             it = interpPlanCache.emplace(
                 interpKey,
-                std::make_shared<DenseInterpPlan>(buildDenseInterpPlan(sparsePositions, meshT.points, interpMode))
+                std::make_shared<DenseInterpPlan>(buildDenseInterpPlan(sparsePositions, meshT.points, interpMode, raycaster))
             ).first;
         }
         interpPlan = it->second;

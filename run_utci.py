@@ -43,6 +43,7 @@ import pyvista as pv
 
 try:
     from scipy.interpolate import griddata as _scipy_griddata
+    from scipy.spatial import cKDTree as _cKDTree
     _HAVE_SCIPY = True
 except ImportError:
     _HAVE_SCIPY = False
@@ -233,57 +234,36 @@ def _stl_bbox(stl_path, padding=0.0):
             b[2] - padding, b[3] + padding)
 
 
-def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
+def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None, fill_radius=-1.0,
+                     terrain_vtk_path=None):
     """
     Build a regular dx/dy grid of pedestrian positions from a surface VTK.
 
-    flat mode (z_offset=0):
-        Generates a regular grid and keeps only points inside the surface mesh
-        (building interiors excluded via matplotlib TriFinder).
+    flat mode (z_offset=0, terrain_vtk_path=None):
+        Snaps cutting-plane cell centres to the dx/dy grid. z is fixed at the
+        cutting-plane height (≈ PED_Z for flat terrain).
 
-    terrain mode (z_offset=PED_Z):
-        Bins face-center points onto the dx/dy grid; each cell gets the median
-        terrain z + z_offset.
+    terrain mode (terrain_vtk_path provided):
+        Same (x,y) positions as flat mode (cutting-plane cell centres), but z
+        is looked up per probe from the terrain surface via nearest-neighbour
+        and then offset by PED_Z. Gives terrain-following probes at air-mesh
+        density — avoids the probe-count explosion of binning the fine ground
+        patch mesh directly.
+
+    legacy terrain mode (z_offset != 0, terrain_vtk_path=None):
+        Bins terrain-patch cell centres onto the grid; each gets median
+        z_terrain + z_offset. Only use for coarse terrain meshes.
 
     bbox: optional (xmin, xmax, ymin, ymax) to clip the grid extent.
           When None the VTK mesh bounds are used (full domain).
     """
     mesh = pv.read(vtk_path)
 
-    if z_offset == 0.0:
-        # Flat: regular grid filtered by 2-D triangulation containment test.
-        # Some case exports contain duplicate points or degenerate triangles,
-        # which can make matplotlib's TriFinder reject the mesh. Clean the
-        # triangulation first and fall back to cell-center binning if needed.
-        mesh = mesh.triangulate()
+    if z_offset == 0.0 or terrain_vtk_path is not None:
+        # Flat / terrain-following: snap cutting-plane cell centres to grid.
+        # Building interiors are gaps in the cutting-plane mesh → correctly absent.
+        mesh = mesh.clean(tolerance=1e-4)
         pts = np.asarray(mesh.points)
-        tris = mesh.faces.reshape(-1, 4)[:, 1:]
-
-        rounded_xy = np.round(pts[:, :2], decimals=6)
-        _, unique_idx, inverse = np.unique(
-            rounded_xy, axis=0, return_index=True, return_inverse=True
-        )
-        pts2 = pts[np.sort(unique_idx)]
-        order = np.zeros(len(unique_idx), dtype=int)
-        order[np.argsort(unique_idx)] = np.arange(len(unique_idx))
-        tris2 = order[inverse[tris]]
-
-        mask_distinct = (
-            (tris2[:, 0] != tris2[:, 1]) &
-            (tris2[:, 0] != tris2[:, 2]) &
-            (tris2[:, 1] != tris2[:, 2])
-        )
-        tris2 = tris2[mask_distinct]
-
-        if len(tris2) > 0:
-            p0 = pts2[tris2[:, 0], :2]
-            p1 = pts2[tris2[:, 1], :2]
-            p2 = pts2[tris2[:, 2], :2]
-            dbl_area = np.abs(
-                (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) -
-                (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
-            )
-            tris2 = tris2[dbl_area > 1e-10]
 
         if bbox is not None:
             xmin, xmax, ymin, ymax = bbox
@@ -293,49 +273,101 @@ def _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=None):
 
         xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
         ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
-        z = float(np.median(pts[:, 2]))
-
-        if len(tris2) > 0:
-            try:
-                tri = mtri.Triangulation(pts2[:, 0], pts2[:, 1], tris2)
-                finder = tri.get_trifinder()
-                gx, gy = np.meshgrid(xs, ys)
-                inside = finder(gx.ravel(), gy.ravel()) >= 0
-                vx = gx.ravel()[inside]
-                vy = gy.ravel()[inside]
-                positions = sorted((float(x), float(y), z) for x, y in zip(vx, vy))
-                if positions:
-                    return positions
-            except RuntimeError:
-                print('  [WARN] Invalid triangulation in pedestrian surface mesh – '
-                      'falling back to flat cell-center binning')
 
         centers = np.asarray(mesh.cell_centers().points)
         mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
                 (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
         centers = centers[mask]
-        gx = np.round(centers[:, 0] / dx) * dx
-        gy = np.round(centers[:, 1] / dy) * dy
-        positions = sorted({(float(x), float(y), z) for x, y in zip(gx, gy)})
+        gx_c = np.round(centers[:, 0] / dx) * dx
+        gy_c = np.round(centers[:, 1] / dy) * dy
+        occ_xy = np.unique(np.column_stack([gx_c, gy_c]), axis=0)
+
+        # Terrain z lookup: NN-query terrain cell centres to get z_terrain(x,y).
+        if terrain_vtk_path is not None and _HAVE_SCIPY and len(occ_xy) > 0:
+            t_mesh = pv.read(terrain_vtk_path)
+            t_centers = np.asarray(t_mesh.cell_centers().points)
+            t_tree = _cKDTree(t_centers[:, :2])
+            _, idx = t_tree.query(occ_xy)
+            occ_z = t_centers[idx, 2] + PED_Z
+        else:
+            z_fixed = float(np.median(pts[:, 2]))
+            occ_z = np.full(len(occ_xy), z_fixed)
+
+        # NN-fill: add empty dx/dy cells within the fill radius of any occupied bin.
+        #   fill_radius <  0 → adaptive: 2× 95th-pct NN gap among occupied bins
+        #   fill_radius == 0 → disabled (return occupied bins only)
+        #   fill_radius >  0 → explicit radius [m]
+        if fill_radius != 0.0 and _HAVE_SCIPY and len(occ_xy) > 1:
+            occ_tree = _cKDTree(occ_xy)
+            if fill_radius < 0:
+                d_occ, _ = occ_tree.query(occ_xy, k=2)
+                r = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0, max(dx, dy) * 2)
+                r = min(r, max(dx, dy) * 4)  # cap: large cells in veg meshes inflate NN gap
+            else:
+                r = fill_radius
+            gxg, gyg = np.meshgrid(xs, ys)
+            all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
+            d_all, nn_idx = occ_tree.query(all_xy)
+            positions = sorted(
+                (float(x), float(y), float(occ_z[i]))
+                for (x, y), d, i in zip(all_xy, d_all, nn_idx) if d <= r
+            )
+        else:
+            positions = sorted(
+                (float(x), float(y), float(z))
+                for (x, y), z in zip(occ_xy, occ_z)
+            )
         return positions
 
     else:
-        # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z
+        # Terrain: bin face-center (x,y,z_terrain) onto grid, then offset z.
+        # After binning, NN-fill empty dx/dy cells so coverage is uniform.
         centers = mesh.cell_centers().points
         if bbox is not None:
             xmin, xmax, ymin, ymax = bbox
             mask = ((centers[:, 0] >= xmin) & (centers[:, 0] <= xmax) &
                     (centers[:, 1] >= ymin) & (centers[:, 1] <= ymax))
             centers = centers[mask]
+        else:
+            b = mesh.bounds
+            xmin, xmax, ymin, ymax = b[0], b[1], b[2], b[3]
         gx = np.round(centers[:, 0] / dx) * dx
         gy = np.round(centers[:, 1] / dy) * dy
         bins = defaultdict(list)
         for i in range(len(centers)):
             bins[(float(gx[i]), float(gy[i]))].append(centers[i, 2])
-        positions = sorted(
-            (x, y, float(np.median(zs)) + z_offset)
-            for (x, y), zs in bins.items()
-        )
+
+        occ_xy = np.array(list(bins.keys()))
+        occ_z  = np.array([float(np.median(zs)) for zs in bins.values()])
+
+        # Build full uniform grid over bbox
+        xs = np.arange(round(xmin / dx) * dx, xmax + dx, dx)
+        ys = np.arange(round(ymin / dy) * dy, ymax + dy, dy)
+        gxg, gyg = np.meshgrid(xs, ys)
+        all_xy = np.column_stack([gxg.ravel(), gyg.ravel()])
+
+        # NN-fill: add empty dx/dy cells within the fill radius of any occupied bin.
+        #   fill_radius <  0 → adaptive: 2× 95th-pct NN gap among occupied bins
+        #   fill_radius == 0 → disabled (return occupied bins only)
+        #   fill_radius >  0 → explicit radius [m]
+        if fill_radius != 0.0 and _HAVE_SCIPY and len(occ_xy) > 1:
+            occ_tree = _cKDTree(occ_xy)
+            if fill_radius < 0:
+                d_occ, _ = occ_tree.query(occ_xy, k=2)
+                r = max(float(np.percentile(d_occ[:, 1], 95)) * 2.0, max(dx, dy) * 2)
+                r = min(r, max(dx, dy) * 4)  # cap: large cells in veg meshes inflate NN gap
+            else:
+                r = fill_radius
+            d_all, nn_idx = occ_tree.query(all_xy)
+            positions = sorted(
+                (float(x), float(y), float(occ_z[i]) + z_offset)
+                for (x, y), d, i in zip(all_xy, d_all, nn_idx) if d <= r
+            )
+        else:
+            positions = sorted(
+                (x, y, float(np.median(zs)) + z_offset)
+                for (x, y), zs in bins.items()
+            )
         return positions
 
 
@@ -630,6 +662,59 @@ def _first_existing_path(paths):
     return None
 
 
+
+def _surface_cell_centres(vtk_path, bbox=None, terrain_vtk_path=None):
+    """Return raw cell centres of the cutting-plane mesh as probe positions.
+    No grid snapping — each probe corresponds to exactly one surface cell.
+    If terrain_vtk_path is provided, z is replaced with z_terrain + PED_Z
+    via nearest-neighbour lookup, giving terrain-following probe heights.
+    """
+    mesh = pv.read(vtk_path)
+    mesh = mesh.clean(tolerance=1e-4)
+    centres = np.asarray(mesh.cell_centers().points)
+    if bbox is not None:
+        xmin, xmax, ymin, ymax = bbox
+        mask = ((centres[:, 0] >= xmin) & (centres[:, 0] <= xmax) &
+                (centres[:, 1] >= ymin) & (centres[:, 1] <= ymax))
+        centres = centres[mask]
+    if terrain_vtk_path is not None and _HAVE_SCIPY:
+        t_mesh = pv.read(terrain_vtk_path)
+        t_centres = np.asarray(t_mesh.cell_centers().points)
+        t_tree = _cKDTree(t_centres[:, :2])
+        _, idx = t_tree.query(centres[:, :2])
+        centres[:, 2] = t_centres[idx, 2] + PED_Z
+    return sorted((float(c[0]), float(c[1]), float(c[2])) for c in centres)
+
+
+def _merge_veg_probes(case, t_start, dx, dy, bbox, fill_radius, terrain_vtk_path, positions):
+    """Merge vegetation-region cutting-plane probes into existing positions.
+    T values are still sampled from the air mesh — this only adds (x,y,z)
+    positions inside the vegetation zone for under-canopy coverage.
+    """
+    sys_veg = os.path.join(case, 'system', 'vegetation')
+    if not os.path.isdir(sys_veg):
+        return positions
+    try:
+        with open(os.path.join(sys_veg, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_surface_dict(terrain_patches=None))
+        r = _run('postProcess -func surfacesPedestrian',
+                 case, region='vegetation', time_range=str(t_start))
+        vtk_path = _find_pedestrian_vtk(case, 'surfacesPedestrian', t_start, 'T_pedestrian.vtk')
+        if r.returncode != 0 or vtk_path is None:
+            return positions
+        veg_pos = _bin_vtk_to_grid(vtk_path, dx, dy, z_offset=0.0, bbox=bbox,
+                                    fill_radius=fill_radius,
+                                    terrain_vtk_path=terrain_vtk_path)
+        merged = {(p[0], p[1]): p for p in veg_pos}
+        merged.update({(p[0], p[1]): p for p in positions})  # air takes priority
+        result = sorted(merged.values())
+        print(f'  Vegetation probes: {len(veg_pos)} sampled, +{len(result)-len(positions)} new')
+        return result
+    except Exception as e:
+        print(f'  [WARN] Vegetation probe merge failed: {e}')
+        return positions
+
+
 def _stage0_generate_positions(args):
     """Run postProcess to generate T_pedestrian.vtk and return (positions, resolved_mode)."""
     sys_air = os.path.join(args.case, 'system', 'air')
@@ -652,6 +737,48 @@ def _stage0_generate_positions(args):
             print('  [WARN] STL not found for bbox clipping '
                   '(tried wallAndTreeSurfaces.stl, walls.stl, facades.stl)')
 
+    # ── surface-centres mode: raw cell centres, no grid snapping ─────────────
+    if getattr(args, 'surface_centres', False):
+        import tempfile, shutil
+        # Step 1: cutting-plane VTK for (x,y,z) cell centres
+        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_surface_dict(terrain_patches=None))
+        r = _run('postProcess -func surfacesPedestrian',
+                 args.case, region='air', time_range=str(args.t_start))
+        vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+        if r.returncode != 0 or vtk_path is None:
+            return None, 'terrain'
+        # Step 2: terrain-patch VTK for z_terrain lookup
+        terrain_vtk_path = None
+        terrain_patches = list(getattr(args, 'terrain_patches', None) or [])
+        if terrain_patches and _HAVE_SCIPY:
+            tmp_dir = tempfile.mkdtemp()
+            try:
+                with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+                    f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+                r2 = _run('postProcess -func surfacesPedestrian',
+                          args.case, region='air', time_range=str(args.t_start))
+                t_vtk = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+                if r2.returncode == 0 and t_vtk is not None:
+                    terrain_vtk_path = os.path.join(tmp_dir, 'terrain.vtk')
+                    shutil.copy2(t_vtk, terrain_vtk_path)
+            except Exception:
+                pass
+            # Restore cutting-plane dict
+            with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+                f.write(_pedestrian_surface_dict(terrain_patches=None))
+        positions = _surface_cell_centres(vtk_path, bbox=bbox,
+                                          terrain_vtk_path=terrain_vtk_path)
+        z_note = 'terrain z' if terrain_vtk_path else 'cutting-plane z'
+        print(f'  Surface-centres mode: {len(positions)} raw cell centres ({z_note}, no grid snapping)')
+        MAX_SURFACE_CENTRES = 250000
+        if len(positions) > MAX_SURFACE_CENTRES:
+            print(f'  [WARN] {len(positions)} > {MAX_SURFACE_CENTRES} limit — subsampling uniformly')
+            step = len(positions) // MAX_SURFACE_CENTRES + 1
+            positions = positions[::step]
+            print(f'  After subsampling: {len(positions)}')
+        return positions, 'terrain'
+
     # ── forced flat ──────────────────────────────────────────────────────────
     if args.mode == 'flat':
         with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
@@ -661,21 +788,59 @@ def _stage0_generate_positions(args):
         vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
         if r.returncode != 0 or vtk_path is None:
             return None, 'flat'
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=0.0, bbox=bbox), 'flat'
+        positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                      z_offset=0.0, bbox=bbox,
+                                      fill_radius=args.ped_grid_fill_radius)
+        if args.vegetation:
+            positions = _merge_veg_probes(args.case, args.t_start, args.ped_grid_dx,
+                                          args.ped_grid_dy, bbox, args.ped_grid_fill_radius,
+                                          None, positions)
+        return positions, 'flat'
 
     # ── forced terrain ───────────────────────────────────────────────────────
+    # Use the cutting-plane VTK (air cells at z≈PED_Z) for probe positions.
+    # The ground-patch mesh is typically much finer than the air mesh and
+    # produces ~4× more occupied bins, which makes the UTCI solver run
+    # out of memory. Air cell centres at z=PED_Z are already "PED_Z above
+    # ground" for flat terrain and give the same probe density as flat mode.
     if args.mode == 'terrain':
         terrain_patches = list(args.terrain_patches)
+        # Step 1: cutting-plane VTK for (x,y) probe positions (air-mesh density)
         with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
-            f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+            f.write(_pedestrian_surface_dict(terrain_patches=None))
         r = _run('postProcess -func surfacesPedestrian',
                  args.case, region='air', time_range=str(args.t_start))
         vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
         if r.returncode != 0 or vtk_path is None:
             return None, 'terrain'
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=PED_Z, bbox=bbox), 'terrain'
+        # Step 2: terrain-patch VTK for z_terrain lookup (written to a separate file)
+        terrain_vtk_path = None
+        if terrain_patches and _HAVE_SCIPY:
+            import tempfile, shutil
+            tmp_dir = tempfile.mkdtemp()
+            try:
+                with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+                    f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+                r2 = _run('postProcess -func surfacesPedestrian',
+                          args.case, region='air', time_range=str(args.t_start))
+                t_vtk = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+                if r2.returncode == 0 and t_vtk is not None:
+                    terrain_vtk_path = os.path.join(tmp_dir, 'terrain.vtk')
+                    shutil.copy2(t_vtk, terrain_vtk_path)
+            except Exception:
+                pass
+            # Restore cutting-plane dict for T sampling in later stages
+            with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+                f.write(_pedestrian_surface_dict(terrain_patches=None))
+        positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                      z_offset=0.0, bbox=bbox,
+                                      fill_radius=args.ped_grid_fill_radius,
+                                      terrain_vtk_path=terrain_vtk_path)
+        if args.vegetation:
+            positions = _merge_veg_probes(args.case, args.t_start, args.ped_grid_dx,
+                                          args.ped_grid_dy, bbox, args.ped_grid_fill_radius,
+                                          terrain_vtk_path, positions)
+        return positions, 'terrain'
 
     # ── auto-detect (default) ─────────────────────────────────────────────────
     # Step 1: always try flat (cuttingPlane at PED_Z) first
@@ -690,23 +855,46 @@ def _stage0_generate_positions(args):
 
     # Step 2: inspect result
     if not _detect_terrain(vtk_path, bbox=bbox):
-        return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                                 z_offset=0.0, bbox=bbox), 'flat'
+        positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                      z_offset=0.0, bbox=bbox,
+                                      fill_radius=args.ped_grid_fill_radius)
+        if args.vegetation:
+            positions = _merge_veg_probes(args.case, args.t_start, args.ped_grid_dx,
+                                          args.ped_grid_dy, bbox, args.ped_grid_fill_radius,
+                                          None, positions)
+        return positions, 'flat'
 
-    # Step 3: re-run as terrain
+    # Step 3: auto-detected terrain — cutting plane for (x,y), terrain patches for z.
     print('  Auto-detected terrain domain (z-spread > 0.5 m, low flat-plane coverage, '
-          'or empty cutting plane) '
-          '— switching to terrain mode')
+          'or empty cutting plane) — switching to terrain mode')
     terrain_patches = list(args.terrain_patches)
-    with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
-        f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
-    r = _run('postProcess -func surfacesPedestrian',
-             args.case, region='air', time_range=str(args.t_start))
-    vtk_path = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
-    if r.returncode != 0 or vtk_path is None:
-        return None, 'terrain'
-    return _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
-                             z_offset=PED_Z, bbox=bbox), 'terrain'
+    terrain_vtk_path = None
+    if terrain_patches and _HAVE_SCIPY:
+        import tempfile, shutil
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+                f.write(_pedestrian_surface_dict(terrain_patches=terrain_patches))
+            r2 = _run('postProcess -func surfacesPedestrian',
+                      args.case, region='air', time_range=str(args.t_start))
+            t_vtk = _find_pedestrian_vtk(args.case, 'surfacesPedestrian', args.t_start, 'T_pedestrian.vtk')
+            if r2.returncode == 0 and t_vtk is not None:
+                terrain_vtk_path = os.path.join(tmp_dir, 'terrain.vtk')
+                shutil.copy2(t_vtk, terrain_vtk_path)
+        except Exception:
+            pass
+        # Restore cutting-plane dict for T sampling in later stages
+        with open(os.path.join(sys_air, 'surfacesPedestrian'), 'w') as f:
+            f.write(_pedestrian_surface_dict(terrain_patches=None))
+    positions = _bin_vtk_to_grid(vtk_path, args.ped_grid_dx, args.ped_grid_dy,
+                                  z_offset=0.0, bbox=bbox,
+                                  fill_radius=args.ped_grid_fill_radius,
+                                  terrain_vtk_path=terrain_vtk_path)
+    if args.vegetation:
+        positions = _merge_veg_probes(args.case, args.t_start, args.ped_grid_dx,
+                                      args.ped_grid_dy, bbox, args.ped_grid_fill_radius,
+                                      terrain_vtk_path, positions)
+    return positions, 'terrain'
 
 
 def stage0(args):
@@ -1226,6 +1414,16 @@ def parse_args():
                    help='Pedestrian grid x-spacing [m]')
     p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
                    help='Pedestrian grid y-spacing [m]')
+    p.add_argument('--surface-centres', action='store_true', dest='surface_centres',
+                   help='Use raw cutting-plane cell centres as probe positions (no grid '
+                        'snapping). Eliminates the sparse→dense interpolation step — '
+                        'Tmrt is computed at every surface cell exactly.')
+    p.add_argument('--ped-grid-fill-radius', type=float, default=0.0,
+                   dest='ped_grid_fill_radius', metavar='M',
+                   help='NN-fill radius for coarse-mesh gaps [m]: '
+                        '0=disable/occupied bins only (default), '
+                        '-1=adaptive (2× 95th-pct NN gap), '
+                        '>0=explicit radius')
     p.add_argument('--bbox-padding', type=float, default=None, dest='bbox_padding',
                    metavar='M',
                    help='Clip probe grid to STL bounding box + M m padding. '

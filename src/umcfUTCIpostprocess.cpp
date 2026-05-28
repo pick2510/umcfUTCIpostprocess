@@ -1221,7 +1221,8 @@ int main(int argc, char* argv[]) {
         }
         computeDenseSurfaceOutputs(args.casePath, outDir, t, positions, sparseResults.tumrtNoSolar[tIdx],
                                    utciSolver, args.writeDebugQrswSurface, args.denseTumrtInterp,
-                                   args.denseTumrtSmoothPasses, args.denseInterpClamp);
+                                   args.denseTumrtSmoothPasses, args.denseInterpClamp,
+                                   &raycaster);
 
         // Print stats
         double tMin  = sparseResults.tmrt[tIdx].minCoeff();
