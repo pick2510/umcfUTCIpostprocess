@@ -1,6 +1,7 @@
 #ifndef DENSESTAGE2_H
 #define DENSESTAGE2_H
 
+#include "raycaster.h"
 #include "types.h"
 #include <string>
 #include <vector>
@@ -35,7 +36,8 @@ bool computeDenseSurfaceOutputs(const std::string& casePath,
                                 bool debugWriteQrsw,
                                 DenseTumrtInterpMode interpMode,
                                 int smoothPasses,
-                                DenseInterpClampMode clampMode);
+                                DenseInterpClampMode clampMode,
+                                const Raycaster* raycaster = nullptr);
 
 }
 
