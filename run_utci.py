@@ -1415,9 +1415,12 @@ def parse_args():
     p.add_argument('--ped-grid-dy', type=float, default=PED_GRID_DY, dest='ped_grid_dy',
                    help='Pedestrian grid y-spacing [m]')
     p.add_argument('--surface-centres', action='store_true', dest='surface_centres',
+                   default=True,
                    help='Use raw cutting-plane cell centres as probe positions (no grid '
                         'snapping). Eliminates the sparse→dense interpolation step — '
-                        'Tmrt is computed at every surface cell exactly.')
+                        'Tmrt is computed at every surface cell exactly. (default: on)')
+    p.add_argument('--no-surface-centres', action='store_false', dest='surface_centres',
+                   help='Disable surface-centres mode; use the pedestrian grid instead.')
     p.add_argument('--ped-grid-fill-radius', type=float, default=0.0,
                    dest='ped_grid_fill_radius', metavar='M',
                    help='NN-fill radius for coarse-mesh gaps [m]: '
