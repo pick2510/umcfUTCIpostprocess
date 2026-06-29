@@ -39,6 +39,7 @@ struct CommandLineArgs {
     int tEnd = 86400;
     int tStep = 3600;
     std::string outputDir = "UTCI";
+    std::string probeLocs;  // empty = use default case path
     int nThreads = 1;
     bool computeUtci = true;
     bool forceRecompute = false;
@@ -201,10 +202,14 @@ void printUsage(const char* progName) {
     logInfo("Usage: " + std::string(progName) + " [options]");
     logInfo("Options:");
     logInfo("  --case <path>          Case directory (required)");
+    logInfo("  --probe-locs <file>    Path to probe_locs file (default: {case}/system/air/probe_locs)");
+    logInfo("  --output <dir>         Output directory, abs or relative to case (default: UTCI)");
+    logInfo("  --output-dir <dir>     Alias for --output");
+    logInfo("  --timestep <t>         Run only this single timestep");
     logInfo("  --start <time>         Start timestep (default: 3600)");
     logInfo("  --end <time>           End timestep (default: 86400)");
     logInfo("  --step <time>          Timestep interval (default: 3600)");
-    logInfo("  --output-dir <dir>     Output directory (default: UTCI)");
+    logInfo("  --threads <N>          Number of threads (alias for -j)");
     logInfo("  --skip-utci            Skip UTCI calculation");
     logInfo("  --utci-method <m>      UTCI method: poly (default) or lut");
     logInfo("  --lut-path <file>      Path to utci_offset.Dat (default: next to binary)");
@@ -253,14 +258,21 @@ CommandLineArgs parseArgs(int argc, char* argv[]) {
 
         if (arg == "--case" && i + 1 < argc) {
             args.casePath = argv[++i];
+        } else if (arg == "--probe-locs" && i + 1 < argc) {
+            args.probeLocs = argv[++i];
+        } else if ((arg == "--output" || arg == "--output-dir") && i + 1 < argc) {
+            args.outputDir = argv[++i];
+        } else if (arg == "--timestep" && i + 1 < argc) {
+            int t = parseIntArg(arg, argv[++i]);
+            args.tStart = t; args.tEnd = t; args.tStep = 1;
+        } else if (arg == "--threads" && i + 1 < argc) {
+            args.nThreads = parseIntArg(arg, argv[++i]);
         } else if (arg == "--start" && i + 1 < argc) {
             args.tStart = parseIntArg(arg, argv[++i]);
         } else if (arg == "--end" && i + 1 < argc) {
             args.tEnd = parseIntArg(arg, argv[++i]);
         } else if (arg == "--step" && i + 1 < argc) {
             args.tStep = parseIntArg(arg, argv[++i]);
-        } else if (arg == "--output-dir" && i + 1 < argc) {
-            args.outputDir = argv[++i];
         } else if (arg == "--skip-utci") {
             args.computeUtci = false;
         } else if (arg == "--utci-method" && i + 1 < argc) {
@@ -710,10 +722,14 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                     batchQswUpward[bi] = areaWeightedAverage(tmrtDetail.qswUpward, ctx.positions[pedIdx].areaVectors);
                 }
 
-                int probeIdx = (pedIdx < ctx.probeIndexForPos.size() && ctx.probeIndexForPos[pedIdx] >= 0)
+                const bool hasProbeMatch = pedIdx < ctx.probeIndexForPos.size()
+                                           && ctx.probeIndexForPos[pedIdx] >= 0;
+                int probeIdx = hasProbeMatch
                     ? ctx.probeIndexForPos[pedIdx]
                     : ctx.positions[pedIdx].originalIndex;
-                double localQrsw = (probeIdx >= 0 && probeIdx < static_cast<int>(probeQrsw.size()))
+                // Only use probe qrsw when position is spatially matched; otherwise fall through
+                // to sparseQrswFromSurface to avoid index-vs-position mismatch.
+                double localQrsw = (hasProbeMatch && probeIdx < static_cast<int>(probeQrsw.size()))
                     ? probeQrsw[probeIdx] : -1.0;
                 if (localQrsw < 0.0 && pedIdx < static_cast<size_t>(sc.sparseQrswFromSurface.size())) {
                     localQrsw = sc.sparseQrswFromSurface[pedIdx];
@@ -739,8 +755,14 @@ static SparseStage2Results runSparseStage2(const SparseStage2Context& ctx) {
                 double Ta_K = (probeIdx < static_cast<int>(probeT.size())) ? probeT[probeIdx] : meteo.Ta;
                 if (!std::isfinite(Ta_K) || Ta_K < 200.0 || Ta_K > 370.0) Ta_K = meteo.Ta;
                 double Ta_c = Ta_K - 273.15;
-                double va = (probeIdx < static_cast<int>(probeU.size())) ? probeU[probeIdx] / 0.667 : meteo.va;
+                // Wind: guard against OpenFOAM's out-of-mesh marker (|U| ~ VGREAT ≈ 1.8e307) and
+                // other invalid samples. An unguarded magnitude would clamp to the 17 m/s ceiling
+                // below, applying spurious hurricane-force wind chill (~−13 °C UTCI error). Fall
+                // back to the reference wind speed instead, matching the Ta fallback above.
+                double vaRaw = (probeIdx < static_cast<int>(probeU.size())) ? probeU[probeIdx] : meteo.va * 0.667;
+                double va = (std::isfinite(vaRaw) && vaRaw >= 0.0 && vaRaw < 1.0e3) ? vaRaw / 0.667 : meteo.va;
                 va = std::max(0.5, std::min(17.0, va));
+                // Humidity: same guard — VGREAT/non-finite specific humidity falls back to default.
                 double w = (probeIdx < static_cast<int>(probeW.size())) ? probeW[probeIdx] : 0.01;
                 if (!std::isfinite(w) || w < 0.0 || w > 0.1) w = 0.01;
                 double psat = std::exp(77.345 + 0.0057 * Ta_K - 7235.0 / Ta_K) / std::pow(Ta_K, 8.2);
@@ -835,6 +857,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Compute absolute output base: if outputDir is absolute use it, else prepend casePath
+    const std::string outputBase = (!args.outputDir.empty() && args.outputDir[0] == '/')
+        ? args.outputDir
+        : args.casePath + "/" + args.outputDir;
+
 #ifdef _OPENMP
     if (args.nThreads > 0) {
         omp_set_num_threads(args.nThreads);
@@ -863,7 +890,9 @@ int main(int argc, char* argv[]) {
     // =========================================================
     // Load pedestrian positions
     // =========================================================
-    std::string probeLocsPath = args.casePath + "/system/air/probe_locs";
+    std::string probeLocsPath = args.probeLocs.empty()
+        ? args.casePath + "/system/air/probe_locs"
+        : args.probeLocs;
     std::vector<PedestrianPosition> positions = loadPedestrianPositions(probeLocsPath);
 
     if (positions.empty()) {
@@ -1082,6 +1111,24 @@ int main(int argc, char* argv[]) {
         logWarn("no probe T – using ambient temperature for UTCI");
     if (probeUAll.empty())
         logWarn("no probe U – using reference wind speed for UTCI");
+    else {
+        // Detect probes that fell outside the mesh (OpenFOAM returns |U| ~ VGREAT). Without the
+        // guard in the UTCI loop these clamp to the 17 m/s ceiling and silently corrupt results,
+        // so surface the count here — it is otherwise invisible.
+        const auto& windRow = probeUAll.front().second;
+        size_t nInvalid = 0;
+        for (double m : windRow)
+            if (!std::isfinite(m) || m < 0.0 || m >= 1.0e3) ++nInvalid;
+        if (nInvalid > 0 && !windRow.empty()) {
+            std::ostringstream wmsg;
+            wmsg << std::fixed << std::setprecision(1)
+                 << nInvalid << " of " << windRow.size() << " wind probes ("
+                 << (100.0 * nInvalid / windRow.size())
+                 << "%) are outside the mesh (|U|=VGREAT) – using reference wind speed for those. "
+                 << "Check that probe_locs sit inside the air mesh.";
+            logWarn(wmsg.str());
+        }
+    }
     if (probeQrswAll.empty())
         logWarn("no probe qrsw data – using dense qrsw surface sampling fallback before binary shadow");
     else
@@ -1109,7 +1156,7 @@ int main(int argc, char* argv[]) {
     // Create output directories once (mkdir -p style)
     // =========================================================
     {
-        std::string baseDir = args.casePath + "/" + args.outputDir;
+        std::string baseDir = outputBase;
         createDirectory(baseDir);
         for (int t : timesteps) {
             std::string outDir = baseDir + "/" + std::to_string(t);
@@ -1132,7 +1179,7 @@ int main(int argc, char* argv[]) {
         args.skyRayLength
     );
     BinaryCache cache;
-    std::string cacheBaseDir = args.casePath + "/" + args.outputDir;
+    std::string cacheBaseDir = outputBase;
     cache.setBaseDir(cacheBaseDir);
     cache.setCompressed(args.compressCache);
     std::ostringstream tag;
@@ -1195,7 +1242,7 @@ int main(int argc, char* argv[]) {
     #pragma omp parallel for schedule(dynamic)
     for (size_t tIdx = 0; tIdx < nT; ++tIdx) {
         int t = timesteps[tIdx];
-        std::string outDir = args.casePath + "/" + args.outputDir + "/" + std::to_string(t);
+        std::string outDir = outputBase + "/" + std::to_string(t);
 
         // Tmrt_pedestrian.vtk  (Kelvin) — point cloud
         writeVtkPolyData(outDir + "/Tmrt_pedestrian.vtk", positions, sparseResults.tmrt[tIdx], "Tmrt");
