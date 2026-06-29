@@ -1129,10 +1129,26 @@ int main(int argc, char* argv[]) {
             logWarn(wmsg.str());
         }
     }
-    if (probeQrswAll.empty())
+    if (probeQrswAll.empty()) {
         logWarn("no probe qrsw data – using dense qrsw surface sampling fallback before binary shadow");
-    else
-        logDetail("Probe qrsw rows: " + std::to_string(probeQrswAll.size()));
+    } else {
+        // Detect a degenerate qrsw probe set (all zero at every timestep). OpenFOAM probe
+        // sampling of the surface-defined qrsw field in the air returns 0 on some meshes
+        // (observed on terrain cases), which would otherwise be taken as a valid "zero solar"
+        // value and suppress the healthy qrsw surface fallback → no direct solar in Tmrt
+        // (Tmrt ~6-11 C too low during the day). Ignore it so the surface fallback is used.
+        double qrswMax = 0.0;
+        for (const auto& row : probeQrswAll)
+            for (double q : row.second)
+                if (std::isfinite(q)) qrswMax = std::max(qrswMax, q);
+        if (qrswMax <= 1.0) {
+            logWarn("probe qrsw data is all zero (degenerate) – ignoring it and using the qrsw "
+                    "surface fallback so direct solar is applied to Tmrt.");
+            probeQrswAll.clear();
+        } else {
+            logDetail("Probe qrsw rows: " + std::to_string(probeQrswAll.size()));
+        }
+    }
     static const std::vector<double> emptyVec;
 
     if (!validateRequiredInputs(args, allGeo, skyGeo, meteoData, timesteps,

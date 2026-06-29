@@ -973,7 +973,7 @@ surfaces
 """
 
 
-def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
+def _sample_qrsw_at_probes(case, t_start, t_end, t_step, terrain=False):
     from scipy.spatial import cKDTree
     from io import StringIO as _StringIO
 
@@ -987,15 +987,31 @@ def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
     px, py = pos[:, 0], pos[:, 1]
     n_probes = len(pos)
 
+    # Choose the qrsw source. On terrain the fixed absolute z=2 m cutting plane sits
+    # underground (terrain surface is tens of metres up) and produces no output, so the
+    # probe values come out all-zero → no direct solar in Tmrt. Use the terrain-following
+    # pedestrian surface instead (sampled on ground/street patches offset by PED_Z).
+    # Flat cases keep the z=2 m cutting plane, which is at pedestrian height there.
+    def _candidates(t):
+        if terrain:
+            return [
+                os.path.join(case, 'postProcessing', 'surfaces', str(t), 'qrsw_pedestrian.vtk'),
+                os.path.join(case, 'postProcessing', 'surfacesPedestrianRad', str(t), 'qrsw_pedestrian.vtk'),
+            ]
+        return [os.path.join(case, 'postProcessing', 'qrswCuttingPlane', str(t), 'qrsw_pedestrian.vtk')]
+
+    src_desc = 'terrain-following pedestrian surface' if terrain else 'z=2 m cutting plane'
+
     out_dir = os.path.join(case, 'postProcessing', 'probes', 'qrsw')
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, 'qrsw')
 
     rows = []
+    n_missing = 0
     for t in range(t_start, t_end + 1, t_step):
-        vtk_path = os.path.join(case, 'postProcessing', 'qrswCuttingPlane', str(t),
-                                'qrsw_pedestrian.vtk')
-        if not os.path.isfile(vtk_path):
+        vtk_path = next((p for p in _candidates(t) if os.path.isfile(p)), None)
+        if vtk_path is None:
+            n_missing += 1
             rows.append((t, np.zeros(n_probes)))
             continue
 
@@ -1008,6 +1024,10 @@ def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
         _, idx = kd.query(np.column_stack([px, py]))
         rows.append((t, qmag[idx]))
 
+    if n_missing:
+        print(f'  [WARN] {n_missing} timestep(s) had no {src_desc} qrsw VTK – wrote zeros '
+              f'(direct solar will be missing for those unless the binary surface fallback applies)')
+
     with open(out_path, 'w') as f:
         for i in range(n_probes):
             f.write(f'# Probe {i} ({pos[i,0]:.3f} {pos[i,1]:.3f} {pos[i,2]:.3f})\n')
@@ -1017,7 +1037,7 @@ def _sample_qrsw_at_probes(case, t_start, t_end, t_step):
                 f.write(f'\t{v:.4f}')
             f.write('\n')
 
-    print(f'  qrsw sampled at {n_probes} probe positions -> {out_path}')
+    print(f'  qrsw sampled at {n_probes} probe positions ({src_desc}) -> {out_path}')
 
 
 def _ensure_symlink(src, dst):
@@ -1197,7 +1217,8 @@ def stage1(args):
                                args.case, rad_region, timesteps, of_parallel)
 
     _normalize_of12_postprocessing(args.case, region, timesteps)
-    _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step)
+    _sample_qrsw_at_probes(args.case, args.t_start, args.t_end, args.t_step,
+                           terrain=(ped_mode == 'terrain'))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
